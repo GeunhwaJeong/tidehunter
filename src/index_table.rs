@@ -147,14 +147,45 @@ impl IndexTable {
     pub fn len(&self) -> usize {
         self.data.len()
     }
+}
 
-    pub fn to_bytes(&self, ks: &KeySpaceDesc) -> Bytes {
+pub trait PersistedIndex {
+    fn to_bytes(table: &IndexTable, ks: &KeySpaceDesc) -> Bytes;
+    fn from_bytes(ks: &KeySpaceDesc, b: Bytes) -> IndexTable;
+    fn lookup_unloaded(
+        ks: &KeySpaceDesc,
+        reader: &impl RandomRead,
+        key: &[u8],
+    ) -> Option<WalPosition>;
+
+    fn element_size(ks: &KeySpaceDesc) -> usize {
+        ks.reduced_key_size() + WalPosition::LENGTH
+    }
+
+    fn key_micro_cell(ks: &KeySpaceDesc, key: &[u8]) -> usize {
+        let prefix = ks.cell_prefix(key);
+        let cell = ks.cell_by_prefix(prefix);
+        let cell_prefix_range = ks.cell_prefix_range(cell);
+        let cell_offset = prefix
+            // cell_prefix_range.start is always u32 (but not cell_prefix_range.end)
+            .checked_sub(cell_prefix_range.start as u32)
+            .expect("Key prefix is out of cell prefix range");
+        let cell_size = ks.cell_size();
+        let micro_cell = rescale_u32(cell_offset, cell_size, HEADER_ELEMENTS as u32);
+        micro_cell as usize
+    }
+}
+
+pub struct MicroCellIndex;
+
+impl PersistedIndex for MicroCellIndex {
+    fn to_bytes(table: &IndexTable, ks: &KeySpaceDesc) -> Bytes {
         let element_size = Self::element_size(ks);
-        let capacity = element_size * self.data.len() + HEADER_SIZE;
+        let capacity = element_size * table.data.len() + HEADER_SIZE;
         let mut out = BytesMut::with_capacity(capacity);
         out.put_bytes(0, HEADER_SIZE);
         let mut header = IndexTableHeaderBuilder::new(ks);
-        for (key, value) in self.data.iter() {
+        for (key, value) in table.data.iter() {
             if key.len() != ks.reduced_key_size() {
                 // todo make into debug assertion
                 panic!(
@@ -173,7 +204,7 @@ impl IndexTable {
         out.to_vec().into()
     }
 
-    pub fn from_bytes(ks: &KeySpaceDesc, b: Bytes) -> Self {
+    fn from_bytes(ks: &KeySpaceDesc, b: Bytes) -> IndexTable {
         let b = b.slice(HEADER_SIZE..);
         let element_size = Self::element_size(ks);
         let elements = b.len() / element_size;
@@ -189,14 +220,10 @@ impl IndexTable {
         }
 
         assert_eq!(data.len(), elements);
-        Self { data }
+        IndexTable { data }
     }
 
-    pub fn element_size(ks: &KeySpaceDesc) -> usize {
-        ks.reduced_key_size() + WalPosition::LENGTH
-    }
-
-    pub fn lookup_unloaded(
+    fn lookup_unloaded(
         ks: &KeySpaceDesc,
         reader: &impl RandomRead,
         key: &[u8],
@@ -226,21 +253,7 @@ impl IndexTable {
         }
         None
     }
-
-    fn key_micro_cell(ks: &KeySpaceDesc, key: &[u8]) -> usize {
-        let prefix = ks.cell_prefix(key);
-        let cell = ks.cell_by_prefix(prefix);
-        let cell_prefix_range = ks.cell_prefix_range(cell);
-        let cell_offset = prefix
-            // cell_prefix_range.start is always u32 (but not cell_prefix_range.end)
-            .checked_sub(cell_prefix_range.start as u32)
-            .expect("Key prefix is out of cell prefix range");
-        let cell_size = ks.cell_size();
-        let micro_cell = rescale_u32(cell_offset, cell_size, HEADER_ELEMENTS as u32);
-        micro_cell as usize
-    }
 }
-
 pub struct IndexTableHeaderBuilder<'a> {
     ks: &'a KeySpaceDesc,
     header: Vec<(u32, u32)>,
@@ -259,7 +272,7 @@ impl<'a> IndexTableHeaderBuilder<'a> {
 
     pub fn add_key(&mut self, key: &[u8], offset: usize) {
         let offset = Self::check_offset(offset);
-        let micro_cell = IndexTable::key_micro_cell(&self.ks, key);
+        let micro_cell = MicroCellIndex::key_micro_cell(&self.ks, key);
         if let Some(last_micro_cell) = self.last_micro_cell {
             if last_micro_cell == micro_cell {
                 return;
@@ -302,30 +315,36 @@ mod tests {
         let mut index = IndexTable::default();
         index.insert(k(1), w(5));
         index.insert(k(5), w(10));
-        let bytes = index.to_bytes(ks);
-        assert_eq!(None, IndexTable::lookup_unloaded(ks, &bytes, &k(0)));
-        assert_eq!(Some(w(5)), IndexTable::lookup_unloaded(ks, &bytes, &k(1)));
-        assert_eq!(Some(w(10)), IndexTable::lookup_unloaded(ks, &bytes, &k(5)));
-        assert_eq!(None, IndexTable::lookup_unloaded(ks, &bytes, &k(10)));
+        let bytes = MicroCellIndex::to_bytes(&index, ks);
+        assert_eq!(None, MicroCellIndex::lookup_unloaded(ks, &bytes, &k(0)));
+        assert_eq!(
+            Some(w(5)),
+            MicroCellIndex::lookup_unloaded(ks, &bytes, &k(1))
+        );
+        assert_eq!(
+            Some(w(10)),
+            MicroCellIndex::lookup_unloaded(ks, &bytes, &k(5))
+        );
+        assert_eq!(None, MicroCellIndex::lookup_unloaded(ks, &bytes, &k(10)));
         let mut index = IndexTable::default();
         index.insert(k(u128::MAX), w(15));
         index.insert(k(u128::MAX - 5), w(25));
-        let bytes = index.to_bytes(ks);
+        let bytes = MicroCellIndex::to_bytes(&index, ks);
         assert_eq!(
             Some(w(15)),
-            IndexTable::lookup_unloaded(ks, &bytes, &k(u128::MAX))
+            MicroCellIndex::lookup_unloaded(ks, &bytes, &k(u128::MAX))
         );
         assert_eq!(
             Some(w(25)),
-            IndexTable::lookup_unloaded(ks, &bytes, &k(u128::MAX - 5))
+            MicroCellIndex::lookup_unloaded(ks, &bytes, &k(u128::MAX - 5))
         );
         assert_eq!(
             None,
-            IndexTable::lookup_unloaded(ks, &bytes, &k(u128::MAX - 1))
+            MicroCellIndex::lookup_unloaded(ks, &bytes, &k(u128::MAX - 1))
         );
         assert_eq!(
             None,
-            IndexTable::lookup_unloaded(ks, &bytes, &k(u128::MAX - 100))
+            MicroCellIndex::lookup_unloaded(ks, &bytes, &k(u128::MAX - 100))
         );
     }
 
@@ -346,14 +365,14 @@ mod tests {
             let pos = rng.next_u64();
             index.insert(k(key), w(pos));
         }
-        let bytes = index.to_bytes(ks);
+        let bytes = MicroCellIndex::to_bytes(&index, ks);
         for (key, expected_value) in index.data {
-            let value = IndexTable::lookup_unloaded(ks, &bytes, &key);
+            let value = MicroCellIndex::lookup_unloaded(ks, &bytes, &key);
             assert_eq!(Some(expected_value), value);
         }
         for _ in 0..ITERATIONS {
             let key = rng.gen_range(target_range.clone());
-            let value = IndexTable::lookup_unloaded(ks, &bytes, &k(key));
+            let value = MicroCellIndex::lookup_unloaded(ks, &bytes, &k(key));
             assert!(value.is_none());
         }
     }

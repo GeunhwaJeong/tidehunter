@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::flusher::{FlushKind, IndexFlusher};
-use crate::index_table::IndexTable;
+use crate::index_table::{IndexTable, MicroCellIndex, PersistedIndex};
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc};
 use crate::metrics::Metrics;
 use crate::primitives::arc_cow::ArcCow;
@@ -254,7 +254,7 @@ impl LargeTable {
         let index_reader = loader.index_reader(index_position)?;
         // todo - consider only doing block_in_place for the syscall random reader
         let result =
-            tokio::task::block_in_place(|| IndexTable::lookup_unloaded(ks, &index_reader, k));
+            tokio::task::block_in_place(|| MicroCellIndex::lookup_unloaded(ks, &index_reader, k));
         self.metrics
             .lookup_mcs
             .with_label_values(&[index_reader.kind_str(), entry.ks.name()])
