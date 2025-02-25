@@ -3,11 +3,12 @@ use crate::config::Config;
 use crate::control::ControlRegion;
 use crate::crc::{CrcFrame, CrcReadError, IntoBytesFixed};
 use crate::flusher::IndexFlusher;
-use crate::index_table::{IndexTable, MicroCellIndex, PersistedIndex};
+use crate::index_table::IndexTable;
 use crate::iterators::db_iterator::DbIterator;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc};
 use crate::large_table::{GetResult, LargeTable, LargeTableContainer, Loader, Version};
 use crate::metrics::{Metrics, TimerExt};
+use crate::persisted_index::{MicroCellIndex, PersistedIndex};
 use crate::wal::{
     PreparedWalWrite, Wal, WalError, WalIterator, WalPosition, WalRandomRead, WalWriter,
 };

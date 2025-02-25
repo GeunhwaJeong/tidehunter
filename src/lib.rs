@@ -11,6 +11,7 @@ mod large_table;
 mod lookup;
 mod math;
 pub mod metrics;
+mod persisted_index;
 mod primitives;
 #[cfg(feature = "stress")]
 mod prometheus;

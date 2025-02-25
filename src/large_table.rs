@@ -1,8 +1,9 @@
 use crate::config::Config;
 use crate::flusher::{FlushKind, IndexFlusher};
-use crate::index_table::{IndexTable, MicroCellIndex, PersistedIndex};
+use crate::index_table::IndexTable;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc};
 use crate::metrics::Metrics;
+use crate::persisted_index::{MicroCellIndex, PersistedIndex};
 use crate::primitives::arc_cow::ArcCow;
 use crate::primitives::sharded_mutex::ShardedMutex;
 use crate::wal::{WalPosition, WalRandomRead};
