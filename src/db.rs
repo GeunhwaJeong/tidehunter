@@ -517,7 +517,9 @@ impl Db {
             .flushed_keys
             .with_label_values(&[ksd.name()])
             .inc_by(index.len() as u64);
-        let index = MicroCellIndex::to_bytes(&index, ksd);
+        // todo avoid the box here; store persisten index in the large table?
+        let mci = Box::new(MicroCellIndex);
+        let index = mci.to_bytes(&index, ksd);
         self.metrics
             .flushed_bytes
             .with_label_values(&[ksd.name()])
@@ -543,7 +545,9 @@ impl Db {
 
     fn read_index(ks: &KeySpaceDesc, entry: WalEntry) -> DbResult<IndexTable> {
         if let WalEntry::Index(_, bytes) = entry {
-            let entry = MicroCellIndex::from_bytes(ks, bytes);
+            // todo avoid the box here; store persisten index in the large table?
+            let mci = Box::new(MicroCellIndex);
+            let entry = mci.from_bytes(ks, bytes);
             Ok(entry)
         } else {
             panic!("Unexpected wal entry where expected record");
