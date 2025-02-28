@@ -1,6 +1,8 @@
-use crate::wal::WalLayout;
+use crate::{persisted_index::MicroCellIndex, wal::WalLayout};
 use rand::Rng;
 use std::cmp;
+
+pub static PERSISTED_INDEX: MicroCellIndex = MicroCellIndex;
 
 // todo - remove pub
 #[cfg_attr(test, derive(Clone))] // Look for Config::clone(...) for usages

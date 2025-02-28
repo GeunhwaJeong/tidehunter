@@ -1,5 +1,5 @@
 use crate::batch::WriteBatch;
-use crate::config::Config;
+use crate::config::{Config, PERSISTED_INDEX};
 use crate::control::ControlRegion;
 use crate::crc::{CrcFrame, CrcReadError, IntoBytesFixed};
 use crate::flusher::IndexFlusher;
@@ -8,7 +8,7 @@ use crate::iterators::db_iterator::DbIterator;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc};
 use crate::large_table::{GetResult, LargeTable, LargeTableContainer, Loader, Version};
 use crate::metrics::{Metrics, TimerExt};
-use crate::persisted_index::{MicroCellIndex, PersistedIndex};
+use crate::persisted_index::PersistedIndex;
 use crate::wal::{
     PreparedWalWrite, Wal, WalError, WalIterator, WalPosition, WalRandomRead, WalWriter,
 };
@@ -517,9 +517,7 @@ impl Db {
             .flushed_keys
             .with_label_values(&[ksd.name()])
             .inc_by(index.len() as u64);
-        // todo avoid the box here; store persisten index in the large table?
-        let mci = Box::new(MicroCellIndex);
-        let index = mci.to_bytes(&index, ksd);
+        let index = PERSISTED_INDEX.to_bytes(&index, ksd);
         self.metrics
             .flushed_bytes
             .with_label_values(&[ksd.name()])
@@ -545,9 +543,7 @@ impl Db {
 
     fn read_index(ks: &KeySpaceDesc, entry: WalEntry) -> DbResult<IndexTable> {
         if let WalEntry::Index(_, bytes) = entry {
-            // todo avoid the box here; store persisten index in the large table?
-            let mci = Box::new(MicroCellIndex);
-            let entry = mci.from_bytes(ks, bytes);
+            let entry = PERSISTED_INDEX.from_bytes(ks, bytes);
             Ok(entry)
         } else {
             panic!("Unexpected wal entry where expected record");

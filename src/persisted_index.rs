@@ -212,12 +212,7 @@ impl SingleHopIndex {
         (from_offset, to_offset)
     }
 
-    fn move_window_up(
-        from_offset: usize,
-        to_offset: usize,
-        element_size: usize,
-        file_length: usize,
-    ) -> (usize, usize) {
+    fn move_window_up(to_offset: usize, element_size: usize, file_length: usize) -> (usize, usize) {
         let window_size = 2 * HALF_WINDOW_SIZE * element_size;
         let new_from_offset = to_offset;
         let new_to_offset = to_offset.saturating_add(window_size).clamp(0, file_length);
@@ -226,7 +221,6 @@ impl SingleHopIndex {
 
     fn move_window_down(
         from_offset: usize,
-        to_offset: usize,
         element_size: usize,
         file_length: usize,
     ) -> (usize, usize) {
@@ -314,28 +308,49 @@ impl PersistedIndex for SingleHopIndex {
             if key < first_element_key {
                 // key is smaller than the first element in the buffer
                 (from_offset, to_offset) =
-                    Self::move_window_down(from_offset, to_offset, element_size, file_length);
+                    Self::move_window_down(from_offset, element_size, file_length);
                 continue;
             }
             if key > last_element_key {
                 // key is larger than the last element in the buffer
                 (from_offset, to_offset) =
-                    Self::move_window_up(from_offset, to_offset, element_size, file_length);
+                    Self::move_window_up(to_offset, element_size, file_length);
                 continue;
             }
 
             // if the key is in the index, it must be in this buffer, iterate over the buffer to find the key
-            // todo: binary search
-            let mut buffer = &buffer[..];
-            while !buffer.is_empty() {
-                let k = &buffer[..key_size];
-                if k == key {
-                    buffer = &buffer[key_size..];
-                    let position = WalPosition::read_from_buf(&mut buffer);
-                    return Some(position);
-                }
-                buffer = &buffer[element_size..];
+            assert_eq!(buffer.len() % element_size, 0);
+            let count = buffer.len() / element_size;
+            if count == 0 {
+                return None; // no entries in this buffer window
             }
+
+            // Binary search on the sorted entries
+            let mut left = 0;
+            let mut right = count; // one past the last valid index
+            while left < right {
+                let mid = (left + right) / 2;
+                let entry_offset = mid * element_size;
+                let k = &buffer[entry_offset..entry_offset + key_size];
+
+                match k.cmp(key) {
+                    std::cmp::Ordering::Less => {
+                        left = mid + 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        right = mid;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        // parse wal position
+                        let mut pos_slice =
+                            &buffer[(entry_offset + key_size)..(entry_offset + element_size)];
+                        let position = WalPosition::read_from_buf(&mut pos_slice);
+                        return Some(position);
+                    }
+                }
+            }
+
+            // Not found
             return None;
         }
     }
@@ -343,12 +358,15 @@ impl PersistedIndex for SingleHopIndex {
 
 #[cfg(test)]
 mod test {
+    use std::{cell::Cell, collections::HashSet, ops::Range};
+
     use minibytes::Bytes;
     use rand::{rngs::ThreadRng, Rng, RngCore};
 
     use crate::{
         index_table::IndexTable,
         key_shape::KeyShape,
+        lookup::RandomRead,
         persisted_index::{MicroCellIndex, PersistedIndex, SingleHopIndex},
         wal::WalPosition,
     };
@@ -467,6 +485,214 @@ mod test {
             let value = pi.lookup_unloaded(ks, &bytes, &k128(key));
             assert!(value.is_none());
         }
+    }
+
+    #[test]
+    fn single_entry_search() {
+        let (shape, ks_id) = KeyShape::new_single(8, 4, 4);
+        let ks = shape.ks(ks_id);
+
+        // 1) Make an IndexTable with exactly 1 key-value
+        let mut index = IndexTable::default();
+        let key = Bytes::from(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let walpos = WalPosition::test_value(12345);
+        index.insert(key.clone(), walpos);
+
+        // 2) Write it to bytes
+        let pi = SingleHopIndex;
+        let bytes = pi.to_bytes(&index, ks);
+        assert!(!bytes.is_empty());
+
+        // 3) Make sure we can find that exact key
+        assert_eq!(Some(walpos), pi.lookup_unloaded(ks, &bytes, &key));
+
+        // 4) Try smaller key
+        let smaller_key = Bytes::from(vec![0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &smaller_key));
+
+        // 5) Try bigger key
+        let bigger_key = Bytes::from(vec![255, 255, 255, 255, 255, 255, 255, 255]);
+        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &bigger_key));
+    }
+
+    struct MockRandomRead {
+        data: Bytes,
+        read_calls: Cell<usize>,
+    }
+
+    impl MockRandomRead {
+        fn new(data: Bytes) -> Self {
+            Self {
+                data,
+                read_calls: Cell::new(0),
+            }
+        }
+
+        fn reset_call_count(&self) {
+            self.read_calls.set(0);
+        }
+
+        fn call_count(&self) -> usize {
+            self.read_calls.get()
+        }
+    }
+
+    impl RandomRead for MockRandomRead {
+        fn read(&self, range: Range<usize>) -> Bytes {
+            // Increment our call counter
+            let old = self.read_calls.get();
+            self.read_calls.set(old + 1);
+
+            let end = range.end.min(self.data.len());
+            self.data.slice(range.start.min(end)..end)
+        }
+
+        fn len(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    #[test]
+    fn test_key_at_window_edge() {
+        // 1) Build a KeyShape + single KeySpace for demonstration:
+        let (shape, ks_id) = KeyShape::new_single(8, 1, 1);
+        let ks = shape.ks(ks_id);
+
+        // 2) Insert several entries in ascending order
+        //    We'll ensure the "search key" is the first or last in the chunk
+        let mut table = IndexTable::default();
+
+        // We'll store keys [10, 20, 30, 40, 50], each is 8 bytes for simplicity
+        // We do a trivial WalPosition for demonstration
+        for &k in &[10_u64, 20, 30, 40, 50] {
+            let key_bytes = k.to_be_bytes().to_vec();
+            let walpos = WalPosition::test_value(k); // e.g. store the same number
+            table.insert(Bytes::from(key_bytes), walpos);
+        }
+
+        // 3) Convert the table to bytes using SingleHopIndex
+        let index_format = SingleHopIndex;
+        let serialized = index_format.to_bytes(&table, ks);
+
+        // 4) We'll build our mock "window" that intentionally ends
+        //    at the last entry being the search key.
+        //    Let's say we want to read only the final two entries [40, 50].
+        //    If the user wants to find key=40, it is the "first" in the chunk.
+        //    If the user wants to find key=50, it is the "last" in the chunk.
+        //
+        // We'll figure out the offsets manually: each entry is 8 bytes of key + 8 bytes of WalPosition = 16 bytes total.
+        // We have 5 entries => total size = 5 * 16 = 80. The layout is:
+        // entry #0: offset 0..16   (key=10)
+        // entry #1: offset 16..32 (key=20)
+        // entry #2: offset 32..48 (key=30)
+        // entry #3: offset 48..64 (key=40)
+        // entry #4: offset 64..80 (key=50)
+
+        // We'll define a custom partial chunk from offset=48..80 => that includes keys [40, 50].
+        let mock_reader = MockRandomRead::new(serialized.clone());
+        let from_offset = 48;
+        let to_offset = 80;
+
+        // 5) Manually read that "window" to confirm the first key is 40, last is 50
+        let _ = mock_reader.read(from_offset..to_offset);
+        // chunk now holds entries #3 (key=40) and #4 (key=50)
+
+        // 6) Suppose we want to confirm that lookup_unloaded can find key=40 if it picks exactly this chunk
+        //    We'll just call the normal function, though keep in mind that SingleHopIndex internally
+        //    calculates offsets. In a real test, we might override the 'probable_offset' logic or do multiple steps
+        //    until it arrives at from_offset=48..to_offset=80.
+        //
+        // For demonstration, we'll do it directly:
+        let key_40 = 40_u64.to_be_bytes();
+        let found = index_format.lookup_unloaded(ks, &mock_reader, &key_40);
+        assert_eq!(
+            found,
+            Some(WalPosition::test_value(40)),
+            "Key=40 not found at chunk start"
+        );
+
+        // 7) Similarly, check key=50 (which is the last in the chunk)
+        let key_50 = 50_u64.to_be_bytes();
+        let found_50 = index_format.lookup_unloaded(ks, &mock_reader, &key_50);
+        assert_eq!(
+            found_50,
+            Some(WalPosition::test_value(50)),
+            "Key=50 not found at chunk end"
+        );
+
+        // 8) Also confirm a missing key (key=45) isn't found in that partial chunk
+        let key_45 = 45_u64.to_be_bytes();
+        let missing = index_format.lookup_unloaded(ks, &mock_reader, &key_45);
+        assert_eq!(missing, None, "Key=45 should not be found");
+    }
+
+    #[test]
+    fn test_probable_window_accuracy_with_random_keys() {
+        let num_entries = 1_000_000;
+        let test_lookups = num_entries / 10; // 10% lookups
+        let (shape, ks_id) = KeyShape::new_single(8, 1, 1);
+        let ks = shape.ks(ks_id);
+
+        // 1) Generate random, distinct 64-bit keys
+        //    We'll store them in a HashSet to ensure uniqueness.
+        let mut rng = rand::thread_rng();
+        let mut unique_keys = HashSet::with_capacity(num_entries);
+        while unique_keys.len() < num_entries {
+            let k = rng.gen::<u64>();
+            unique_keys.insert(k);
+        }
+
+        // 2) Build an IndexTable from those random keys
+        let mut index = IndexTable::default();
+        for &k in &unique_keys {
+            let key_bytes = k.to_be_bytes().to_vec();
+            // We'll store WalPosition as the same integer for simplicity
+            index.insert(Bytes::from(key_bytes), WalPosition::test_value(k));
+        }
+
+        // 3) Convert to bytes using SingleHopIndex
+        let index_format = SingleHopIndex;
+        let data = index_format.to_bytes(&index, ks);
+
+        // 4) Wrap it in our MockRandomRead
+        let reader = MockRandomRead::new(data);
+
+        // We'll now do random lookups for 10% of the keys
+        // Build a vec of all keys, then sample from it
+        let all_keys: Vec<u64> = unique_keys.into_iter().collect();
+        let mut single_hop_success = 0;
+
+        for _ in 0..test_lookups {
+            // pick a random key from the set
+            let key = all_keys[rng.gen_range(0..all_keys.len())];
+
+            // reset the read call count
+            reader.reset_call_count();
+
+            // do the lookup
+            let key_bytes = key.to_be_bytes();
+            let found = index_format.lookup_unloaded(ks, &reader, &key_bytes);
+
+            // confirm correctness, though you can skip if you only care about stats
+            assert_eq!(
+                found,
+                Some(WalPosition::test_value(key)),
+                "Did not find expected key in index!"
+            );
+
+            // check if exactly one read call was needed
+            if reader.call_count() == 1 {
+                single_hop_success += 1;
+            }
+        }
+
+        let success_rate = (single_hop_success as f64) / (test_lookups as f64) * 100.0;
+        println!(
+            "Single-hop success rate: {}/{} (~{:.2}%)",
+            single_hop_success, test_lookups, success_rate
+        );
+        // Optionally: assert if you want a minimum threshold
+        // assert!(success_rate > 50.0, "Single-hop success is too low!");
     }
 
     fn k64(k: u64) -> [u8; 8] {

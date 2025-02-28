@@ -144,10 +144,6 @@ impl IndexTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key_shape::KeyShape;
-    use crate::persisted_index::{MicroCellIndex, PersistedIndex};
-    use rand::rngs::ThreadRng;
-    use rand::{Rng, RngCore};
 
     #[test]
     pub fn test_unmerge_flushed() {
@@ -229,13 +225,5 @@ mod tests {
         // not existing element - next not found
         let next = table.next_entry(Some(vec![1, 2, 3, 3].into()), true);
         assert!(next.is_none());
-    }
-
-    fn k(k: u128) -> Bytes {
-        k.to_be_bytes().to_vec().into()
-    }
-
-    fn w(w: u64) -> WalPosition {
-        WalPosition::test_value(w)
     }
 }
