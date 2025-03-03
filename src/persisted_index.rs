@@ -13,7 +13,6 @@ use crate::{
 const HEADER_ELEMENTS: usize = 1024;
 const HEADER_ELEMENT_SIZE: usize = 8;
 const HEADER_SIZE: usize = HEADER_ELEMENTS * HEADER_ELEMENT_SIZE;
-const HALF_WINDOW_SIZE: usize = 500; // in entries (not bytes); todo make configurable
 const PREFIX_LENGTH: usize = 8; // prefix of key used to estimate position in file, in bytes
 
 pub trait PersistedIndex {
@@ -170,14 +169,34 @@ impl<'a> IndexTableHeaderBuilder<'a> {
     }
 }
 
-pub struct SingleHopIndex;
+pub struct SingleHopIndex {
+    window_sizes: Vec<Vec<usize>>,
+    // any other fields you need
+}
 
 impl SingleHopIndex {
-    fn get_probable_key_offset(
+    pub fn new() -> Self {
+        // For now, let’s fill with default values.
+        // Suppose we want a 128x128 matrix that always returns 500 initially:
+        let size_x = 128;
+        let size_y = 128;
+        let mut matrix = Vec::with_capacity(size_x);
+        for _ in 0..size_x {
+            let row = vec![500; size_y];
+            matrix.push(row);
+        }
+
+        Self {
+            window_sizes: matrix,
+        }
+    }
+
+    fn get_probable_key_offset_and_window_size(
+        &self,
         cell_prefix_range: &Range<u64>,
         key: &[u8],
         file_length: usize,
-    ) -> usize {
+    ) -> (usize, usize) {
         let long_prefix_range_start = cell_prefix_range
             .start
             .saturating_mul(1 << (PREFIX_LENGTH - CELL_PREFIX_LENGTH) * 8);
@@ -189,31 +208,40 @@ impl SingleHopIndex {
         assert!(PREFIX_LENGTH >= CELL_PREFIX_LENGTH);
         assert!(PREFIX_LENGTH <= 8); // we want the prefix to fit in u64
         let mut p = [0u8; PREFIX_LENGTH];
-        p[..PREFIX_LENGTH].copy_from_slice(&key[..PREFIX_LENGTH]);
+        let copy_len = key.len().min(PREFIX_LENGTH);
+        p[..copy_len].copy_from_slice(&key[..copy_len]);
         let prefix = u64::from_be_bytes(p);
         assert!(long_prefix_range_start <= prefix && prefix <= long_prefix_range_end);
         let prefix_pos = prefix.saturating_sub(long_prefix_range_start);
         let probable_offset = (prefix_pos as f64) * (file_length as f64) / (cell_width as f64);
         let probable_offset = (probable_offset.round() as usize).clamp(0, file_length - 1);
-        probable_offset
+        let half_window_size = self.window_sizes[0][0]; // todo lookup by N and p
+
+        (probable_offset, half_window_size)
     }
 
     fn get_start_and_end_offsets(
+        half_window_size: usize,
         estimated_offset: usize,
         element_size: usize,
         file_length: usize,
     ) -> (usize, usize) {
         // make sure to align to element size
         let estimated_offset = estimated_offset / element_size * element_size;
-        let from_offset = estimated_offset.saturating_sub(HALF_WINDOW_SIZE * element_size);
+        let from_offset = estimated_offset.saturating_sub(half_window_size * element_size);
         let to_offset = estimated_offset
-            .saturating_add(HALF_WINDOW_SIZE * element_size)
+            .saturating_add(half_window_size * element_size)
             .clamp(0, file_length);
         (from_offset, to_offset)
     }
 
-    fn move_window_up(to_offset: usize, element_size: usize, file_length: usize) -> (usize, usize) {
-        let window_size = 2 * HALF_WINDOW_SIZE * element_size;
+    fn move_window_up(
+        to_offset: usize,
+        half_window_size: usize,
+        element_size: usize,
+        file_length: usize,
+    ) -> (usize, usize) {
+        let window_size = 2 * half_window_size * element_size;
         let new_from_offset = to_offset;
         let new_to_offset = to_offset.saturating_add(window_size).clamp(0, file_length);
         (new_from_offset, new_to_offset)
@@ -221,10 +249,11 @@ impl SingleHopIndex {
 
     fn move_window_down(
         from_offset: usize,
+        half_window_size: usize,
         element_size: usize,
         file_length: usize,
     ) -> (usize, usize) {
-        let window_size = 2 * HALF_WINDOW_SIZE * element_size;
+        let window_size = 2 * half_window_size * element_size;
         let new_from_offset = from_offset
             .saturating_sub(window_size)
             .clamp(0, file_length);
@@ -289,13 +318,21 @@ impl PersistedIndex for SingleHopIndex {
 
         // compute probable offset
         let file_length = reader.len();
-        let probable_offset = Self::get_probable_key_offset(&cell_prefix_range, key, file_length);
+        let (probable_offset, half_window_size) =
+            self.get_probable_key_offset_and_window_size(&cell_prefix_range, key, file_length);
 
         // compute start and end of the window around probable offset
-        let (mut from_offset, mut to_offset) =
-            Self::get_start_and_end_offsets(probable_offset, element_size, file_length);
+        let (mut from_offset, mut to_offset) = Self::get_start_and_end_offsets(
+            half_window_size,
+            probable_offset,
+            element_size,
+            file_length,
+        );
 
         loop {
+            if (from_offset >= to_offset) || (from_offset >= file_length) {
+                return None;
+            }
             let buffer = reader.read(from_offset..to_offset);
 
             if buffer.len() < element_size {
@@ -307,14 +344,18 @@ impl PersistedIndex for SingleHopIndex {
                 &buffer[buffer.len() - element_size..buffer.len() - element_size + key_size];
             if key < first_element_key {
                 // key is smaller than the first element in the buffer
-                (from_offset, to_offset) =
-                    Self::move_window_down(from_offset, element_size, file_length);
+                (from_offset, to_offset) = Self::move_window_down(
+                    from_offset,
+                    half_window_size,
+                    element_size,
+                    file_length,
+                );
                 continue;
             }
             if key > last_element_key {
                 // key is larger than the last element in the buffer
                 (from_offset, to_offset) =
-                    Self::move_window_up(to_offset, element_size, file_length);
+                    Self::move_window_up(to_offset, half_window_size, element_size, file_length);
                 continue;
             }
 
@@ -358,7 +399,7 @@ impl PersistedIndex for SingleHopIndex {
 
 #[cfg(test)]
 mod test {
-    use std::{cell::Cell, collections::HashSet, ops::Range};
+    use std::{cell::Cell, collections::HashSet, ops::Range, vec};
 
     use minibytes::Bytes;
     use rand::{rngs::ThreadRng, Rng, RngCore};
@@ -375,54 +416,66 @@ mod test {
     fn test_offset_calculation() {
         let cell_prefix_range = 0..100;
         let file_length = 1000; // test with file larger than range
+        let pi = SingleHopIndex::new();
 
         let key = [0, 0, 0, 0, 0, 0, 0, 0];
-        let offset = SingleHopIndex::get_probable_key_offset(&cell_prefix_range, &key, file_length);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, 0);
 
         let key: [u8; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 255];
-        let offset = SingleHopIndex::get_probable_key_offset(&cell_prefix_range, &key, file_length);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, 0);
 
         let key = k64(0);
-        let offset = SingleHopIndex::get_probable_key_offset(&cell_prefix_range, &key, file_length);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, 0);
 
         let key = k64((cell_prefix_range.end << 32) - 1);
-        let offset = SingleHopIndex::get_probable_key_offset(&cell_prefix_range, &key, file_length);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, file_length - 1);
 
         let key = k64((cell_prefix_range.end << 32) / 2);
-        let offset = SingleHopIndex::get_probable_key_offset(&cell_prefix_range, &key, file_length);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, file_length / 2);
 
         let file_length = 10; // test with file smaller than range
 
         let key = [0, 0, 0, 0, 0, 0, 0, 0];
-        let offset = SingleHopIndex::get_probable_key_offset(&cell_prefix_range, &key, file_length);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, 0);
 
         let key: [u8; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 255];
-        let offset = SingleHopIndex::get_probable_key_offset(&cell_prefix_range, &key, file_length);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, 0);
 
         let key = k64(0);
-        let offset = SingleHopIndex::get_probable_key_offset(&cell_prefix_range, &key, file_length);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, 0);
 
         let key = k64((cell_prefix_range.end << 32) - 1);
-        let offset = SingleHopIndex::get_probable_key_offset(&cell_prefix_range, &key, file_length);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, file_length - 1);
 
         let key = k64((cell_prefix_range.end << 32) / 2);
-        let offset = SingleHopIndex::get_probable_key_offset(&cell_prefix_range, &key, file_length);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, file_length / 2);
     }
 
     #[test]
     pub fn test_index_lookup() {
         test_index_lookup_inner(&MicroCellIndex);
-        test_index_lookup_inner(&SingleHopIndex);
+        let pi = SingleHopIndex::new();
+        test_index_lookup_inner(&pi);
     }
 
     pub fn test_index_lookup_inner(pi: &impl PersistedIndex) {
@@ -454,9 +507,76 @@ mod test {
     }
 
     #[test]
+    fn test_persisted_index_roundtrip() {
+        // 1) Choose an implementation: SingleHopIndex or MicroCellIndex
+        //    Depending on which you want to test.
+        let single_hop = SingleHopIndex::new();
+
+        // 2) Build a key shape (assuming 8-byte keys, but adapt as needed)
+        let (shape, ks_id) = KeyShape::new_single(8, 4, 4);
+        let ks = shape.ks(ks_id);
+
+        // 3) Populate an IndexTable with some entries
+        let mut original_index = IndexTable::default();
+
+        // Insert a few sample entries:
+        let key1 = Bytes::from(vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        let key2 = Bytes::from(vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0, 0, 0]);
+        let key3 = Bytes::from(vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        original_index.insert(key1.clone(), WalPosition::test_value(100));
+        original_index.insert(key2.clone(), WalPosition::test_value(200));
+        original_index.insert(key3.clone(), WalPosition::test_value(300));
+
+        // 4) Convert to bytes
+        let serialized = single_hop.to_bytes(&original_index, ks);
+
+        // 5) From those bytes, build a new IndexTable
+        let roundtrip_index = single_hop.from_bytes(ks, serialized);
+
+        // 6) Confirm the new table has the same entries
+        //    For example, check that each key still maps to the same WalPosition
+        assert_eq!(
+            roundtrip_index.get(&key1),
+            Some(WalPosition::test_value(100)),
+            "Key1 not found or mismatched in round-trip"
+        );
+
+        assert_eq!(
+            roundtrip_index.get(&key2),
+            Some(WalPosition::test_value(200)),
+            "Key2 not found or mismatched in round-trip"
+        );
+
+        assert_eq!(
+            roundtrip_index.get(&key3),
+            Some(WalPosition::test_value(300)),
+            "Key3 not found or mismatched in round-trip"
+        );
+
+        // Also iterate over roundtrip_index.data
+        // and confirm it matches original_index.data exactly.
+        assert_eq!(
+            original_index.data.len(),
+            roundtrip_index.data.len(),
+            "IndexTable size mismatch"
+        );
+
+        for (k, pos) in &original_index.data {
+            let rt_pos = roundtrip_index
+                .get(k)
+                .expect("Missing key in round-trip index");
+            assert_eq!(pos, &rt_pos, "WalPosition mismatch for key={:?}", k);
+        }
+
+        // If no assertion failed, we've verified that
+        // the persisted index correctly round-trips these entries.
+    }
+
+    #[test]
     pub fn test_index_lookup_random() {
         test_index_lookup_random_inner(&MicroCellIndex);
-        test_index_lookup_random_inner(&SingleHopIndex);
+        let pi = SingleHopIndex::new();
+        test_index_lookup_random_inner(&pi);
     }
 
     pub fn test_index_lookup_random_inner(pi: &impl PersistedIndex) {
@@ -499,7 +619,7 @@ mod test {
         index.insert(key.clone(), walpos);
 
         // 2) Write it to bytes
-        let pi = SingleHopIndex;
+        let pi = SingleHopIndex::new();
         let bytes = pi.to_bytes(&index, ks);
         assert!(!bytes.is_empty());
 
@@ -571,7 +691,7 @@ mod test {
         }
 
         // 3) Convert the table to bytes using SingleHopIndex
-        let index_format = SingleHopIndex;
+        let index_format = SingleHopIndex::new();
         let serialized = index_format.to_bytes(&table, ks);
 
         // 4) We'll build our mock "window" that intentionally ends
@@ -651,7 +771,7 @@ mod test {
         }
 
         // 3) Convert to bytes using SingleHopIndex
-        let index_format = SingleHopIndex;
+        let index_format = SingleHopIndex::new();
         let data = index_format.to_bytes(&index, ks);
 
         // 4) Wrap it in our MockRandomRead
@@ -693,6 +813,104 @@ mod test {
         );
         // Optionally: assert if you want a minimum threshold
         // assert!(success_rate > 50.0, "Single-hop success is too low!");
+    }
+
+    #[test]
+    fn test_singlehopindex_with_short_keys() {
+        // 1) Build a KeyShape that expects e.g. 4‐byte keys
+        let (shape, ks_id) = KeyShape::new_single(4, 12, 12);
+        let ks = shape.ks(ks_id);
+
+        // 2) Insert a few short keys into IndexTable
+        //    e.g. 4‐byte keys, 1‐byte key, empty key...
+        let mut index = IndexTable::default();
+        let key1 = vec![1, 2, 3, 4];
+        let key2 = vec![3, 4, 5, 6];
+
+        index.insert(key1.clone().into(), WalPosition::test_value(1001));
+        index.insert(key2.clone().into(), WalPosition::test_value(1002));
+
+        // 3) Convert to bytes with SingleHopIndex
+        let single_hop = SingleHopIndex::new();
+        let data = single_hop.to_bytes(&index, ks);
+
+        // 4) Mock a simple in‐memory reader
+
+        let reader = MockRandomRead::new(data);
+
+        // 5) Make sure we can look up short_key1, short_key2, short_key3
+        //    without panicking or indexing out of range
+        let found1 = single_hop.lookup_unloaded(ks, &reader, &key1);
+        assert_eq!(found1, Some(WalPosition::test_value(1001)));
+
+        let found2 = single_hop.lookup_unloaded(ks, &reader, &key2);
+        assert_eq!(found2, Some(WalPosition::test_value(1002)));
+
+        // 6) Also ensure that a random short key that doesn't exist returns None
+        let not_inserted = Bytes::from(vec![7, 8, 9, 10]);
+        let found4 = single_hop.lookup_unloaded(ks, &reader, &not_inserted);
+        assert_eq!(found4, None, "Key {not_inserted:?} unexpectedly found");
+    }
+
+    #[test]
+    fn test_persisted_index_with_filerange() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        // 1) Choose which PersistedIndex to test:
+        let index_impl = SingleHopIndex::new();
+
+        // 2) Build a KeyShape, e.g. 8-byte keys
+        let (shape, ks_id) = KeyShape::new_single(4, 12, 12);
+        let ks = shape.ks(ks_id);
+
+        // 3) Populate an IndexTable
+        let mut table = IndexTable::default();
+        let key1 = Bytes::from(vec![1, 2, 3, 4]);
+        let key2 = Bytes::from(vec![3, 4, 5, 6]);
+        table.insert(key1.clone(), WalPosition::test_value(100));
+        table.insert(key2.clone(), WalPosition::test_value(200));
+
+        // 4) Convert the table to bytes
+        let bytes = index_impl.to_bytes(&table, ks);
+
+        // 5) Write those bytes to a temp file
+        let tmp_dir = tempdir::TempDir::new("test-wal").unwrap();
+        let file_path = tmp_dir.path().join("index_data_filerange.bin");
+
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .open(&file_path)
+                .expect("Failed to open file for writing");
+
+            file.write_all(&bytes).expect("Failed to write index bytes");
+            file.sync_all().unwrap();
+        }
+
+        // 6) Open the file again for reading, get its size, and build a FileRange
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&file_path)
+            .expect("Failed to open file for reading");
+
+        let file_len = file.metadata().unwrap().len();
+        // Full file range is 0..file_len
+        let file_range = crate::lookup::FileRange::new(&file, 0..file_len);
+
+        // 7) Use lookup_unloaded to find each key
+        // let found1 = index_impl.lookup_unloaded(ks, &file_range, &key1);
+        // assert_eq!(found1, Some(WalPosition::test_value(100)));
+
+        let found2 = index_impl.lookup_unloaded(ks, &file_range, &key2);
+        assert_eq!(found2, Some(WalPosition::test_value(200)));
+
+        // 8) Confirm non-existent key returns None
+        let key3 = Bytes::from(vec![99, 99, 99, 99]);
+        let found3 = index_impl.lookup_unloaded(ks, &file_range, &key3);
+        assert_eq!(found3, None);
     }
 
     fn k64(k: u64) -> [u8; 8] {
