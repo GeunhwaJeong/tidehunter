@@ -21,9 +21,9 @@ histogram = { version = "0.11.1", optional = true }
 axum = { version = "0.6.18", optional = true }
 bloom = "0.3.2"
 lru = "0.12.2"
-statrs = "0.16"
-sha2 = "0.10"
-time = "0.3"
+statrs = { version = "0.16", optional = true }
+sha2 = { version = "0.10", optional = true }
+time = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempdir = "0.3.7"
@@ -37,4 +37,9 @@ stress = [
 ]
 random_access_speed_test = [
     "tempdir"
+]
+read_window_test = [
+    "statrs",
+    "sha2",
+    "time",
 ]

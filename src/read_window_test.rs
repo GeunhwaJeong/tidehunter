@@ -201,7 +201,7 @@ fn compute_hit_rate_exact(test_keys: &[(u64, usize)], n: usize) -> (f64, f64) {
     (hit_rate, avg_window)
 }
 
-fn main() {
+pub(crate) fn main() {
     let n_values = build_n_values();
     let p_values = build_p_values();
     println!("Precomputing window sizes...");
