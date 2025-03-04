@@ -5,12 +5,12 @@ use crate::math::rescale_u32;
 use crate::wal::WalPosition;
 use crate::{index::index_table::IndexTable, key_shape::KeySpaceDesc, lookup::RandomRead};
 
-use super::persisted_index::{PersistedIndex, HEADER_ELEMENTS, HEADER_ELEMENT_SIZE, HEADER_SIZE};
+use super::persisted_index::{IndexFormat, HEADER_ELEMENTS, HEADER_ELEMENT_SIZE, HEADER_SIZE};
 use super::{deserialize_index_entries, serialize_index_entries};
 
-pub struct MicroCellIndex;
+pub struct LookupHeaderIndex;
 
-impl MicroCellIndex {
+impl LookupHeaderIndex {
     fn key_micro_cell(ks: &KeySpaceDesc, key: &[u8]) -> usize {
         let prefix = ks.cell_prefix(key);
         let cell = ks.cell_by_prefix(prefix);
@@ -25,7 +25,7 @@ impl MicroCellIndex {
     }
 }
 
-impl PersistedIndex for MicroCellIndex {
+impl IndexFormat for LookupHeaderIndex {
     fn to_bytes(&self, table: &IndexTable, ks: &KeySpaceDesc) -> Bytes {
         let element_size = Self::element_size(ks);
         let capacity = element_size * table.data.len() + HEADER_SIZE;
@@ -102,7 +102,7 @@ impl<'a> IndexTableHeaderBuilder<'a> {
 
     pub fn add_key(&mut self, key: &[u8], offset: usize) {
         let offset = Self::check_offset(offset);
-        let micro_cell = MicroCellIndex::key_micro_cell(&self.ks, key);
+        let micro_cell = LookupHeaderIndex::key_micro_cell(&self.ks, key);
         if let Some(last_micro_cell) = self.last_micro_cell {
             if last_micro_cell == micro_cell {
                 return;
@@ -138,11 +138,11 @@ mod tests {
 
     #[test]
     pub fn test_index_lookup() {
-        test_index_lookup_inner(&MicroCellIndex);
+        test_index_lookup_inner(&LookupHeaderIndex);
     }
 
     #[test]
     pub fn test_index_lookup_random() {
-        test_index_lookup_random_inner(&MicroCellIndex);
+        test_index_lookup_random_inner(&LookupHeaderIndex);
     }
 }

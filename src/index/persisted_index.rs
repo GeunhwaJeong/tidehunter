@@ -8,7 +8,7 @@ pub const HEADER_ELEMENT_SIZE: usize = 8;
 pub const HEADER_SIZE: usize = HEADER_ELEMENTS * HEADER_ELEMENT_SIZE;
 pub const PREFIX_LENGTH: usize = 8; // prefix of key used to estimate position in file, in bytes
 
-pub trait PersistedIndex {
+pub trait IndexFormat {
     fn to_bytes(&self, table: &IndexTable, ks: &KeySpaceDesc) -> Bytes;
     fn from_bytes(&self, ks: &KeySpaceDesc, b: Bytes) -> IndexTable;
     fn lookup_unloaded(
@@ -29,11 +29,11 @@ pub mod test {
     use rand::{rngs::ThreadRng, Rng, RngCore};
 
     use crate::{
-        index::index_table::IndexTable, index::persisted_index::PersistedIndex,
-        key_shape::KeyShape, wal::WalPosition,
+        index::index_table::IndexTable, index::persisted_index::IndexFormat, key_shape::KeyShape,
+        wal::WalPosition,
     };
 
-    pub fn test_index_lookup_inner(pi: &impl PersistedIndex) {
+    pub fn test_index_lookup_inner(pi: &impl IndexFormat) {
         let (shape, ks) = KeyShape::new_single(16, 8, 8);
         let ks = shape.ks(ks);
         let mut index = IndexTable::default();
@@ -61,7 +61,7 @@ pub mod test {
         assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &k128(u128::MAX - 100)));
     }
 
-    pub fn test_index_lookup_random_inner(pi: &impl PersistedIndex) {
+    pub fn test_index_lookup_random_inner(pi: &impl IndexFormat) {
         const M: usize = 8;
         const P: usize = 8;
         let (shape, ks) = KeyShape::new_single(4, M, P);

@@ -1,18 +1,19 @@
 use minibytes::Bytes;
 use std::ops::Range;
 
-use super::persisted_index::PersistedIndex;
+use super::persisted_index::IndexFormat;
 use super::{deserialize_index_entries, serialize_index_entries};
 use crate::index::persisted_index::PREFIX_LENGTH;
 use crate::key_shape::CELL_PREFIX_LENGTH;
 use crate::wal::WalPosition;
 use crate::{index::index_table::IndexTable, key_shape::KeySpaceDesc, lookup::RandomRead};
 
-pub struct SingleHopIndex {
+pub struct UniformLookupIndex {
     window_sizes: Vec<Vec<usize>>,
 }
 
-impl SingleHopIndex {
+impl UniformLookupIndex {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         // For now, let’s fill with default values.
         // Suppose we want a 128x128 matrix that always returns 500 initially:
@@ -29,7 +30,7 @@ impl SingleHopIndex {
         }
     }
 
-    fn get_probable_key_offset_and_window_size(
+    fn probable_key_offset_and_window_size(
         &self,
         cell_prefix_range: &Range<u64>,
         key: &[u8],
@@ -49,16 +50,20 @@ impl SingleHopIndex {
         let copy_len = key.len().min(PREFIX_LENGTH);
         p[..copy_len].copy_from_slice(&key[..copy_len]);
         let prefix = u64::from_be_bytes(p);
-        assert!(long_prefix_range_start <= prefix && prefix <= long_prefix_range_end);
+        if long_prefix_range_start > prefix || prefix > long_prefix_range_end {
+            panic!("Key prefix out of range: key prefix={prefix}, long_prefix_range={long_prefix_range_start}..{long_prefix_range_end}");
+        }
         let prefix_pos = prefix.saturating_sub(long_prefix_range_start);
-        let probable_offset = (prefix_pos as f64) * (file_length as f64) / (cell_width as f64);
-        let probable_offset = (probable_offset.round() as usize).clamp(0, file_length - 1);
+        // cannot cause overflow because prefix_pos is always smaller than cell_width
+        let probable_offset =
+            (((prefix_pos as u128) * (file_length as u128) / (cell_width as u128)) as usize)
+                .clamp(0, file_length - 1);
         let half_window_size = self.window_sizes[0][0]; // todo lookup by N and p
 
         (probable_offset, half_window_size)
     }
 
-    fn get_start_and_end_offsets(
+    fn lookup_window(
         half_window_size: usize,
         estimated_offset: usize,
         element_size: usize,
@@ -100,7 +105,7 @@ impl SingleHopIndex {
     }
 }
 
-impl PersistedIndex for SingleHopIndex {
+impl IndexFormat for UniformLookupIndex {
     fn to_bytes(&self, table: &IndexTable, ks: &KeySpaceDesc) -> Bytes {
         let element_size = Self::element_size(ks);
         let capacity = element_size * table.data.len();
@@ -131,39 +136,22 @@ impl PersistedIndex for SingleHopIndex {
 
         // compute probable offset
         let file_length = reader.len();
-        // println!(
-        //     "lookup_unloaded: file_length={}, cell_prefix_range={:?}",
-        //     file_length, cell_prefix_range
-        // );
         let (probable_offset, half_window_size) =
-            self.get_probable_key_offset_and_window_size(&cell_prefix_range, key, file_length);
-        // println!(
-        //     "lookup_unloaded: probable_offset={}, half_window_size={}",
-        //     probable_offset, half_window_size
-        // );
+            self.probable_key_offset_and_window_size(&cell_prefix_range, key, file_length);
 
         // compute start and end of the window around probable offset
-        let (mut from_offset, mut to_offset) = Self::get_start_and_end_offsets(
-            half_window_size,
-            probable_offset,
-            element_size,
-            file_length,
-        );
-        // println!(
-        //     "lookup_unloaded: from_offset={}, to_offset={}",
-        //     from_offset, to_offset
-        // );
+        let (mut from_offset, mut to_offset) =
+            Self::lookup_window(half_window_size, probable_offset, element_size, file_length);
 
+        // todo record metrics for the number of iterations
         loop {
-            if (from_offset >= to_offset) || (from_offset >= file_length) {
-                // println!("lookup_unloaded: from_offset >= to_offset, returning None");
+            if ((to_offset as i128) - (from_offset as i128) < (element_size as i128))
+                || (from_offset >= file_length)
+            {
                 return None;
             }
             let buffer = reader.read(from_offset..to_offset);
 
-            if buffer.len() < element_size {
-                return None;
-            }
             // first check if the buffer range contains the key
             let first_element_key = &buffer[..key_size];
             let last_element_key =
@@ -176,32 +164,24 @@ impl PersistedIndex for SingleHopIndex {
                     element_size,
                     file_length,
                 );
-                // println!(
-                //     "lookup_unloaded: from_offset={}, to_offset={}",
-                //     from_offset, to_offset
-                // );
                 continue;
             }
             if key > last_element_key {
                 // key is larger than the last element in the buffer
                 (from_offset, to_offset) =
                     Self::move_window_up(to_offset, half_window_size, element_size, file_length);
-                // println!(
-                //     "lookup_unloaded: from_offset={}, to_offset={}",
-                //     from_offset, to_offset
-                // );
                 continue;
             }
 
             // if the key is in the index, it must be in this buffer, iterate over the buffer to find the key
-            assert_eq!(buffer.len() % element_size, 0);
+            debug_assert_eq!(buffer.len() % element_size, 0);
             let count = buffer.len() / element_size;
             if count == 0 {
-                // println!("lookup_unloaded: count == 0, returning None");
                 return None; // no entries in this buffer window
             }
 
             // Binary search on the sorted entries
+            // todo compare different approaches for in-memory search
             let mut left = 0;
             let mut right = count; // one past the last valid index
             while left < right {
@@ -221,14 +201,12 @@ impl PersistedIndex for SingleHopIndex {
                         let mut pos_slice =
                             &buffer[(entry_offset + key_size)..(entry_offset + element_size)];
                         let position = WalPosition::read_from_buf(&mut pos_slice);
-                        // println!("lookup_unloaded: found key, returning Some(position)");
                         return Some(position);
                     }
                 }
             }
 
             // Not found
-            // println!("lookup_unloaded: key not found, returning None");
             return None;
         }
     }
@@ -244,13 +222,13 @@ mod test {
 
     #[test]
     pub fn test_index_lookup() {
-        let pi = SingleHopIndex::new();
+        let pi = UniformLookupIndex::new();
         test_index_lookup_inner(&pi);
     }
 
     #[test]
     pub fn test_index_lookup_random() {
-        let pi = SingleHopIndex::new();
+        let pi = UniformLookupIndex::new();
         test_index_lookup_random_inner(&pi);
     }
 
@@ -310,7 +288,7 @@ mod test {
         }
 
         // 3) Convert the table to bytes using SingleHopIndex
-        let index_format = SingleHopIndex::new();
+        let index_format = UniformLookupIndex::new();
         let serialized = index_format.to_bytes(&table, ks);
 
         // 4) We'll build our mock "window" that intentionally ends
@@ -390,7 +368,7 @@ mod test {
         }
 
         // 3) Convert to bytes using SingleHopIndex
-        let index_format = SingleHopIndex::new();
+        let index_format = UniformLookupIndex::new();
         let data = index_format.to_bytes(&index, ks);
 
         // 4) Wrap it in our MockRandomRead
@@ -438,58 +416,58 @@ mod test {
     fn test_offset_calculation() {
         let cell_prefix_range = 0..100;
         let file_length = 1000; // test with file larger than range
-        let pi = SingleHopIndex::new();
+        let pi = UniformLookupIndex::new();
 
         let key = [0, 0, 0, 0, 0, 0, 0, 0];
         let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+            pi.probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, 0);
 
         let key: [u8; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 255];
         let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+            pi.probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, 0);
 
         let key = k64(0);
         let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+            pi.probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, 0);
 
         let key = k64((cell_prefix_range.end << 32) - 1);
         let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+            pi.probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, file_length - 1);
 
         let key = k64((cell_prefix_range.end << 32) / 2);
         let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+            pi.probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, file_length / 2);
 
         let file_length = 10; // test with file smaller than range
 
         let key = [0, 0, 0, 0, 0, 0, 0, 0];
         let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+            pi.probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, 0);
 
         let key: [u8; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 255];
         let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+            pi.probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, 0);
 
         let key = k64(0);
         let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+            pi.probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, 0);
 
         let key = k64((cell_prefix_range.end << 32) - 1);
         let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+            pi.probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, file_length - 1);
 
         let key = k64((cell_prefix_range.end << 32) / 2);
         let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+            pi.probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
         assert_eq!(offset, file_length / 2);
     }
 
@@ -509,7 +487,7 @@ mod test {
         index.insert(key2.clone().into(), WalPosition::test_value(1002));
 
         // 3) Convert to bytes with SingleHopIndex
-        let single_hop = SingleHopIndex::new();
+        let single_hop = UniformLookupIndex::new();
         let data = single_hop.to_bytes(&index, ks);
 
         // 4) Mock a simple in‐memory reader
@@ -536,7 +514,7 @@ mod test {
         use std::io::Write;
 
         // 1) Choose which PersistedIndex to test:
-        let index_impl = SingleHopIndex::new();
+        let index_impl = UniformLookupIndex::new();
 
         // 2) Build a KeyShape, e.g. 8-byte keys
         let (shape, ks_id) = KeyShape::new_single(4, 12, 12);
@@ -603,7 +581,7 @@ mod test {
         index.insert(key.clone(), walpos);
 
         // 2) Write it to bytes
-        let pi = SingleHopIndex::new();
+        let pi = UniformLookupIndex::new();
         let bytes = pi.to_bytes(&index, ks);
         assert!(!bytes.is_empty());
 
@@ -623,7 +601,7 @@ mod test {
     fn test_persisted_index_roundtrip() {
         // 1) Choose an implementation: SingleHopIndex or MicroCellIndex
         //    Depending on which you want to test.
-        let single_hop = SingleHopIndex::new();
+        let single_hop = UniformLookupIndex::new();
 
         // 2) Build a key shape (assuming 8-byte keys, but adapt as needed)
         let (shape, ks_id) = KeyShape::new_single(8, 4, 4);

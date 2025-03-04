@@ -4,8 +4,8 @@ use crate::control::ControlRegion;
 use crate::crc::{CrcFrame, CrcReadError, IntoBytesFixed};
 use crate::flusher::IndexFlusher;
 use crate::index::index_table::IndexTable;
-use crate::index::persisted_index::PersistedIndex;
-use crate::index::PERSISTED_INDEX;
+use crate::index::persisted_index::IndexFormat;
+use crate::index::INDEX_FORMAT;
 use crate::iterators::db_iterator::DbIterator;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc};
 use crate::large_table::{GetResult, LargeTable, LargeTableContainer, Loader, Version};
@@ -518,7 +518,7 @@ impl Db {
             .flushed_keys
             .with_label_values(&[ksd.name()])
             .inc_by(index.len() as u64);
-        let index = PERSISTED_INDEX.to_bytes(&index, ksd);
+        let index = INDEX_FORMAT.to_bytes(&index, ksd);
         self.metrics
             .flushed_bytes
             .with_label_values(&[ksd.name()])
@@ -544,7 +544,7 @@ impl Db {
 
     fn read_index(ks: &KeySpaceDesc, entry: WalEntry) -> DbResult<IndexTable> {
         if let WalEntry::Index(_, bytes) = entry {
-            let entry = PERSISTED_INDEX.from_bytes(ks, bytes);
+            let entry = INDEX_FORMAT.from_bytes(ks, bytes);
             Ok(entry)
         } else {
             panic!("Unexpected wal entry where expected record");

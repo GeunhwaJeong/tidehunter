@@ -1,19 +1,23 @@
 pub mod index_table;
-pub mod microcell;
+pub mod lookup_header;
 pub mod persisted_index;
-pub mod single_hop;
+pub mod uniform_lookup;
 
 use bytes::{BufMut, BytesMut};
 use index_table::IndexTable;
 use minibytes::Bytes;
-use single_hop::SingleHopIndex;
-use std::{collections::BTreeMap, sync::LazyLock};
+use std::collections::BTreeMap;
 
 use crate::{key_shape::KeySpaceDesc, wal::WalPosition};
-pub static PERSISTED_INDEX: LazyLock<SingleHopIndex> = LazyLock::new(|| SingleHopIndex::new());
 
-// use microcell::MicroCellIndex;
-// pub static PERSISTED_INDEX: MicroCellIndex = MicroCellIndex;
+// use single_hop::UniformLookupIndex;
+// use std::sync::LazyLock;
+// pub static PERSISTED_INDEX: LazyLock<UniformLookupIndex> =
+//     LazyLock::new(|| UniformLookupIndex::new());
+
+use lookup_header::LookupHeaderIndex;
+pub const INDEX_FORMAT: LookupHeaderIndex = LookupHeaderIndex;
+
 /// Writes key-value pairs from IndexTable to a BytesMut buffer
 /// Returns the populated buffer
 pub fn serialize_index_entries(
