@@ -1,9 +1,10 @@
-use crate::config::{Config, PERSISTED_INDEX};
+use crate::config::Config;
 use crate::flusher::{FlushKind, IndexFlusher};
-use crate::index_table::IndexTable;
+use crate::index::index_table::IndexTable;
+use crate::index::persisted_index::PersistedIndex;
+use crate::index::PERSISTED_INDEX;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc};
 use crate::metrics::Metrics;
-use crate::persisted_index::PersistedIndex;
 use crate::primitives::arc_cow::ArcCow;
 use crate::primitives::sharded_mutex::ShardedMutex;
 use crate::wal::{WalPosition, WalRandomRead};

@@ -1,177 +1,16 @@
+use bytes::{BufMut, BytesMut};
+use minibytes::Bytes;
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use bytes::{Buf, BufMut, BytesMut};
-use minibytes::Bytes;
-
+use super::persisted_index::PersistedIndex;
+use crate::index::persisted_index::PREFIX_LENGTH;
+use crate::key_shape::CELL_PREFIX_LENGTH;
 use crate::wal::WalPosition;
-use crate::{
-    index_table::IndexTable, key_shape::KeySpaceDesc, key_shape::CELL_PREFIX_LENGTH,
-    lookup::RandomRead, math::rescale_u32,
-};
-
-const HEADER_ELEMENTS: usize = 1024;
-const HEADER_ELEMENT_SIZE: usize = 8;
-const HEADER_SIZE: usize = HEADER_ELEMENTS * HEADER_ELEMENT_SIZE;
-const PREFIX_LENGTH: usize = 8; // prefix of key used to estimate position in file, in bytes
-
-pub trait PersistedIndex {
-    fn to_bytes(&self, table: &IndexTable, ks: &KeySpaceDesc) -> Bytes;
-    fn from_bytes(&self, ks: &KeySpaceDesc, b: Bytes) -> IndexTable;
-    fn lookup_unloaded(
-        &self,
-        ks: &KeySpaceDesc,
-        reader: &impl RandomRead,
-        key: &[u8],
-    ) -> Option<WalPosition>;
-
-    fn element_size(ks: &KeySpaceDesc) -> usize {
-        ks.reduced_key_size() + WalPosition::LENGTH
-    }
-
-    fn key_micro_cell(ks: &KeySpaceDesc, key: &[u8]) -> usize {
-        let prefix = ks.cell_prefix(key);
-        let cell = ks.cell_by_prefix(prefix);
-        let cell_prefix_range = ks.cell_prefix_range(cell);
-        let cell_offset = prefix
-            // cell_prefix_range.start is always u32 (but not cell_prefix_range.end)
-            .checked_sub(cell_prefix_range.start as u32)
-            .expect("Key prefix is out of cell prefix range");
-        let cell_size = ks.cell_size();
-        let micro_cell = rescale_u32(cell_offset, cell_size, HEADER_ELEMENTS as u32);
-        micro_cell as usize
-    }
-}
-
-pub struct MicroCellIndex;
-
-impl PersistedIndex for MicroCellIndex {
-    fn to_bytes(&self, table: &IndexTable, ks: &KeySpaceDesc) -> Bytes {
-        let element_size = Self::element_size(ks);
-        let capacity = element_size * table.data.len() + HEADER_SIZE;
-        let mut out = BytesMut::with_capacity(capacity);
-        out.put_bytes(0, HEADER_SIZE);
-        let mut header = IndexTableHeaderBuilder::new(ks);
-        for (key, value) in table.data.iter() {
-            if key.len() != ks.reduced_key_size() {
-                // todo make into debug assertion
-                panic!(
-                    "Index in ks {} contains key length {} (configured {})",
-                    ks.name(),
-                    key.len(),
-                    ks.reduced_key_size()
-                );
-            }
-            header.add_key(key, out.len());
-            out.put_slice(&key);
-            value.write_to_buf(&mut out);
-        }
-        assert_eq!(out.len(), capacity);
-        header.write_header(out.len(), &mut out[..HEADER_SIZE]);
-        out.to_vec().into()
-    }
-
-    fn from_bytes(&self, ks: &KeySpaceDesc, b: Bytes) -> IndexTable {
-        let b = b.slice(HEADER_SIZE..);
-        let element_size = Self::element_size(ks);
-        let elements = b.len() / element_size;
-        assert_eq!(b.len(), elements * element_size);
-
-        let mut data = BTreeMap::new();
-        for i in 0..elements {
-            let key = b.slice(i * element_size..(i * element_size + ks.reduced_key_size()));
-            let value = WalPosition::from_slice(
-                &b[(i * element_size + ks.reduced_key_size())..(i * element_size + element_size)],
-            );
-            data.insert(key, value);
-        }
-
-        assert_eq!(data.len(), elements);
-        IndexTable { data }
-    }
-
-    fn lookup_unloaded(
-        &self,
-        ks: &KeySpaceDesc,
-        reader: &impl RandomRead,
-        key: &[u8],
-    ) -> Option<WalPosition> {
-        let key_size = ks.reduced_key_size();
-        assert_eq!(key.len(), key_size);
-        let micro_cell = Self::key_micro_cell(ks, key);
-        let header_element =
-            reader.read(micro_cell * HEADER_ELEMENT_SIZE..(micro_cell + 1) * HEADER_ELEMENT_SIZE);
-        let mut header_element = &header_element[..];
-        let from_offset = header_element.get_u32() as usize;
-        let to_offset = header_element.get_u32() as usize;
-        if from_offset == 0 && to_offset == 0 {
-            return None;
-        }
-        let buffer = reader.read(from_offset..to_offset);
-        let mut buffer = &buffer[..];
-        let element_size = Self::element_size(ks);
-        while !buffer.is_empty() {
-            let k = &buffer[..key_size];
-            if k == key {
-                buffer = &buffer[key_size..];
-                let position = WalPosition::read_from_buf(&mut buffer);
-                return Some(position);
-            }
-            buffer = &buffer[element_size..];
-        }
-        None
-    }
-}
-pub struct IndexTableHeaderBuilder<'a> {
-    ks: &'a KeySpaceDesc,
-    header: Vec<(u32, u32)>,
-    last_micro_cell: Option<usize>,
-}
-
-impl<'a> IndexTableHeaderBuilder<'a> {
-    pub fn new(ks: &'a KeySpaceDesc) -> Self {
-        let header = (0..HEADER_ELEMENTS).map(|_| (0, 0)).collect();
-        Self {
-            ks,
-            header,
-            last_micro_cell: None,
-        }
-    }
-
-    pub fn add_key(&mut self, key: &[u8], offset: usize) {
-        let offset = Self::check_offset(offset);
-        let micro_cell = MicroCellIndex::key_micro_cell(&self.ks, key);
-        if let Some(last_micro_cell) = self.last_micro_cell {
-            if last_micro_cell == micro_cell {
-                return;
-            }
-            self.header[last_micro_cell].1 = offset;
-        }
-        self.last_micro_cell = Some(micro_cell);
-        self.header[micro_cell].0 = offset;
-    }
-
-    pub fn write_header(self, end_offset: usize, mut buf: &mut [u8]) {
-        let mut header = self.header;
-        let end_offset = Self::check_offset(end_offset);
-        if let Some(last_micro_cell) = self.last_micro_cell {
-            header[last_micro_cell].1 = end_offset;
-        }
-        for (start, end) in header {
-            buf.put_u32(start);
-            buf.put_u32(end);
-        }
-    }
-
-    fn check_offset(offset: usize) -> u32 {
-        assert!(offset < u32::MAX as usize, "Index table is too large");
-        offset as u32
-    }
-}
+use crate::{index::index_table::IndexTable, key_shape::KeySpaceDesc, lookup::RandomRead};
 
 pub struct SingleHopIndex {
     window_sizes: Vec<Vec<usize>>,
-    // any other fields you need
 }
 
 impl SingleHopIndex {
@@ -318,8 +157,16 @@ impl PersistedIndex for SingleHopIndex {
 
         // compute probable offset
         let file_length = reader.len();
+        // println!(
+        //     "lookup_unloaded: file_length={}, cell_prefix_range={:?}",
+        //     file_length, cell_prefix_range
+        // );
         let (probable_offset, half_window_size) =
             self.get_probable_key_offset_and_window_size(&cell_prefix_range, key, file_length);
+        // println!(
+        //     "lookup_unloaded: probable_offset={}, half_window_size={}",
+        //     probable_offset, half_window_size
+        // );
 
         // compute start and end of the window around probable offset
         let (mut from_offset, mut to_offset) = Self::get_start_and_end_offsets(
@@ -328,9 +175,14 @@ impl PersistedIndex for SingleHopIndex {
             element_size,
             file_length,
         );
+        // println!(
+        //     "lookup_unloaded: from_offset={}, to_offset={}",
+        //     from_offset, to_offset
+        // );
 
         loop {
             if (from_offset >= to_offset) || (from_offset >= file_length) {
+                // println!("lookup_unloaded: from_offset >= to_offset, returning None");
                 return None;
             }
             let buffer = reader.read(from_offset..to_offset);
@@ -350,12 +202,20 @@ impl PersistedIndex for SingleHopIndex {
                     element_size,
                     file_length,
                 );
+                // println!(
+                //     "lookup_unloaded: from_offset={}, to_offset={}",
+                //     from_offset, to_offset
+                // );
                 continue;
             }
             if key > last_element_key {
                 // key is larger than the last element in the buffer
                 (from_offset, to_offset) =
                     Self::move_window_up(to_offset, half_window_size, element_size, file_length);
+                // println!(
+                //     "lookup_unloaded: from_offset={}, to_offset={}",
+                //     from_offset, to_offset
+                // );
                 continue;
             }
 
@@ -363,6 +223,7 @@ impl PersistedIndex for SingleHopIndex {
             assert_eq!(buffer.len() % element_size, 0);
             let count = buffer.len() / element_size;
             if count == 0 {
+                // println!("lookup_unloaded: count == 0, returning None");
                 return None; // no entries in this buffer window
             }
 
@@ -386,12 +247,14 @@ impl PersistedIndex for SingleHopIndex {
                         let mut pos_slice =
                             &buffer[(entry_offset + key_size)..(entry_offset + element_size)];
                         let position = WalPosition::read_from_buf(&mut pos_slice);
+                        // println!("lookup_unloaded: found key, returning Some(position)");
                         return Some(position);
                     }
                 }
             }
 
             // Not found
+            // println!("lookup_unloaded: key not found, returning None");
             return None;
         }
     }
@@ -399,240 +262,22 @@ impl PersistedIndex for SingleHopIndex {
 
 #[cfg(test)]
 mod test {
-    use std::{cell::Cell, collections::HashSet, ops::Range, vec};
+    use rand::Rng;
 
-    use minibytes::Bytes;
-    use rand::{rngs::ThreadRng, Rng, RngCore};
-
-    use crate::{
-        index_table::IndexTable,
-        key_shape::KeyShape,
-        lookup::RandomRead,
-        persisted_index::{MicroCellIndex, PersistedIndex, SingleHopIndex},
-        wal::WalPosition,
-    };
-
-    #[test]
-    fn test_offset_calculation() {
-        let cell_prefix_range = 0..100;
-        let file_length = 1000; // test with file larger than range
-        let pi = SingleHopIndex::new();
-
-        let key = [0, 0, 0, 0, 0, 0, 0, 0];
-        let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
-        assert_eq!(offset, 0);
-
-        let key: [u8; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 255];
-        let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
-        assert_eq!(offset, 0);
-
-        let key = k64(0);
-        let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
-        assert_eq!(offset, 0);
-
-        let key = k64((cell_prefix_range.end << 32) - 1);
-        let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
-        assert_eq!(offset, file_length - 1);
-
-        let key = k64((cell_prefix_range.end << 32) / 2);
-        let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
-        assert_eq!(offset, file_length / 2);
-
-        let file_length = 10; // test with file smaller than range
-
-        let key = [0, 0, 0, 0, 0, 0, 0, 0];
-        let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
-        assert_eq!(offset, 0);
-
-        let key: [u8; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 255];
-        let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
-        assert_eq!(offset, 0);
-
-        let key = k64(0);
-        let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
-        assert_eq!(offset, 0);
-
-        let key = k64((cell_prefix_range.end << 32) - 1);
-        let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
-        assert_eq!(offset, file_length - 1);
-
-        let key = k64((cell_prefix_range.end << 32) / 2);
-        let (offset, _) =
-            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
-        assert_eq!(offset, file_length / 2);
-    }
+    use super::*;
+    use crate::{index::persisted_index::test::*, key_shape::KeyShape};
+    use std::{cell::Cell, collections::HashSet};
 
     #[test]
     pub fn test_index_lookup() {
-        test_index_lookup_inner(&MicroCellIndex);
         let pi = SingleHopIndex::new();
         test_index_lookup_inner(&pi);
     }
 
-    pub fn test_index_lookup_inner(pi: &impl PersistedIndex) {
-        let (shape, ks) = KeyShape::new_single(16, 8, 8);
-        let ks = shape.ks(ks);
-        let mut index = IndexTable::default();
-        index.insert(k128(1), w(5));
-        index.insert(k128(5), w(10));
-
-        let bytes = pi.to_bytes(&index, ks);
-        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &k128(0)));
-        assert_eq!(Some(w(5)), pi.lookup_unloaded(ks, &bytes, &k128(1)));
-        assert_eq!(Some(w(10)), pi.lookup_unloaded(ks, &bytes, &k128(5)));
-        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &k128(10)));
-        let mut index = IndexTable::default();
-        index.insert(k128(u128::MAX), w(15));
-        index.insert(k128(u128::MAX - 5), w(25));
-        let bytes = pi.to_bytes(&index, ks);
-        assert_eq!(
-            Some(w(15)),
-            pi.lookup_unloaded(ks, &bytes, &k128(u128::MAX))
-        );
-        assert_eq!(
-            Some(w(25)),
-            pi.lookup_unloaded(ks, &bytes, &k128(u128::MAX - 5))
-        );
-        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &k128(u128::MAX - 1)));
-        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &k128(u128::MAX - 100)));
-    }
-
-    #[test]
-    fn test_persisted_index_roundtrip() {
-        // 1) Choose an implementation: SingleHopIndex or MicroCellIndex
-        //    Depending on which you want to test.
-        let single_hop = SingleHopIndex::new();
-
-        // 2) Build a key shape (assuming 8-byte keys, but adapt as needed)
-        let (shape, ks_id) = KeyShape::new_single(8, 4, 4);
-        let ks = shape.ks(ks_id);
-
-        // 3) Populate an IndexTable with some entries
-        let mut original_index = IndexTable::default();
-
-        // Insert a few sample entries:
-        let key1 = Bytes::from(vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
-        let key2 = Bytes::from(vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0, 0, 0]);
-        let key3 = Bytes::from(vec![0, 1, 2, 3, 4, 5, 6, 7]);
-        original_index.insert(key1.clone(), WalPosition::test_value(100));
-        original_index.insert(key2.clone(), WalPosition::test_value(200));
-        original_index.insert(key3.clone(), WalPosition::test_value(300));
-
-        // 4) Convert to bytes
-        let serialized = single_hop.to_bytes(&original_index, ks);
-
-        // 5) From those bytes, build a new IndexTable
-        let roundtrip_index = single_hop.from_bytes(ks, serialized);
-
-        // 6) Confirm the new table has the same entries
-        //    For example, check that each key still maps to the same WalPosition
-        assert_eq!(
-            roundtrip_index.get(&key1),
-            Some(WalPosition::test_value(100)),
-            "Key1 not found or mismatched in round-trip"
-        );
-
-        assert_eq!(
-            roundtrip_index.get(&key2),
-            Some(WalPosition::test_value(200)),
-            "Key2 not found or mismatched in round-trip"
-        );
-
-        assert_eq!(
-            roundtrip_index.get(&key3),
-            Some(WalPosition::test_value(300)),
-            "Key3 not found or mismatched in round-trip"
-        );
-
-        // Also iterate over roundtrip_index.data
-        // and confirm it matches original_index.data exactly.
-        assert_eq!(
-            original_index.data.len(),
-            roundtrip_index.data.len(),
-            "IndexTable size mismatch"
-        );
-
-        for (k, pos) in &original_index.data {
-            let rt_pos = roundtrip_index
-                .get(k)
-                .expect("Missing key in round-trip index");
-            assert_eq!(pos, &rt_pos, "WalPosition mismatch for key={:?}", k);
-        }
-
-        // If no assertion failed, we've verified that
-        // the persisted index correctly round-trips these entries.
-    }
-
     #[test]
     pub fn test_index_lookup_random() {
-        test_index_lookup_random_inner(&MicroCellIndex);
         let pi = SingleHopIndex::new();
         test_index_lookup_random_inner(&pi);
-    }
-
-    pub fn test_index_lookup_random_inner(pi: &impl PersistedIndex) {
-        const M: usize = 8;
-        const P: usize = 8;
-        let (shape, ks) = KeyShape::new_single(16, M, P);
-        let ks = shape.ks(ks);
-        let mut index = IndexTable::default();
-        let mut rng = ThreadRng::default();
-        let target_bucket = rng.gen_range(0..((M * P) as u128));
-        let bucket_size = u128::MAX / ((M * P) as u128);
-        let target_range = target_bucket * bucket_size..(target_bucket + 1) * bucket_size;
-        const ITERATIONS: usize = 1000;
-        for _ in 0..ITERATIONS {
-            let key = rng.gen_range(target_range.clone());
-            let pos = rng.next_u64();
-            index.insert(k128(key), w(pos));
-        }
-        let bytes = pi.to_bytes(&index, ks);
-        for (key, expected_value) in index.data {
-            let value = pi.lookup_unloaded(ks, &bytes, &key);
-            assert_eq!(Some(expected_value), value);
-        }
-        for _ in 0..ITERATIONS {
-            let key = rng.gen_range(target_range.clone());
-            let value = pi.lookup_unloaded(ks, &bytes, &k128(key));
-            assert!(value.is_none());
-        }
-    }
-
-    #[test]
-    fn single_entry_search() {
-        let (shape, ks_id) = KeyShape::new_single(8, 4, 4);
-        let ks = shape.ks(ks_id);
-
-        // 1) Make an IndexTable with exactly 1 key-value
-        let mut index = IndexTable::default();
-        let key = Bytes::from(vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        let walpos = WalPosition::test_value(12345);
-        index.insert(key.clone(), walpos);
-
-        // 2) Write it to bytes
-        let pi = SingleHopIndex::new();
-        let bytes = pi.to_bytes(&index, ks);
-        assert!(!bytes.is_empty());
-
-        // 3) Make sure we can find that exact key
-        assert_eq!(Some(walpos), pi.lookup_unloaded(ks, &bytes, &key));
-
-        // 4) Try smaller key
-        let smaller_key = Bytes::from(vec![0, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &smaller_key));
-
-        // 5) Try bigger key
-        let bigger_key = Bytes::from(vec![255, 255, 255, 255, 255, 255, 255, 255]);
-        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &bigger_key));
     }
 
     struct MockRandomRead {
@@ -816,6 +461,65 @@ mod test {
     }
 
     #[test]
+    fn test_offset_calculation() {
+        let cell_prefix_range = 0..100;
+        let file_length = 1000; // test with file larger than range
+        let pi = SingleHopIndex::new();
+
+        let key = [0, 0, 0, 0, 0, 0, 0, 0];
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+        assert_eq!(offset, 0);
+
+        let key: [u8; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 255];
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+        assert_eq!(offset, 0);
+
+        let key = k64(0);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+        assert_eq!(offset, 0);
+
+        let key = k64((cell_prefix_range.end << 32) - 1);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+        assert_eq!(offset, file_length - 1);
+
+        let key = k64((cell_prefix_range.end << 32) / 2);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+        assert_eq!(offset, file_length / 2);
+
+        let file_length = 10; // test with file smaller than range
+
+        let key = [0, 0, 0, 0, 0, 0, 0, 0];
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+        assert_eq!(offset, 0);
+
+        let key: [u8; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 255];
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+        assert_eq!(offset, 0);
+
+        let key = k64(0);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+        assert_eq!(offset, 0);
+
+        let key = k64((cell_prefix_range.end << 32) - 1);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+        assert_eq!(offset, file_length - 1);
+
+        let key = k64((cell_prefix_range.end << 32) / 2);
+        let (offset, _) =
+            pi.get_probable_key_offset_and_window_size(&cell_prefix_range, &key, file_length);
+        assert_eq!(offset, file_length / 2);
+    }
+
+    #[test]
     fn test_singlehopindex_with_short_keys() {
         // 1) Build a KeyShape that expects e.g. 4‐byte keys
         let (shape, ks_id) = KeyShape::new_single(4, 12, 12);
@@ -913,15 +617,97 @@ mod test {
         assert_eq!(found3, None);
     }
 
-    fn k64(k: u64) -> [u8; 8] {
-        k.to_be_bytes()
+    #[test]
+    fn single_entry_search() {
+        let (shape, ks_id) = KeyShape::new_single(8, 4, 4);
+        let ks = shape.ks(ks_id);
+
+        // 1) Make an IndexTable with exactly 1 key-value
+        let mut index = IndexTable::default();
+        let key = Bytes::from(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let walpos = WalPosition::test_value(12345);
+        index.insert(key.clone(), walpos);
+
+        // 2) Write it to bytes
+        let pi = SingleHopIndex::new();
+        let bytes = pi.to_bytes(&index, ks);
+        assert!(!bytes.is_empty());
+
+        // 3) Make sure we can find that exact key
+        assert_eq!(Some(walpos), pi.lookup_unloaded(ks, &bytes, &key));
+
+        // 4) Try smaller key
+        let smaller_key = Bytes::from(vec![0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &smaller_key));
+
+        // 5) Try bigger key
+        let bigger_key = Bytes::from(vec![255, 255, 255, 255, 255, 255, 255, 255]);
+        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &bigger_key));
     }
 
-    fn k128(k: u128) -> Bytes {
-        k.to_be_bytes().to_vec().into()
-    }
+    #[test]
+    fn test_persisted_index_roundtrip() {
+        // 1) Choose an implementation: SingleHopIndex or MicroCellIndex
+        //    Depending on which you want to test.
+        let single_hop = SingleHopIndex::new();
 
-    fn w(w: u64) -> WalPosition {
-        WalPosition::test_value(w)
+        // 2) Build a key shape (assuming 8-byte keys, but adapt as needed)
+        let (shape, ks_id) = KeyShape::new_single(8, 4, 4);
+        let ks = shape.ks(ks_id);
+
+        // 3) Populate an IndexTable with some entries
+        let mut original_index = IndexTable::default();
+
+        // Insert a few sample entries:
+        let key1 = Bytes::from(vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        let key2 = Bytes::from(vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0, 0, 0]);
+        let key3 = Bytes::from(vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        original_index.insert(key1.clone(), WalPosition::test_value(100));
+        original_index.insert(key2.clone(), WalPosition::test_value(200));
+        original_index.insert(key3.clone(), WalPosition::test_value(300));
+
+        // 4) Convert to bytes
+        let serialized = single_hop.to_bytes(&original_index, ks);
+
+        // 5) From those bytes, build a new IndexTable
+        let roundtrip_index = single_hop.from_bytes(ks, serialized);
+
+        // 6) Confirm the new table has the same entries
+        //    For example, check that each key still maps to the same WalPosition
+        assert_eq!(
+            roundtrip_index.get(&key1),
+            Some(WalPosition::test_value(100)),
+            "Key1 not found or mismatched in round-trip"
+        );
+
+        assert_eq!(
+            roundtrip_index.get(&key2),
+            Some(WalPosition::test_value(200)),
+            "Key2 not found or mismatched in round-trip"
+        );
+
+        assert_eq!(
+            roundtrip_index.get(&key3),
+            Some(WalPosition::test_value(300)),
+            "Key3 not found or mismatched in round-trip"
+        );
+
+        // Also iterate over roundtrip_index.data
+        // and confirm it matches original_index.data exactly.
+        assert_eq!(
+            original_index.data.len(),
+            roundtrip_index.data.len(),
+            "IndexTable size mismatch"
+        );
+
+        for (k, pos) in &original_index.data {
+            let rt_pos = roundtrip_index
+                .get(k)
+                .expect("Missing key in round-trip index");
+            assert_eq!(pos, &rt_pos, "WalPosition mismatch for key={:?}", k);
+        }
+
+        // If no assertion failed, we've verified that
+        // the persisted index correctly round-trips these entries.
     }
 }

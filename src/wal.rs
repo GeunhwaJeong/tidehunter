@@ -350,7 +350,9 @@ impl Wal {
                         .offset(range.start)
                         .len(self.layout.frag_size as usize);
                     if writeable {
-                        options/*.populate()*/.map_mut(&self.file)?.into()
+                        options /*.populate()*/
+                            .map_mut(&self.file)?
+                            .into()
                     } else {
                         options.map(&self.file)?.into()
                     }

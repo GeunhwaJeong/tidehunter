@@ -1,10 +1,6 @@
-use crate::{persisted_index::*, wal::WalLayout};
+use crate::wal::WalLayout;
 use rand::Rng;
 use std::cmp;
-
-use std::sync::LazyLock;
-pub static PERSISTED_INDEX: LazyLock<SingleHopIndex> = LazyLock::new(|| SingleHopIndex::new());
-// pub static PERSISTED_INDEX: MicroCellIndex = MicroCellIndex;
 
 // todo - remove pub
 #[cfg_attr(test, derive(Clone))] // Look for Config::clone(...) for usages

@@ -1,14 +1,15 @@
 use crate::batch::WriteBatch;
-use crate::config::{Config, PERSISTED_INDEX};
+use crate::config::Config;
 use crate::control::ControlRegion;
 use crate::crc::{CrcFrame, CrcReadError, IntoBytesFixed};
 use crate::flusher::IndexFlusher;
-use crate::index_table::IndexTable;
+use crate::index::index_table::IndexTable;
+use crate::index::persisted_index::PersistedIndex;
+use crate::index::PERSISTED_INDEX;
 use crate::iterators::db_iterator::DbIterator;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc};
 use crate::large_table::{GetResult, LargeTable, LargeTableContainer, Loader, Version};
 use crate::metrics::{Metrics, TimerExt};
-use crate::persisted_index::PersistedIndex;
 use crate::wal::{
     PreparedWalWrite, Wal, WalError, WalIterator, WalPosition, WalRandomRead, WalWriter,
 };
