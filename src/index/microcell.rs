@@ -1,12 +1,12 @@
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut};
 use minibytes::Bytes;
-use std::collections::BTreeMap;
 
 use crate::math::rescale_u32;
 use crate::wal::WalPosition;
 use crate::{index::index_table::IndexTable, key_shape::KeySpaceDesc, lookup::RandomRead};
 
 use super::persisted_index::{PersistedIndex, HEADER_ELEMENTS, HEADER_ELEMENT_SIZE, HEADER_SIZE};
+use super::{deserialize_index_entries, serialize_index_entries};
 
 pub struct MicroCellIndex;
 
@@ -29,45 +29,27 @@ impl PersistedIndex for MicroCellIndex {
     fn to_bytes(&self, table: &IndexTable, ks: &KeySpaceDesc) -> Bytes {
         let element_size = Self::element_size(ks);
         let capacity = element_size * table.data.len() + HEADER_SIZE;
-        let mut out = BytesMut::with_capacity(capacity);
-        out.put_bytes(0, HEADER_SIZE);
+
+        // Use the common function to serialize entries
+        let mut out = serialize_index_entries(table, ks, capacity, HEADER_SIZE);
+
+        // Build header
         let mut header = IndexTableHeaderBuilder::new(ks);
-        for (key, value) in table.data.iter() {
-            if key.len() != ks.reduced_key_size() {
-                // todo make into debug assertion
-                panic!(
-                    "Index in ks {} contains key length {} (configured {})",
-                    ks.name(),
-                    key.len(),
-                    ks.reduced_key_size()
-                );
-            }
-            header.add_key(key, out.len());
-            out.put_slice(&key);
-            value.write_to_buf(&mut out);
+        let mut current_offset = HEADER_SIZE;
+
+        for (key, _) in table.data.iter() {
+            header.add_key(key, current_offset);
+            current_offset += element_size;
         }
-        assert_eq!(out.len(), capacity);
+
+        // Write header to the reserved space
         header.write_header(out.len(), &mut out[..HEADER_SIZE]);
+
         out.to_vec().into()
     }
 
     fn from_bytes(&self, ks: &KeySpaceDesc, b: Bytes) -> IndexTable {
-        let b = b.slice(HEADER_SIZE..);
-        let element_size = Self::element_size(ks);
-        let elements = b.len() / element_size;
-        assert_eq!(b.len(), elements * element_size);
-
-        let mut data = BTreeMap::new();
-        for i in 0..elements {
-            let key = b.slice(i * element_size..(i * element_size + ks.reduced_key_size()));
-            let value = WalPosition::from_slice(
-                &b[(i * element_size + ks.reduced_key_size())..(i * element_size + element_size)],
-            );
-            data.insert(key, value);
-        }
-
-        assert_eq!(data.len(), elements);
-        IndexTable { data }
+        deserialize_index_entries(HEADER_SIZE, ks, b)
     }
 
     fn lookup_unloaded(

@@ -1,9 +1,8 @@
-use bytes::{BufMut, BytesMut};
 use minibytes::Bytes;
-use std::collections::BTreeMap;
 use std::ops::Range;
 
 use super::persisted_index::PersistedIndex;
+use super::{deserialize_index_entries, serialize_index_entries};
 use crate::index::persisted_index::PREFIX_LENGTH;
 use crate::key_shape::CELL_PREFIX_LENGTH;
 use crate::wal::WalPosition;
@@ -105,40 +104,15 @@ impl PersistedIndex for SingleHopIndex {
     fn to_bytes(&self, table: &IndexTable, ks: &KeySpaceDesc) -> Bytes {
         let element_size = Self::element_size(ks);
         let capacity = element_size * table.data.len();
-        let mut out = BytesMut::with_capacity(capacity);
-        for (key, value) in table.data.iter() {
-            if key.len() != ks.reduced_key_size() {
-                // todo make into debug assertion
-                panic!(
-                    "Index in ks {} contains key length {} (configured {})",
-                    ks.name(),
-                    key.len(),
-                    ks.reduced_key_size()
-                );
-            }
-            out.put_slice(&key);
-            value.write_to_buf(&mut out);
-        }
-        assert_eq!(out.len(), capacity);
+
+        // Use the common function with 0 header size
+        let out = serialize_index_entries(table, ks, capacity, 0);
         out.to_vec().into()
     }
 
     fn from_bytes(&self, ks: &KeySpaceDesc, b: Bytes) -> IndexTable {
-        let element_size = Self::element_size(ks);
-        let elements = b.len() / element_size;
-        assert_eq!(b.len(), elements * element_size);
-
-        let mut data = BTreeMap::new();
-        for i in 0..elements {
-            let key = b.slice(i * element_size..(i * element_size + ks.reduced_key_size()));
-            let value = WalPosition::from_slice(
-                &b[(i * element_size + ks.reduced_key_size())..(i * element_size + element_size)],
-            );
-            data.insert(key, value);
-        }
-
-        assert_eq!(data.len(), elements);
-        IndexTable { data }
+        // Use the common function with 0 data offset
+        deserialize_index_entries(0, ks, b)
     }
 
     fn lookup_unloaded(
