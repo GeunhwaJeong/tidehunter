@@ -10,3 +10,4 @@ repository:
   url: https://@github.com/mystenlabs/tidehunter.git
   commit: collector
 target_configs_path: "./orchestrator/assets/target_configs.yml"
+log_processing: true
