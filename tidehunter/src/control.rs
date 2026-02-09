@@ -175,11 +175,24 @@ impl ControlRegionStore {
         let serialized =
             bincode::serialize(&control_region).expect("Failed to serialize control region");
         let temp_file = self.path.with_extension(".bak");
-        fs::write(&temp_file, &serialized).expect("Failed to write control region file");
+        fs::write(&temp_file, &serialized).unwrap_or_else(|e| {
+            panic!(
+                "Failed to write control region file {}: {}",
+                temp_file.display(),
+                e
+            )
+        });
         metrics
             .snapshot_written_bytes
             .inc_by(serialized.len() as u64);
-        fs::rename(&temp_file, &self.path).expect("Failed to rename control region file");
+        fs::rename(&temp_file, &self.path).unwrap_or_else(|e| {
+            panic!(
+                "Failed to rename control region file from {} to {}: {}",
+                temp_file.display(),
+                self.path.display(),
+                e
+            )
+        });
         self.last_position = last_position;
         self.force_relocation_position = force_relocation_position;
     }
