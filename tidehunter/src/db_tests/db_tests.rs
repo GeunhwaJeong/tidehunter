@@ -1,5 +1,4 @@
 use super::super::*;
-use crate::batch::WriteBatch;
 use crate::config::Config;
 use crate::crc::CrcFrame;
 use crate::failpoints::FailPoint;
@@ -136,13 +135,111 @@ fn test_batch() {
     let dir = tempdir::TempDir::new("test-batch").unwrap();
     let config = Arc::new(Config::small());
     let (key_shape, ks) = KeyShape::new_single(4, 16, KeyType::uniform(16));
-    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
-    let mut batch = WriteBatch::new();
+    let metrics = Metrics::new();
+    let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let mut batch = db.write_batch();
     batch.write(ks, vec![5, 6, 7, 8], vec![15]);
     batch.write(ks, vec![6, 7, 8, 9], vec![17]);
-    db.write_batch(batch).unwrap();
+
+    // Check pending_table_len after writes but before commit
+    // With deferred pending table updates, pending entries are only added on commit
+    let pending_len = metrics.pending_table_len.with_label_values(&["root"]).get();
+    assert_eq!(
+        pending_len, 0,
+        "Should have 0 pending entries before commit (deferred behavior)"
+    );
+
+    batch.commit().unwrap();
+
+    // Check pending_table_len after commit but before promote_pending
+    let pending_len = metrics.pending_table_len.with_label_values(&["root"]).get();
+    assert_eq!(
+        pending_len, 2,
+        "Should still have 2 pending entries after commit"
+    );
+
     assert_eq!(Some(vec![15].into()), db.get(ks, &[5, 6, 7, 8]).unwrap());
+
+    // Check pending_table_len after first get (promote_pending is called for that cell)
+    let pending_len = metrics.pending_table_len.with_label_values(&["root"]).get();
+    // Could be 0, 1, or 2 depending on whether keys are in same cell
+    // If keys are in different cells, only one cell's pending_table is cleared
+    let pending_after_first_get = pending_len;
+
     assert_eq!(Some(vec![17].into()), db.get(ks, &[6, 7, 8, 9]).unwrap());
+
+    // After both gets, all pending entries should be promoted
+    let pending_len = metrics.pending_table_len.with_label_values(&["root"]).get();
+    assert_eq!(
+        pending_len, 0,
+        "Should have 0 pending entries after both gets (was {} after first get)",
+        pending_after_first_get
+    );
+}
+
+#[test]
+fn test_batch_lru() {
+    let dir = tempdir::TempDir::new("test-batch-lru").unwrap();
+    let config = Arc::new(Config::small());
+    let metrics = Metrics::new();
+
+    let mut ksb = KeyShapeBuilder::new();
+    let ksc = KeySpaceConfig::new().with_value_cache_size(100);
+    let ks = ksb.add_key_space_config("ks", 4, 16, KeyType::uniform(16), ksc);
+    let key_shape = ksb.build();
+
+    let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+
+    // Test batch writes populate LRU cache during promote_pending
+    let mut batch = db.write_batch();
+    batch.write(ks, vec![1, 2, 3, 4], vec![10]);
+    batch.write(ks, vec![2, 3, 4, 5], vec![20]);
+    batch.commit().unwrap();
+
+    // First access: promote_pending is called which populates LRU, then LRU is checked
+    assert_eq!(Some(vec![10].into()), db.get(ks, &[1, 2, 3, 4]).unwrap());
+    assert_eq!(Some(vec![20].into()), db.get(ks, &[2, 3, 4, 5]).unwrap());
+
+    // Second access: promote_pending does nothing (already promoted), then LRU is checked and hits
+    assert_eq!(Some(vec![10].into()), db.get(ks, &[1, 2, 3, 4]).unwrap());
+    assert_eq!(Some(vec![20].into()), db.get(ks, &[2, 3, 4, 5]).unwrap());
+
+    // Check that LRU cache was hit on all four get() calls
+    // (promote_pending populates LRU, then subsequent gets hit the cache)
+    let lru_hits = metrics
+        .lookup_result
+        .with_label_values(&["ks", "found", "lru"])
+        .get();
+    assert_eq!(
+        lru_hits, 4,
+        "All four get() calls should have been served from LRU cache"
+    );
+
+    // Test overwrite in batch updates LRU cache
+    let mut batch = db.write_batch();
+    batch.write(ks, vec![1, 2, 3, 4], vec![30]); // Overwrite with new value
+    batch.commit().unwrap();
+
+    // Access the overwritten key - should get the new value from LRU
+    assert_eq!(Some(vec![30].into()), db.get(ks, &[1, 2, 3, 4]).unwrap());
+
+    // Verify LRU was hit (not read from disk/index)
+    let lru_hits_after_overwrite = metrics
+        .lookup_result
+        .with_label_values(&["ks", "found", "lru"])
+        .get();
+    assert_eq!(
+        lru_hits_after_overwrite, 5,
+        "Overwritten value should be served from updated LRU cache"
+    );
+
+    // Test delete in batch removes from LRU cache
+    let mut batch = db.write_batch();
+    batch.delete(ks, vec![1, 2, 3, 4]);
+    batch.commit().unwrap();
+
+    // Key should be deleted and not in LRU cache
+    assert_eq!(None, db.get(ks, &[1, 2, 3, 4]).unwrap());
 }
 
 #[test]
@@ -158,10 +255,10 @@ fn test_batch_replay() {
             Metrics::new(),
         )
         .unwrap();
-        let mut batch = WriteBatch::new();
+        let mut batch = db.write_batch();
         batch.write(ks, vec![5, 6, 7, 8], vec![15]);
         batch.write(ks, vec![6, 7, 8, 9], vec![17]);
-        db.write_batch(batch).unwrap();
+        batch.commit().unwrap();
     }
     let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
     assert_eq!(Some(vec![15].into()), db.get(ks, &[5, 6, 7, 8]).unwrap());
@@ -184,14 +281,14 @@ fn test_corrupted_batch_replay() {
             Metrics::new(),
         )
         .unwrap();
-        let mut batch = WriteBatch::new();
+        let mut batch = db.write_batch();
         batch.write(ks, key_a.clone(), value_a.clone());
         batch.write(ks, key_b.clone(), value_b.clone());
-        db.write_batch(batch).unwrap();
-        let mut batch = WriteBatch::new();
+        batch.commit().unwrap();
+        let mut batch = db.write_batch();
         batch.write(ks, key_a.clone(), vec![20]);
         batch.write(ks, key_b.clone(), vec![23]);
-        db.write_batch(batch).unwrap();
+        batch.commit().unwrap();
 
         let position = db.wal_writer.position();
         let record_length = CrcFrame::CRC_HEADER_LENGTH as u64 + 4 + 1 + 4;
@@ -235,12 +332,12 @@ fn test_concurrent_batch() {
             let db = db.clone();
             let (key_a, key_b, key_c) = (key_a.clone(), key_b.clone(), key_c.clone());
             let handle = thread::spawn(move || {
-                let mut batch = WriteBatch::new();
+                let mut batch = db.write_batch();
                 let (a, b) = (thread_id, thread_id * 2);
                 batch.write(ks, key_a, thread_id.to_be_bytes().to_vec());
                 batch.write(ks, key_b, (thread_id * 2).to_be_bytes().to_vec());
                 batch.write(ks, key_c, (a + b).to_be_bytes().to_vec());
-                db.write_batch(batch).unwrap();
+                batch.commit().unwrap();
             });
             handles.push(handle);
         }
@@ -437,8 +534,15 @@ fn test_iterator_run(data: Vec<u128>, key_indexing: KeyIndexing) {
         Metrics::new(),
     )
     .unwrap();
-    for k in &data {
-        db.insert(ks, ku128(*k), vu128(*k)).unwrap();
+    for (i, k) in data.iter().enumerate() {
+        if i % 2 == 0 {
+            db.insert(ks, ku128(*k), vu128(*k)).unwrap();
+        } else {
+            // Write some values with batch write to make sure there is no difference with regular write
+            let mut batch = db.write_batch();
+            batch.write(ks, ku128(*k), vu128(*k));
+            batch.commit().unwrap();
+        }
     }
     let mut rng = ThreadRng::default();
     for reverse in [true, false] {
@@ -2577,14 +2681,14 @@ fn setup_corrupted_db(
     }));
 
     // Create a batch with 3 records
-    let mut batch = WriteBatch::new();
+    let mut batch = db.write_batch();
     batch.write(ks, vec![1, 2, 3, 4], vec![10]);
     batch.write(ks, vec![2, 3, 4, 5], vec![20]);
     batch.write(ks, vec![3, 4, 5, 6], vec![30]);
 
     // Attempt to write the batch - this should panic on the 3rd write
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        db.write_batch(batch).unwrap();
+        batch.commit().unwrap();
     }));
 
     assert!(result.is_err(), "Expected panic during batch write");
@@ -2616,11 +2720,11 @@ fn test_batch_after_incomplete_batch() {
         assert_eq!(None, db.get(ks, &[3, 4, 5, 6]).unwrap());
 
         // Now write the batch again without the failpoint
-        let mut batch = WriteBatch::new();
+        let mut batch = db.write_batch();
         batch.write(ks, vec![1, 2, 3, 4], vec![10]);
         batch.write(ks, vec![2, 3, 4, 5], vec![20]);
         batch.write(ks, vec![3, 4, 5, 6], vec![30]);
-        db.write_batch(batch).unwrap();
+        batch.commit().unwrap();
     }
 
     // Reopen the database again and verify all keys are accessible

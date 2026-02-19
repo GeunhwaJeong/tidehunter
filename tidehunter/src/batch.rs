@@ -1,13 +1,36 @@
 use crate::cell::CellId;
-use crate::db::{MAX_KEY_LEN, WalEntry};
-use crate::key_shape::{KeySpace, KeySpaceDesc};
+use crate::db::{Db, DbResult, WalEntry};
+use crate::index::pending_table::Transaction;
+use crate::key_shape::KeySpace;
 use crate::wal::PreparedWalWrite;
 use minibytes::Bytes;
+use std::sync::Arc;
 
 pub struct WriteBatch {
-    pub(crate) updates: Vec<Update>,
-    pub(crate) prepared_writes: Vec<PreparedWalWrite>,
+    pub(crate) transaction: Transaction,
+    db: Arc<Db>,
+    pub(crate) writes: Vec<WriteBatchWrite>,
     pub(crate) tag: String,
+    /// Operations to be applied to pending table on commit
+    pub(crate) pending_ops: Vec<PendingOp>,
+}
+
+pub(crate) struct WriteBatchWrite {
+    pub prepared_write: PreparedWalWrite,
+    pub is_modified: bool,
+    pub ks: KeySpace,
+}
+
+pub(crate) enum PendingOp {
+    Insert {
+        ks: KeySpace,
+        reduced_key: Bytes,
+        lru_update: Option<Bytes>,
+    },
+    Remove {
+        ks: KeySpace,
+        reduced_key: Bytes,
+    },
 }
 
 pub(crate) struct RelocatedWriteBatch {
@@ -20,18 +43,14 @@ pub(crate) struct RelocatedWriteBatch {
 
 const MAX_BATCH_LEN: usize = 1_000_000;
 
-impl Default for WriteBatch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl WriteBatch {
-    pub fn new() -> Self {
+    pub fn new(db: Arc<Db>) -> Self {
         WriteBatch {
-            updates: Default::default(),
-            prepared_writes: Default::default(),
+            db,
+            transaction: Default::default(),
+            writes: Default::default(),
             tag: Default::default(),
+            pending_ops: Default::default(),
         }
     }
 
@@ -39,32 +58,62 @@ impl WriteBatch {
         self.tag = tag;
     }
 
+    /// Write a key-value pair to the batch.
     pub fn write(&mut self, ks: KeySpace, k: impl Into<Bytes>, v: impl Into<Bytes>) {
-        self.prepare_write(Update::Record(ks, k.into(), v.into()));
+        let k = k.into();
+        let v = v.into();
+        let context = self.db.ks_context(ks);
+        context.ks_config.check_key(&k);
+        let reduced_key = context.ks_config.reduced_key_bytes(k.clone());
+        // Pass value for LRU cache if enabled
+        let lru_update = context.ks_config.value_cache_size().map(|_| v.clone());
+
+        // Store operation to be applied on commit
+        self.pending_ops.push(PendingOp::Insert {
+            ks,
+            reduced_key,
+            lru_update,
+        });
+
+        // todo transaction state is corrupted on panic
+        self.prepare_write(WalEntry::Record(ks, k, v, false));
     }
 
+    /// Delete a key from the batch.
     pub fn delete(&mut self, ks: KeySpace, k: impl Into<Bytes>) {
-        self.prepare_write(Update::Remove(ks, k.into()));
+        let k = k.into();
+        let context = self.db.ks_context(ks);
+        context.ks_config.check_key(&k);
+        let reduced_key = context.ks_config.reduced_key_bytes(k.clone());
+
+        // Store operation to be applied on commit
+        self.pending_ops.push(PendingOp::Remove { ks, reduced_key });
+
+        // todo transaction state is corrupted on panic
+        self.prepare_write(WalEntry::Remove(ks, k));
     }
 
-    pub fn prepare_write(&mut self, update: Update) {
-        let (wal_write, key) = match update {
-            Update::Record(ks, ref key, ref value) => (
-                PreparedWalWrite::new(&WalEntry::Record(ks, key.clone(), value.clone(), false)),
-                key,
-            ),
-            Update::Remove(ks, ref key) => (
-                PreparedWalWrite::new(&WalEntry::Remove(ks, key.clone())),
-                key,
-            ),
+    fn prepare_write(&mut self, wal_entry: WalEntry) {
+        let (prepared_write, ks, is_modified) = match &wal_entry {
+            WalEntry::Record(ks, _key, _value, _relocated) => {
+                (PreparedWalWrite::new(&wal_entry), *ks, true)
+            }
+            WalEntry::Remove(ks, _key) => (PreparedWalWrite::new(&wal_entry), *ks, false),
+            _ => unreachable!("WalEntry::Record should be remove or record"),
         };
-        assert!(key.len() <= MAX_KEY_LEN, "Key exceeding max key length");
-        self.prepared_writes.push(wal_write);
-        self.updates.push(update);
+        self.writes.push(WriteBatchWrite {
+            is_modified,
+            ks,
+            prepared_write,
+        });
         assert!(
-            self.updates.len() < MAX_BATCH_LEN,
+            self.writes.len() < MAX_BATCH_LEN,
             "Batch exceeds max length {MAX_BATCH_LEN}"
         );
+    }
+
+    pub fn commit(self) -> DbResult<()> {
+        self.db.clone().do_write_batch(self)
     }
 }
 
@@ -92,28 +141,5 @@ impl RelocatedWriteBatch {
 
     pub fn len(&self) -> usize {
         self.prepared_writes.len()
-    }
-}
-
-pub enum Update {
-    Record(KeySpace, Bytes, Bytes),
-    Remove(KeySpace, Bytes),
-}
-
-impl Update {
-    pub fn ks(&self) -> KeySpace {
-        match self {
-            Update::Record(ks, _, _) => *ks,
-            Update::Remove(ks, _) => *ks,
-        }
-    }
-
-    pub fn reduced_key(&self, ks: &KeySpaceDesc) -> Bytes {
-        let key = match self {
-            Update::Record(_, key, _) => key,
-            Update::Remove(_, key) => key,
-        };
-        ks.check_key(key);
-        ks.reduced_key_bytes(key.clone())
     }
 }
