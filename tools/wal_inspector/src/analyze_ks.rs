@@ -45,23 +45,22 @@ pub fn analyze_ks_command(db_path: PathBuf, keyspace_name: String, verbose: bool
     let snapshot = control_region.snapshot();
     let ks_idx = ks.as_u8() as usize;
 
-    if ks_idx >= snapshot.0.len() {
+    if ks_idx >= snapshot.data.len() {
         return Err(anyhow::anyhow!(
             "Keyspace index {} out of range (snapshot has {} keyspaces)",
             ks_idx,
-            snapshot.0.len()
+            snapshot.data.len()
         ));
     }
 
-    let ks_data = &snapshot.0[ks_idx];
+    let ks_data = &snapshot.data[ks_idx];
 
     // Collect all valid index positions for this keyspace
+    // ks_data is a BTreeMap<CellId, SnapshotEntryData>
     let mut index_positions = Vec::new();
-    for row in ks_data {
-        for entry in row.values() {
-            if let Some(pos) = entry.position.valid() {
-                index_positions.push(pos);
-            }
+    for entry in ks_data.values() {
+        if let Some(pos) = entry.position.valid() {
+            index_positions.push(pos);
         }
     }
 

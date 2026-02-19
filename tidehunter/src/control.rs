@@ -84,7 +84,7 @@ impl ControlRegion {
             // Populate names for existing keyspaces from the current key_shape
             self.keyspace_names = key_shape
                 .iter_ks()
-                .take(self.snapshot.0.len())
+                .take(self.snapshot.data.len())
                 .map(|ks| ks.name().to_string())
                 .collect();
         }
@@ -92,7 +92,7 @@ impl ControlRegion {
 
     /// Extends the snapshot to include new keyspaces if the key_shape has more keyspaces
     fn extend_snapshot_if_needed(&mut self, key_shape: &KeyShape) {
-        let snapshot_len = self.snapshot.0.len();
+        let snapshot_len = self.snapshot.data.len();
         let num_ks = key_shape.num_ks();
 
         if snapshot_len < num_ks {
@@ -100,14 +100,14 @@ impl ControlRegion {
             for ks in key_shape.iter_ks().skip(snapshot_len) {
                 let new_ks_snapshot =
                     LargeTableContainer::new_keyspace(ks, SnapshotEntryData::empty());
-                self.snapshot.0.push(new_ks_snapshot);
+                self.snapshot.data.push(new_ks_snapshot);
                 self.keyspace_names.push(ks.name().to_string());
             }
         }
     }
 
     fn verify_shape(&self, key_shape: &KeyShape) {
-        let snapshot_len = self.snapshot.0.len();
+        let snapshot_len = self.snapshot.data.len();
         let num_ks = key_shape.num_ks();
 
         // We allow adding keyspaces at the end, but not removing or reordering

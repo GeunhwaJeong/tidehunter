@@ -48,18 +48,16 @@ pub fn control_region_command(db_path: PathBuf, num_positions: usize, verbose: b
     // Collect all valid positions with their keyspace for sorting
     let mut all_positions = Vec::new();
 
-    for (ks_idx, ks_data) in snapshot.0.iter().enumerate() {
+    for (ks_idx, ks_data) in snapshot.data.iter().enumerate() {
         let mut ks_total = 0;
 
-        for row in ks_data {
-            for entry in row.values() {
-                ks_total += 1;
-                total_entries += 1;
+        for entry in ks_data.values() {
+            ks_total += 1;
+            total_entries += 1;
 
-                if let Some(pos) = entry.position.valid() {
-                    all_positions.push((pos, ks_idx));
-                    total_position_size += pos.frame_len() as u64;
-                }
+            if let Some(pos) = entry.position.valid() {
+                all_positions.push((pos, ks_idx));
+                total_position_size += pos.frame_len() as u64;
             }
         }
 

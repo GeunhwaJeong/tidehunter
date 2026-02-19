@@ -23,7 +23,7 @@ use lru::LruCache;
 use minibytes::Bytes;
 use parking_lot::{MutexGuard, RwLock};
 use rand::rngs::ThreadRng;
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -86,8 +86,6 @@ enum Entries {
     Tree(BTreeMap<CellIdBytesContainer, LargeTableEntry>),
 }
 
-pub(crate) type RowContainer<T> = BTreeMap<CellId, T>;
-
 /// Snapshot data for a single entry containing both WAL position and last processed position
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 #[doc(hidden)] // Used by tools/wal_inspector for control region inspection
@@ -106,10 +104,15 @@ impl SnapshotEntryData {
     }
 }
 
-/// ks -> row -> cell
+/// Container for snapshot data: ks -> cell (mutex-independent)
+/// Vec index corresponds to keyspace (same as keyspace_names Vec)
+/// CellId is scoped within each keyspace
 #[derive(Serialize, Deserialize, Debug)]
 #[doc(hidden)] // Used by tools/wal_inspector for control region inspection
-pub struct LargeTableContainer<T>(pub Vec<Vec<RowContainer<T>>>);
+pub struct LargeTableContainer<T> {
+    // Vec[ks_idx] = BTreeMap of all cells in that keyspace
+    pub data: Vec<BTreeMap<CellId, T>>,
+}
 
 pub(crate) struct LargeTableSnapshot {
     pub data: LargeTableContainer<SnapshotEntryData>,
@@ -126,90 +129,97 @@ impl LargeTable {
         loader: &L,
     ) -> Self {
         assert_eq!(
-            snapshot.0.len(),
+            snapshot.data.len(),
             key_shape.num_ks(),
             "Snapshot has different number of key spaces"
         );
         let table = key_shape
             .iter_ks()
-            .zip(&snapshot.0)
+            .zip(&snapshot.data) // Each data[i] = BTreeMap for keyspace i
             .collect::<Vec<_>>()
             .into_par_iter()
-            .map(|(ks, ks_snapshot)| {
-                if ks_snapshot.len() != ks.num_mutexes() {
-                    panic!(
-                        "Invalid snapshot for ks {}: {} rows, expected {} rows",
-                        ks.id().as_usize(),
-                        ks_snapshot.len(),
-                        ks.num_mutexes()
-                    );
-                }
-                let context = KsContext::new(config.clone(), ks.clone(), metrics.clone());
-                let bloom_filter_start = Instant::now();
-                let rows = ks_snapshot.par_iter().map(|row_snapshot| {
-                    let entries = row_snapshot.iter().map(|(cell, entry_data)| {
-                        let bloom_filter = context.ks_config.bloom_filter().map(|opts| {
-                            let mut filter = BloomFilter::with_rate(opts.rate, opts.count);
-                            if entry_data.position.is_valid() {
-                                let data =
+            .map(
+                |(ks, ks_cells): (_, &BTreeMap<CellId, SnapshotEntryData>)| {
+                    let context = KsContext::new(config.clone(), ks.clone(), metrics.clone());
+                    let bloom_filter_start = Instant::now();
+                    let num_mutexes = ks.num_mutexes();
+
+                    // Distribute cells to rows based on current mutex_for_cell()
+                    let mut row_cells: Vec<Vec<(CellId, SnapshotEntryData)>> =
+                        (0..num_mutexes).map(|_| Vec::new()).collect();
+
+                    for (cell, entry_data) in ks_cells {
+                        let mutex_idx = ks.mutex_for_cell(cell);
+                        row_cells[mutex_idx].push((cell.clone(), *entry_data));
+                    }
+
+                    // Create Row structures
+                    let rows = row_cells.into_par_iter().map(|cells| {
+                        let entries = cells.into_iter().map(|(cell, entry_data)| {
+                            let bloom_filter = context.ks_config.bloom_filter().map(|opts| {
+                                let mut filter = BloomFilter::with_rate(opts.rate, opts.count);
+                                if entry_data.position.is_valid() {
+                                    let data =
                                     loader.load(&context.ks_config, entry_data.position).expect(
                                         "Failed to load an index entry to reconstruct bloom filter",
                                     );
-                                for key in data.keys() {
-                                    filter.insert(key);
+                                    for key in data.keys() {
+                                        filter.insert(key);
+                                    }
                                 }
-                            }
-                            filter
+                                filter
+                            });
+                            let unload_jitter =
+                                config.gen_dirty_keys_jitter(&mut ThreadRng::default());
+                            LargeTableEntry::from_snapshot_data(
+                                context.clone(),
+                                cell,
+                                &entry_data,
+                                unload_jitter,
+                                bloom_filter,
+                            )
                         });
-                        let unload_jitter = config.gen_dirty_keys_jitter(&mut ThreadRng::default());
-                        LargeTableEntry::from_snapshot_data(
-                            context.clone(),
-                            cell.clone(),
-                            entry_data,
-                            unload_jitter,
-                            bloom_filter,
-                        )
-                    });
-                    let entries = match ks.key_type() {
-                        KeyType::Uniform(_) => Entries::Array(ks.num_mutexes(), entries.collect()),
-                        KeyType::PrefixedUniform(_) => Entries::Tree(
-                            entries
-                                .map(|e| (e.cell.assume_bytes_id().clone(), e))
-                                .collect(),
-                        ),
-                    };
-                    Row {
-                        entries,
-                        context: context.clone(),
-                    }
-                });
-
-                let rows = ShardedMutex::from_parallel_iterator(rows);
-                metrics
-                    .large_table_init_mcs
-                    .with_label_values(&[ks.name()])
-                    .inc_by(bloom_filter_start.elapsed().as_micros() as u64);
-
-                // For PrefixedUniform keyspaces, build cell index for fast iteration
-                let cell_index = match ks.key_type() {
-                    KeyType::PrefixedUniform(_) => {
-                        let mut cells = BTreeSet::new();
-                        for row_snapshot in ks_snapshot {
-                            for cell in row_snapshot.keys() {
-                                cells.insert(cell.assume_bytes_id().clone());
+                        let entries = match ks.key_type() {
+                            KeyType::Uniform(_) => {
+                                Entries::Array(ks.num_mutexes(), entries.collect())
                             }
+                            KeyType::PrefixedUniform(_) => Entries::Tree(
+                                entries
+                                    .map(|e| (e.cell.assume_bytes_id().clone(), e))
+                                    .collect(),
+                            ),
+                        };
+                        Row {
+                            entries,
+                            context: context.clone(),
                         }
-                        RwLock::new(cells)
-                    }
-                    KeyType::Uniform(_) => Default::default(),
-                };
+                    });
 
-                KsTable {
-                    context,
-                    rows,
-                    cell_index,
-                }
-            })
+                    let rows = ShardedMutex::from_parallel_iterator(rows);
+                    metrics
+                        .large_table_init_mcs
+                        .with_label_values(&[ks.name()])
+                        .inc_by(bloom_filter_start.elapsed().as_micros() as u64);
+
+                    // For PrefixedUniform keyspaces, build cell index for fast iteration
+                    let cell_index = match ks.key_type() {
+                        KeyType::PrefixedUniform(_) => {
+                            let cells = ks_cells
+                                .keys()
+                                .map(|cell| cell.assume_bytes_id().clone())
+                                .collect();
+                            RwLock::new(cells)
+                        }
+                        KeyType::Uniform(_) => Default::default(),
+                    };
+
+                    KsTable {
+                        context,
+                        rows,
+                        cell_index,
+                    }
+                },
+            )
             .collect();
         Self {
             table,
@@ -605,7 +615,7 @@ impl LargeTable {
             wal_last_processed.as_u64()
         };
 
-        let data = LargeTableContainer(data);
+        let data = LargeTableContainer { data };
         Ok(LargeTableSnapshot { data, replay_from })
     }
 
@@ -645,7 +655,7 @@ impl LargeTable {
         threshold_position: u64,
     ) -> Result<
         (
-            Vec<RowContainer<SnapshotEntryData>>,
+            BTreeMap<CellId, SnapshotEntryData>,
             Option<u64>,
             Option<WalPosition>,
         ),
@@ -653,10 +663,10 @@ impl LargeTable {
     > {
         let mut replay_from: Option<u64> = None;
         let mut max_wal_position: Option<WalPosition> = None;
-        let mut ks_data = Vec::with_capacity(ks_table.rows.mutexes().len());
+        // Collect all cells from all rows into one BTreeMap
+        let mut ks_data = BTreeMap::new();
         for mutex in ks_table.rows.mutexes() {
             let mut row = mutex.lock();
-            let mut row_data = RowContainer::new();
             for entry in row.entries.iter_mut() {
                 // Important - read Loader::last_processed_wal_position before calling promote_pending.
                 // See also comments in unload_if_ks_enabled.
@@ -674,7 +684,7 @@ impl LargeTable {
                     position,
                     last_processed: entry.last_processed,
                 };
-                row_data.insert(entry.cell.clone(), snapshot_data);
+                ks_data.insert(entry.cell.clone(), snapshot_data);
                 if let Some(valid_position) = position.valid() {
                     max_wal_position = if let Some(max_wal_position) = max_wal_position {
                         Some(cmp::max(max_wal_position, valid_position))
@@ -690,7 +700,6 @@ impl LargeTable {
                     ));
                 }
             }
-            ks_data.push(row_data);
         }
         let metric = self
             .metrics
@@ -1600,36 +1609,32 @@ enum UnloadedState {
 impl<T: Copy> LargeTableContainer<T> {
     /// Creates a new container with the given shape and filled with copy of passed value
     pub fn new_from_key_shape(key_shape: &KeyShape, value: T) -> Self {
-        Self(
-            key_shape
-                .iter_ks()
-                .map(|ks| Self::new_keyspace(ks, value))
-                .collect(),
-        )
+        let data = key_shape
+            .iter_ks()
+            .map(|ks| Self::new_keyspace(ks, value))
+            .collect();
+        Self { data }
     }
 
-    fn new_row(ks: &KeySpaceDesc, row: usize, value: T) -> RowContainer<T> {
+    pub(crate) fn new_keyspace(ks: &KeySpaceDesc, value: T) -> BTreeMap<CellId, T> {
         match ks.key_type() {
             KeyType::Uniform(config) => {
-                // todo - create empty row and fill integer cells on-demand?
-                (0..config.cells_per_mutex())
-                    .map(|offset| (CellId::Integer(ks.cell_by_location(row, offset)), value))
+                // Pre-populate all integer cells for uniform keyspaces
+                let total_cells = ks.num_mutexes() * config.cells_per_mutex();
+                (0..total_cells)
+                    .map(|cell_idx| {
+                        let row = cell_idx / config.cells_per_mutex();
+                        let offset = cell_idx % config.cells_per_mutex();
+                        (CellId::Integer(ks.cell_by_location(row, offset)), value)
+                    })
                     .collect()
             }
-            KeyType::PrefixedUniform(_) => RowContainer::new(),
+            KeyType::PrefixedUniform(_) => BTreeMap::new(),
         }
     }
 
-    pub(crate) fn new_keyspace(ks: &KeySpaceDesc, value: T) -> Vec<RowContainer<T>> {
-        (0..ks.num_mutexes())
-            .map(|row| Self::new_row(ks, row, value))
-            .collect()
-    }
-
     pub fn iter_cells(&self) -> impl Iterator<Item = &T> {
-        self.0
-            .iter()
-            .flat_map(|ks| ks.iter().flat_map(|row| row.values()))
+        self.data.iter().flat_map(|ks_map| ks_map.values())
     }
 }
 
@@ -2163,7 +2168,7 @@ mod tests {
     #[test]
     fn test_pct_wal_position() {
         // Create a container with various WAL positions
-        let mut entries = RowContainer::new();
+        let mut entries = BTreeMap::new();
         for i in 0..5 {
             let position_value = (i + 1) * 100;
             entries.insert(
@@ -2174,7 +2179,9 @@ mod tests {
                 },
             );
         }
-        let container = LargeTableContainer(vec![vec![entries]]);
+        let container = LargeTableContainer {
+            data: vec![entries],
+        };
 
         // Test various percentiles
         // 0% - all positions are above this, should return the highest position
@@ -2213,21 +2220,23 @@ mod tests {
         );
 
         // Test with empty container
-        let empty_container = LargeTableContainer::<SnapshotEntryData>(vec![]);
+        let empty_container = LargeTableContainer::<SnapshotEntryData> { data: vec![] };
         assert_eq!(empty_container.pct_wal_position(50), None);
 
         // Test with container having only invalid positions
-        let invalid_container = LargeTableContainer(vec![vec![
-            vec![(
-                CellId::Integer(0),
-                SnapshotEntryData {
-                    position: WalPosition::INVALID,
-                    last_processed: LastProcessed::none(),
-                },
-            )]
-            .into_iter()
-            .collect(),
-        ]]);
+        let invalid_container = LargeTableContainer {
+            data: vec![
+                vec![(
+                    CellId::Integer(0),
+                    SnapshotEntryData {
+                        position: WalPosition::INVALID,
+                        last_processed: LastProcessed::none(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ],
+        };
         assert_eq!(invalid_container.pct_wal_position(50), None);
     }
 
