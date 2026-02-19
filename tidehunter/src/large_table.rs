@@ -1383,7 +1383,6 @@ impl LargeTableEntry {
             return Ok(());
         };
         self.last_processed = last_processed;
-        // todo correctly handle self.context.ks_config.unloading_disabled()
         self.clear_after_flush(position, last_processed);
         Ok(())
     }
@@ -1417,7 +1416,16 @@ impl LargeTableEntry {
     }
 
     fn clear_after_flush(&mut self, position: WalPosition, last_processed: LastProcessed) {
-        // Retain only entries with offset >= last_processed
+        if self.context.ks_config.unloading_disabled() && self.state.is_loaded() {
+            if self.data.has_unprocessed(last_processed) {
+                // Some entries remain (newer than last_processed), keep state as DirtyLoaded
+                self.state = LargeTableEntryState::DirtyLoaded(position);
+            } else {
+                self.state = LargeTableEntryState::Loaded(position);
+            }
+            return;
+        }
+        // Unloading enabled: retain only entries with offset >= last_processed
         self.data.make_mut().retain_unprocessed(last_processed);
         self.report_loaded_keys_count();
 
@@ -1540,6 +1548,21 @@ impl LargeTableEntryState {
             LargeTableEntryState::Loaded(_) => None,
             LargeTableEntryState::DirtyUnloaded(pos) => Some((UnloadedState::Dirty, *pos)),
             LargeTableEntryState::DirtyLoaded(_) => None,
+        }
+    }
+
+    /// Empty, Loaded and DirtyLoaded is considered 'loaded' state.
+    /// No disk lookup is needed when accessing entry in this state.
+    /// This is opposite of as_unloaded_state:
+    /// - if this method returns true, as_unloaded_state returns None
+    /// - if this method returns false, as_unloaded_state returns Some(...)
+    pub fn is_loaded(&self) -> bool {
+        match self {
+            LargeTableEntryState::Empty => true,
+            LargeTableEntryState::Unloaded(_) => false,
+            LargeTableEntryState::Loaded(_) => true,
+            LargeTableEntryState::DirtyUnloaded(_) => false,
+            LargeTableEntryState::DirtyLoaded(_) => true,
         }
     }
 

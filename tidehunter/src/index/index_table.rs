@@ -269,6 +269,13 @@ impl IndexTable {
         self.data.retain(|_k, v| !last_processed.is_processed(v));
     }
 
+    /// Returns if this index table has any unprocessed entries.
+    pub fn has_unprocessed(&self, last_processed: LastProcessed) -> bool {
+        self.data
+            .iter()
+            .any(|(_k, v)| !last_processed.is_processed(v))
+    }
+
     /// Retain only entries with offset >= last_processed
     pub fn retain_above_position(&mut self, last_processed: u64) {
         // todo ideally should use LastProcessed::is_processed here
