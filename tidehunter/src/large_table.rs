@@ -303,7 +303,7 @@ impl LargeTable {
         k: Bytes,
         position: WalPosition,
         lru_update: Option<Bytes>,
-        transaction: &mut Transaction,
+        transaction: &Transaction,
     ) {
         let (mut row, cell) = self.row(context, &k);
         let entry = self.entry_mut(&mut row, &cell);
@@ -318,7 +318,7 @@ impl LargeTable {
         context: &KsContext,
         k: Bytes,
         position: WalPosition,
-        transaction: &mut Transaction,
+        transaction: &Transaction,
     ) {
         let (mut row, cell) = self.row(context, &k);
         let entry = self.entry_mut(&mut row, &cell);

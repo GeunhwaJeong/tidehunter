@@ -1,4 +1,4 @@
-use crate::batch::{RelocatedWriteBatch, WriteBatch, WriteBatchWrite};
+use crate::batch::{PendingOp, RelocatedWriteBatch, WriteBatch, WriteBatchWrite};
 use crate::cell::CellId;
 use crate::config::Config;
 use crate::context::{DbOpKind, KsContext, KsContextVec, ReadType, WalEntryKind};
@@ -7,6 +7,7 @@ use crate::crc::IntoBytesFixed;
 use crate::flusher::IndexFlusher;
 use crate::index::index_format::IndexFormat;
 use crate::index::index_table::IndexTable;
+use crate::index::pending_table::Transaction;
 use crate::iterators::IteratorResult;
 use crate::iterators::db_iterator::DbIterator;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc, KeyType};
@@ -41,6 +42,7 @@ pub struct Db {
     metrics: Arc<Metrics>,
     pub(crate) key_shape: KeyShape,
     relocator: Relocator,
+    commit_pool: Option<rayon::ThreadPool>,
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -86,6 +88,19 @@ impl Db {
         let last_index_position = control_region.last_index_wal_position();
         let index_writer = indexes.writer_after(last_index_position)?;
         let control_region_store = Mutex::new(control_region_store);
+
+        let commit_pool = if config.commit_pool_size > 0 {
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(config.commit_pool_size)
+                    .thread_name(|idx| format!("commit-pool-{}", idx))
+                    .build()
+                    .expect("Failed to create commit thread pool"),
+            )
+        } else {
+            None
+        };
+
         let this = Self {
             large_table,
             wal_writer,
@@ -97,6 +112,7 @@ impl Db {
             metrics: metrics.clone(),
             key_shape,
             relocator,
+            commit_pool,
         };
         this.report_memory_estimates();
         let this = Arc::new(this);
@@ -371,7 +387,7 @@ impl Db {
 
     pub(crate) fn do_write_batch(&self, batch: WriteBatch) -> DbResult<()> {
         let WriteBatch {
-            mut transaction,
+            transaction,
             writes,
             tag,
             pending_ops,
@@ -398,31 +414,20 @@ impl Db {
         let positions: Vec<_> = guards[1..].iter().map(|g| *g.wal_position()).collect();
 
         // Apply all pending operations to the large table with known WAL positions
-        for (op, position) in pending_ops.iter().zip(positions.iter()) {
-            match op {
-                crate::batch::PendingOp::Insert {
-                    ks,
-                    reduced_key,
-                    lru_update,
-                } => {
-                    let context = self.ks_context(*ks);
-                    self.large_table.insert_pending(
-                        context,
-                        reduced_key.clone(),
-                        *position,
-                        lru_update.clone(),
-                        &mut transaction,
-                    );
-                }
-                crate::batch::PendingOp::Remove { ks, reduced_key } => {
-                    let context = self.ks_context(*ks);
-                    self.large_table.remove_pending(
-                        context,
-                        reduced_key.clone(),
-                        *position,
-                        &mut transaction,
-                    );
-                }
+        if let Some(pool) = &self.commit_pool {
+            use rayon::prelude::*;
+            pool.install(|| {
+                pending_ops
+                    .par_iter()
+                    .zip(positions.par_iter())
+                    .with_min_len(32)
+                    .for_each(|(op, position)| {
+                        self.apply_batch_op(op, *position, &transaction);
+                    });
+            });
+        } else {
+            for (op, position) in pending_ops.iter().zip(positions.iter()) {
+                self.apply_batch_op(op, *position, &transaction);
             }
         }
 
@@ -469,6 +474,34 @@ impl Db {
         );
 
         Ok(())
+    }
+
+    fn apply_batch_op(&self, op: &PendingOp, position: WalPosition, transaction: &Transaction) {
+        match op {
+            PendingOp::Insert {
+                ks,
+                reduced_key,
+                lru_update,
+            } => {
+                let context = self.ks_context(*ks);
+                self.large_table.insert_pending(
+                    context,
+                    reduced_key.clone(),
+                    position,
+                    lru_update.clone(),
+                    transaction,
+                );
+            }
+            PendingOp::Remove { ks, reduced_key } => {
+                let context = self.ks_context(*ks);
+                self.large_table.remove_pending(
+                    context,
+                    reduced_key.clone(),
+                    position,
+                    transaction,
+                );
+            }
+        }
     }
 
     pub(crate) fn write_relocated_batch(&self, batch: RelocatedWriteBatch) -> DbResult<()> {

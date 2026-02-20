@@ -68,12 +68,12 @@ impl PendingTable {
         key: Bytes,
         position: WalPosition,
         lru_update: Option<Bytes>,
-        transaction: &mut Transaction,
+        transaction: &Transaction,
     ) {
         self.insert_pending(key, true, position, lru_update, transaction);
     }
 
-    pub fn remove(&mut self, key: Bytes, position: WalPosition, transaction: &mut Transaction) {
+    pub fn remove(&mut self, key: Bytes, position: WalPosition, transaction: &Transaction) {
         self.insert_pending(key, false, position, None, transaction);
     }
 
@@ -83,7 +83,7 @@ impl PendingTable {
         is_modified: bool,
         position: WalPosition,
         lru_update: Option<Bytes>,
-        transaction: &mut Transaction,
+        transaction: &Transaction,
     ) {
         self.len += 1;
         let update = PendingUpdate::new(
@@ -211,12 +211,12 @@ mod tests {
     #[test]
     fn pending_table_tests() {
         let mut table = PendingTable::default();
-        let mut tx1 = Transaction::default();
-        let mut tx2 = Transaction::default();
+        let tx1 = Transaction::default();
+        let tx2 = Transaction::default();
 
-        table.insert(b(1), WalPosition::test_value(0), None, &mut tx1);
-        table.insert(b(1), WalPosition::test_value(1), None, &mut tx2);
-        table.insert(b(2), WalPosition::test_value(2), None, &mut tx2);
+        table.insert(b(1), WalPosition::test_value(0), None, &tx1);
+        table.insert(b(1), WalPosition::test_value(1), None, &tx2);
+        table.insert(b(2), WalPosition::test_value(2), None, &tx2);
         let (committed, removed) = table.take_committed();
         assert_eq!(committed.len(), 0);
         assert_eq!(removed, 0);

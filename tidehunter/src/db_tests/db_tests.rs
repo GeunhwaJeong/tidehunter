@@ -132,8 +132,19 @@ fn test_multi_thread_write() {
 
 #[test]
 fn test_batch() {
+    test_batch_impl(Config::small());
+}
+
+#[test]
+fn test_batch_commit_pool() {
+    let mut config = Config::small();
+    config.commit_pool_size = 4;
+    test_batch_impl(config);
+}
+
+fn test_batch_impl(config: Config) {
     let dir = tempdir::TempDir::new("test-batch").unwrap();
-    let config = Arc::new(Config::small());
+    let config = Arc::new(config);
     let (key_shape, ks) = KeyShape::new_single(4, 16, KeyType::uniform(16));
     let metrics = Metrics::new();
     let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();

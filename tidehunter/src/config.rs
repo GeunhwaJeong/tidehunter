@@ -35,6 +35,11 @@ pub struct Config {
     /// Enable Tidehunter runtime metrics collection
     #[serde(default = "default_metrics_enabled")]
     pub metrics_enabled: bool,
+    /// Number of threads in the batch commit pool(0 = disabled).
+    /// If this feature is used batch commit uses thread pool for operations that can be parallelized.
+    /// Using this feature does not change batch atomicity and isolation guarantees.
+    #[serde(default)]
+    pub commit_pool_size: usize,
 }
 
 fn default_metrics_enabled() -> bool {
@@ -61,6 +66,7 @@ impl Default for Config {
             relocation_strategy: RelocationStrategy::default(),
             relocation_max_reclaim_pct: default_relocation_max_reclaim_pct(),
             metrics_enabled: true,
+            commit_pool_size: 0,
         }
     }
 }
@@ -81,6 +87,7 @@ impl Config {
             relocation_strategy: RelocationStrategy::default(),
             metrics_enabled: true,
             relocation_max_reclaim_pct: 100,
+            commit_pool_size: 0,
         }
     }
 
