@@ -767,7 +767,7 @@ impl LargeTable {
         loader: &L,
         row: &mut Row,
         cell: &CellId,
-        prev_key: Option<Bytes>,
+        mut prev_key: Option<Bytes>,
         reverse: bool,
     ) -> Result<Option<(Bytes, WalPosition)>, L::Error> {
         let Some(entry) = row.try_entry_mut(cell) else {
@@ -823,38 +823,35 @@ impl LargeTable {
 
             // For dirty unloaded, combine in-memory and on-disk entries
             LargeTableEntryState::DirtyUnloaded(position) => {
-                // Check in-memory part first (dirty keys)
-                let in_memory_next = entry.next_entry(prev_key.clone(), reverse);
-
-                // Get reader for on-disk index
-                let index_reader = loader.index_reader(*position)?;
+                let position = *position;
+                // Get reader for on-disk index (opened once for all skip iterations)
+                let index_reader = loader.index_reader(position)?;
                 let format = entry.context.ks_config.index_format();
-
-                // Use the format to find the next entry from on-disk index
-                let on_disk_next = runtime::block_in_place(|| {
-                    let direction = Direction::from_bool(reverse);
-
-                    format.next_entry_unloaded(
-                        &entry.context.ks_config,
-                        &index_reader,
-                        prev_key.as_deref(),
-                        direction,
-                        &entry.context.metrics,
-                    )
-                });
-
-                // Use the utility function to determine the next entry
                 let direction = Direction::from_bool(reverse);
-                let result = match take_next_entry(in_memory_next, on_disk_next, direction) {
-                    NextEntryResult::NotFound => None,
-                    NextEntryResult::Found(key, val) => Some((key, val)),
-                    NextEntryResult::SkipDeleted(skip_key) => {
-                        // todo remove recursion
-                        return Self::next_in_cell(loader, row, cell, Some(skip_key), reverse);
-                    }
-                };
 
-                Ok(result)
+                loop {
+                    // Check in-memory part first (dirty keys)
+                    let in_memory_next = entry.next_entry(prev_key.clone(), reverse);
+
+                    // Use the format to find the next entry from on-disk index
+                    let on_disk_next = runtime::block_in_place(|| {
+                        format.next_entry_unloaded(
+                            &entry.context.ks_config,
+                            &index_reader,
+                            prev_key.as_deref(),
+                            direction,
+                            &entry.context.metrics,
+                        )
+                    });
+
+                    match take_next_entry(in_memory_next, on_disk_next, direction) {
+                        NextEntryResult::NotFound => return Ok(None),
+                        NextEntryResult::Found(key, val) => return Ok(Some((key, val))),
+                        NextEntryResult::SkipDeleted(skip_key) => {
+                            prev_key = Some(skip_key);
+                        }
+                    }
+                }
             }
         }
     }
