@@ -1,5 +1,6 @@
 use crate::cell::CellId;
 use crate::db::{Db, DbResult};
+use crate::index::index_format::IndexIterCache;
 use crate::key_shape::KeySpace;
 use minibytes::Bytes;
 use std::sync::Arc;
@@ -14,6 +15,9 @@ pub struct DbIterator {
     with_key_reduction: bool,
     end_cell_exclusive: Option<CellId>,
     reverse: bool,
+    /// Cached index buffer carried across successive `next()` calls to avoid
+    /// redundant disk reads when iterating over unloaded cells.
+    iter_cache: Option<IndexIterCache>,
 }
 
 impl DbIterator {
@@ -31,12 +35,14 @@ impl DbIterator {
             end_cell_exclusive: None,
             reverse: false,
             with_key_reduction,
+            iter_cache: None,
         }
     }
 
     /// Set lower bound(inclusive) for the iterator.
     /// Updating boundaries may reset the iterator.
     pub fn set_lower_bound(&mut self, lower_bound: impl Into<Bytes>) {
+        self.iter_cache = None;
         let full_lower_bound = lower_bound.into();
         let ks = self.db.ks(self.ks);
         ks.assert_supports_iterator_bound();
@@ -67,6 +73,7 @@ impl DbIterator {
     /// Set upper bound(exclusive) for the iterator.
     /// Updating boundaries may reset the iterator.
     pub fn set_upper_bound(&mut self, upper_bound: impl Into<Bytes>) {
+        self.iter_cache = None;
         let full_upper_bound = upper_bound.into();
         let ks = self.db.ks(self.ks);
         ks.assert_supports_iterator_bound();
@@ -92,6 +99,7 @@ impl DbIterator {
     }
 
     pub fn reverse(&mut self) {
+        self.iter_cache = None;
         let ks = self.db.ks(self.ks);
         ks.assert_supports_iterator_bound();
         self.reverse = !self.reverse;
@@ -125,6 +133,7 @@ impl DbIterator {
             prev_key,
             &self.end_cell_exclusive,
             self.reverse,
+            &mut self.iter_cache,
         ) {
             Ok(Some(result)) => {
                 self.cell = result.cell;

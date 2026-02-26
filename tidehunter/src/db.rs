@@ -5,7 +5,7 @@ use crate::context::{DbOpKind, KsContext, KsContextVec, ReadType, WalEntryKind};
 use crate::control::{ControlRegion, ControlRegionStore};
 use crate::crc::IntoBytesFixed;
 use crate::flusher::IndexFlusher;
-use crate::index::index_format::IndexFormat;
+use crate::index::index_format::{IndexFormat, IndexIterCache};
 use crate::index::index_table::IndexTable;
 use crate::index::pending_table::Transaction;
 use crate::iterators::IteratorResult;
@@ -601,6 +601,7 @@ impl Db {
         prev_key: Option<Bytes>,
         end_cell_exclusive: &Option<CellId>,
         reverse: bool,
+        cache: &mut Option<IndexIterCache>,
     ) -> DbResult<Option<IteratorResult<Bytes>>> {
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::NextEntry);
@@ -611,6 +612,7 @@ impl Db {
             self,
             end_cell_exclusive,
             reverse,
+            cache,
         )?
         else {
             return Ok(None);

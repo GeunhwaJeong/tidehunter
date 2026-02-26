@@ -10,8 +10,8 @@ use crate::wal::position::WalPosition;
 use crate::{index::index_table::IndexTable, key_shape::KeySpaceDesc, lookup::RandomRead};
 
 use super::index_format::{
-    Direction, HEADER_ELEMENT_SIZE, HEADER_ELEMENTS, HEADER_SIZE, IndexFormat, binary_search,
-    linear_search,
+    Direction, HEADER_ELEMENT_SIZE, HEADER_ELEMENTS, HEADER_SIZE, IndexFormat, IndexIterCache,
+    binary_search, linear_search,
 };
 
 #[derive(Clone)]
@@ -73,19 +73,22 @@ impl LookupHeaderIndex {
         Some(buffer)
     }
 
-    /// Process a single micro-cell to find the next entry
-    #[allow(clippy::too_many_arguments)] // todo fix
-    fn process_micro_cell(
-        &self,
-        reader: &impl RandomRead,
-        micro_cell: usize,
+    /// Binary-search `buffer` for the entry after/before `prev` in `direction`.
+    ///
+    /// Returns `(key, wal_position, entry_index)` on success, where `entry_index`
+    /// is the buffer-relative entry index of the returned key.  The caller stores
+    /// this as `last_returned_pos` in the cache so the *next* call can reach the
+    /// subsequent entry in O(1) instead of O(log n).
+    ///
+    /// This function does not perform any I/O.
+    fn search_in_micro_cell_buffer(
+        buffer: &Bytes,
         prev: Option<&[u8]>,
         direction: Direction,
         ks: &KeySpaceDesc,
         metrics: &Metrics,
-    ) -> Option<(Bytes, WalPosition)> {
+    ) -> Option<(Bytes, WalPosition, usize)> {
         let (key_size, element_size) = ks.index_key_element_size().unwrap();
-        let buffer = self.read_micro_cell_section(reader, micro_cell, metrics)?;
 
         if buffer.is_empty() {
             return None;
@@ -96,19 +99,15 @@ impl LookupHeaderIndex {
             return None;
         }
 
-        // If we have a previous key, find its position in the buffer
         let start_pos = if let Some(prev_key) = prev {
-            // Use binary search function to find the position
             let (found_pos, insertion_point, _) =
-                binary_search(&buffer, prev_key, element_size, key_size, metrics);
+                binary_search(buffer, prev_key, element_size, key_size, metrics);
 
             match direction {
                 Direction::Forward => {
                     if let Some(pos) = found_pos {
-                        // Move to the next position after the found key
                         pos + 1
                     } else {
-                        // If key not found, use the insertion point
                         insertion_point
                     }
                 }
@@ -121,22 +120,19 @@ impl LookupHeaderIndex {
                 }
             }
         } else {
-            // No previous key, start from the beginning or end based on direction
             direction.first_in_range(0..entry_count)
         };
 
-        // Check if there's a valid entry at the position
         if start_pos >= entry_count {
             return None;
         }
 
-        // Extract the key and value at the position
         let entry_start = start_pos * element_size;
         let key = buffer.slice(entry_start..entry_start + key_size);
         let value_bytes = &buffer[entry_start + key_size..entry_start + element_size];
         let pos = WalPosition::from_slice(value_bytes);
 
-        Some((key, pos))
+        Some((key, pos, start_pos))
     }
 }
 
@@ -188,9 +184,17 @@ impl IndexFormat for LookupHeaderIndex {
         prev: Option<&[u8]>,
         direction: Direction,
         metrics: &Metrics,
+        position: WalPosition,
+        cache: &mut Option<IndexIterCache>,
     ) -> Option<(Bytes, WalPosition)> {
-        // If no previous key is provided, start from the first or last micro-cell
-        // depending on the direction
+        // Invalidate a stale cache entry (flush detected between calls).
+        if let Some(c) = cache.as_ref()
+            && c.position() != position
+        {
+            *cache = None;
+        }
+
+        // Determine which micro-cell to start searching from.
         let start_micro_cell = if let Some(prev_key) = prev {
             if let Some(key_size) = ks.index_key_size() {
                 assert_eq!(prev_key.len(), key_size);
@@ -200,13 +204,117 @@ impl IndexFormat for LookupHeaderIndex {
             direction.first_in_range(0..HEADER_ELEMENTS)
         };
 
+        let (key_size, element_size) = ks.index_key_element_size().unwrap();
         let mut current_micro_cell = start_micro_cell;
+
         loop {
-            if let result @ Some(_) =
-                self.process_micro_cell(reader, current_micro_cell, prev, direction, ks, metrics)
+            // --- Cache check: do we have the buffer for this micro-cell? ---
+            let cache_hit: Option<(Bytes, usize)> = if let Some(IndexIterCache::LookupHeader {
+                micro_cell: cached_mc,
+                buffer,
+                last_returned_pos,
+                ..
+            }) = cache.as_ref()
             {
-                break result;
+                if *cached_mc == current_micro_cell {
+                    Some((buffer.clone(), *last_returned_pos))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Returns (key, wal_position, entry_index) or None if exhausted.
+            let result: Option<(Bytes, WalPosition, usize)> =
+                if let Some((buffer, last_pos)) = cache_hit {
+                    let entry_count = buffer.len() / element_size;
+
+                    // O(1) sequential-access path: only when prev_key matches
+                    // the last entry we returned (the common iterator case).
+                    if let Some(prev_key) = prev {
+                        let key_at_last =
+                            &buffer[last_pos * element_size..last_pos * element_size + key_size];
+
+                        if key_at_last == prev_key {
+                            // Direct index arithmetic — no binary search needed.
+                            let next_pos = match direction {
+                                Direction::Forward => {
+                                    let p = last_pos + 1;
+                                    if p < entry_count { Some(p) } else { None }
+                                }
+                                Direction::Backward => last_pos.checked_sub(1),
+                            };
+
+                            if let Some(next_pos) = next_pos {
+                                let entry_start = next_pos * element_size;
+                                let key = buffer.slice(entry_start..entry_start + key_size);
+                                let val = WalPosition::from_slice(
+                                    &buffer[entry_start + key_size..entry_start + element_size],
+                                );
+                                Some((key, val, next_pos))
+                            } else {
+                                // Micro-cell exhausted — detected without binary search.
+                                *cache = None;
+                                current_micro_cell = next_bounded(
+                                    current_micro_cell,
+                                    HEADER_ELEMENTS,
+                                    direction == Direction::Backward,
+                                )?;
+                                continue;
+                            }
+                        } else {
+                            // Non-sequential access (e.g. first call after
+                            // cache warm-up mid-cell): binary search fallback.
+                            Self::search_in_micro_cell_buffer(&buffer, prev, direction, ks, metrics)
+                        }
+                    } else {
+                        // No prev key (start of iteration): binary search for
+                        // the first/last entry in the cached buffer.
+                        Self::search_in_micro_cell_buffer(&buffer, prev, direction, ks, metrics)
+                    }
+                } else {
+                    // Cache miss: read from disk and populate the cache.
+                    let Some(buffer) =
+                        self.read_micro_cell_section(reader, current_micro_cell, metrics)
+                    else {
+                        *cache = None;
+                        current_micro_cell = next_bounded(
+                            current_micro_cell,
+                            HEADER_ELEMENTS,
+                            direction == Direction::Backward,
+                        )?;
+                        continue;
+                    };
+
+                    let result =
+                        Self::search_in_micro_cell_buffer(&buffer, prev, direction, ks, metrics);
+
+                    // Populate cache with the freshly-read buffer.
+                    // `last_returned_pos` is updated below when we find an entry.
+                    *cache = Some(IndexIterCache::LookupHeader {
+                        position,
+                        micro_cell: current_micro_cell,
+                        buffer,
+                        last_returned_pos: 0,
+                    });
+
+                    result
+                };
+
+            if let Some((key, val, entry_pos)) = result {
+                // Update the cached position so the next call uses O(1) lookup.
+                if let Some(IndexIterCache::LookupHeader {
+                    last_returned_pos, ..
+                }) = cache.as_mut()
+                {
+                    *last_returned_pos = entry_pos;
+                }
+                return Some((key, val));
             }
+
+            // Micro-cell exhausted via binary search: advance.
+            *cache = None;
             current_micro_cell = next_bounded(
                 current_micro_cell,
                 HEADER_ELEMENTS,
@@ -325,10 +433,13 @@ mod tests {
 
         // Use the MockRandomRead from the test module in index_format.rs
         let reader = MockRandomRead::new(serialized);
+        let dummy_pos = WalPosition::test_value(0);
 
-        // Test forward iteration across all entries to verify micro cell boundaries
-        let mut current_key = None;
+        // Test forward iteration across all entries to verify micro cell boundaries,
+        // reusing the cache across calls as a real iterator would.
+        let mut current_key: Option<Bytes> = None;
         let mut count = 0;
+        let mut cache = None;
 
         loop {
             let result = index_format.next_entry_unloaded(
@@ -337,6 +448,8 @@ mod tests {
                 current_key.as_deref(),
                 Direction::Forward,
                 &metrics,
+                dummy_pos,
+                &mut cache,
             );
 
             if result.is_none() {
@@ -351,9 +464,10 @@ mod tests {
         // Verify we can iterate through all entries
         assert_eq!(count, 20, "Should iterate through all 20 entries");
 
-        // Test backward iteration
-        let mut current_key = None;
+        // Test backward iteration with a fresh cache
+        let mut current_key: Option<Bytes> = None;
         let mut count = 0;
+        let mut cache = None;
 
         loop {
             let result = index_format.next_entry_unloaded(
@@ -362,6 +476,8 @@ mod tests {
                 current_key.as_deref(),
                 Direction::Backward,
                 &metrics,
+                dummy_pos,
+                &mut cache,
             );
 
             if result.is_none() {
@@ -375,5 +491,79 @@ mod tests {
 
         // Verify we can iterate through all entries backwards
         assert_eq!(count, 20, "Should iterate through all 20 entries backward");
+    }
+
+    #[test]
+    fn test_next_entry_cache_reduces_io() {
+        let metrics = Metrics::new();
+        // Use a small key space so all keys land in few micro-cells.
+        let (shape, ks_id) = KeyShape::new_single(8, 1, KeyType::uniform(1));
+        let ks = shape.ks(ks_id);
+
+        let mut table = IndexTable::default();
+        // Pack many consecutive keys so they share micro-cells.
+        for i in 0u64..50 {
+            let key = (i * 100_000_000_000_000u64).to_be_bytes().to_vec();
+            table.insert(Bytes::from(key), WalPosition::test_value(i));
+        }
+
+        let index_format = LookupHeaderIndex;
+        let serialized = index_format.clean_serialize_index(&mut table, ks);
+        let reader = MockRandomRead::new(serialized);
+        let dummy_pos = WalPosition::test_value(42);
+
+        // Iterate with cache enabled, counting reads.
+        let mut current_key: Option<Bytes> = None;
+        let mut count = 0;
+        let mut cache = None;
+        reader.reset_call_count();
+
+        loop {
+            let result = index_format.next_entry_unloaded(
+                ks,
+                &reader,
+                current_key.as_deref(),
+                Direction::Forward,
+                &metrics,
+                dummy_pos,
+                &mut cache,
+            );
+            if result.is_none() {
+                break;
+            }
+            let (key, _) = result.unwrap();
+            current_key = Some(key);
+            count += 1;
+        }
+        assert_eq!(count, 50);
+        let cached_reads = reader.call_count();
+
+        // Iterate again without cache (fresh None each call).
+        let mut current_key: Option<Bytes> = None;
+        reader.reset_call_count();
+
+        loop {
+            let result = index_format.next_entry_unloaded(
+                ks,
+                &reader,
+                current_key.as_deref(),
+                Direction::Forward,
+                &metrics,
+                dummy_pos,
+                &mut None,
+            );
+            if result.is_none() {
+                break;
+            }
+            let (key, _) = result.unwrap();
+            current_key = Some(key);
+        }
+        let uncached_reads = reader.call_count();
+
+        // With caching we should issue strictly fewer I/O calls.
+        assert!(
+            cached_reads < uncached_reads,
+            "cache={cached_reads} should be less than no-cache={uncached_reads}"
+        );
     }
 }

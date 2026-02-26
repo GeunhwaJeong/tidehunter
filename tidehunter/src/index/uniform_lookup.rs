@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::time::Instant;
 
-use super::index_format::{Direction, IndexFormat};
+use super::index_format::{Direction, IndexFormat, IndexIterCache};
 use crate::index::index_format::{PREFIX_LENGTH, binary_search};
 use crate::key_shape::CELL_PREFIX_LENGTH;
 use crate::metrics::Metrics;
@@ -274,25 +274,153 @@ impl IndexFormat for UniformLookupIndex {
         prev: Option<&[u8]>,
         direction: Direction,
         metrics: &Metrics,
+        position: WalPosition,
+        cache: &mut Option<IndexIterCache>,
     ) -> Option<(Bytes, WalPosition)> {
         let element_size = ks.require_index_element_size();
         let key_size = ks.require_index_key_size("uniform lookup index");
         let file_length = reader.len();
 
-        // If there's no previous key, just start at the beginning/end
+        // Invalidate stale cache (flush detected between calls).
+        if let Some(c) = cache.as_ref()
+            && c.position() != position
+        {
+            *cache = None;
+        }
+
+        // If there's no previous key, just start at the beginning/end.
+        // We don't cache this case; the second call will have a prev_key and
+        // will populate the cache then.
         let Some(prev_key) = prev else {
+            *cache = None;
             return self.next_entry_unloaded_no_prev(ks, reader, direction, metrics);
         };
 
         assert_eq!(prev_key.len(), key_size);
 
-        // Find the cell and compute probable offset
+        // --- Cache check ---
+        // Try to serve the result directly from the cached window buffer.
+        if let Some(IndexIterCache::UniformLookup {
+            from_offset: cached_from,
+            to_offset: cached_to,
+            buffer: cached_buf,
+            last_returned_pos: cached_lrp,
+            ..
+        }) = cache.as_ref()
+        {
+            let (cached_from, cached_to, last_pos) = (*cached_from, *cached_to, *cached_lrp);
+            let entry_count = cached_buf.len() / element_size;
+            if entry_count > 0 {
+                let first_key = &cached_buf[..key_size];
+                let last_key = &cached_buf
+                    [cached_buf.len() - element_size..cached_buf.len() - element_size + key_size];
+
+                // prev_key is in range if it lies within [first_key, last_key],
+                // or we're already at a file boundary (no more data beyond).
+                let in_range = (prev_key >= first_key || cached_from == 0)
+                    && (prev_key <= last_key || cached_to == file_length);
+
+                if in_range {
+                    // --- O(1) sequential path ---
+                    // If prev_key matches the last entry we returned, the next
+                    // entry is at last_pos ± 1 — no binary search needed.
+                    let key_at_last =
+                        &cached_buf[last_pos * element_size..last_pos * element_size + key_size];
+
+                    let next_pos_opt: Option<usize> = if key_at_last == prev_key {
+                        match direction {
+                            Direction::Forward => {
+                                let p = last_pos + 1;
+                                if p < entry_count {
+                                    Some(p)
+                                } else if cached_to == file_length {
+                                    return None; // End of file.
+                                } else {
+                                    None // Need to read more data; fall through.
+                                }
+                            }
+                            Direction::Backward => {
+                                if last_pos == 0 {
+                                    if cached_from == 0 {
+                                        return None; // Beginning of file.
+                                    }
+                                    None // Need to read earlier data; fall through.
+                                } else {
+                                    Some(last_pos - 1)
+                                }
+                            }
+                        }
+                    } else {
+                        // --- Binary search fallback (non-sequential access) ---
+                        let (found_pos, insertion_point, _) =
+                            binary_search(cached_buf, prev_key, element_size, key_size, metrics);
+
+                        match direction {
+                            Direction::Forward => {
+                                let raw = if let Some(p) = found_pos {
+                                    p + 1
+                                } else {
+                                    insertion_point
+                                };
+                                if raw < entry_count {
+                                    Some(raw)
+                                } else if cached_to == file_length {
+                                    return None;
+                                } else {
+                                    None
+                                }
+                            }
+                            Direction::Backward => {
+                                if let Some(p) = found_pos {
+                                    if p == 0 {
+                                        if cached_from == 0 {
+                                            return None;
+                                        }
+                                        None
+                                    } else {
+                                        Some(p - 1)
+                                    }
+                                } else if insertion_point == 0 {
+                                    if cached_from == 0 {
+                                        return None;
+                                    }
+                                    None
+                                } else {
+                                    Some(insertion_point - 1)
+                                }
+                            }
+                        }
+                    };
+
+                    if let Some(next_pos) = next_pos_opt {
+                        // Full cache hit: return from the existing buffer.
+                        let entry_start = next_pos * element_size;
+                        let key = cached_buf.slice(entry_start..entry_start + key_size);
+                        let value_bytes =
+                            &cached_buf[entry_start + key_size..entry_start + element_size];
+                        let pos = WalPosition::from_slice(value_bytes);
+                        // Update last_returned_pos so next call uses O(1).
+                        if let Some(IndexIterCache::UniformLookup {
+                            last_returned_pos, ..
+                        }) = cache.as_mut()
+                        {
+                            *last_returned_pos = next_pos;
+                        }
+                        return Some((key, pos));
+                    }
+                    // else: fall through to disk-based window search below
+                }
+            }
+        }
+
+        // --- Cache miss: run the window search logic and populate the cache. ---
+
+        // Find the cell and compute probable offset.
         let cell = ks.cell_id(prev_key);
         let cell_prefix_range = ks.index_prefix_range(&cell);
         let (probable_offset, half_window_size) =
             self.probable_key_offset_and_window_size(ks, &cell_prefix_range, prev_key, file_length);
 
-        // Compute the initial window around the probable offset
         let (mut from_offset, mut to_offset) =
             Self::lookup_window(half_window_size, probable_offset, element_size, file_length);
 
@@ -317,7 +445,6 @@ impl IndexFormat for UniformLookupIndex {
 
             // Check if the buffer range contains the key
             if prev_key < first_element_key && from_offset != 0 {
-                // Key is smaller than the first element in the buffer, move window down
                 (from_offset, to_offset) = Self::move_window_down(
                     from_offset,
                     half_window_size,
@@ -328,43 +455,34 @@ impl IndexFormat for UniformLookupIndex {
             }
 
             if prev_key > last_element_key && to_offset != file_length {
-                // Key is larger than the last element in the buffer, move window up
                 (from_offset, to_offset) =
                     Self::move_window_up(to_offset, half_window_size, element_size, file_length);
                 continue;
             }
 
-            // The key should be in this buffer (or its insertion point is)
             let entry_count = buffer.len() / element_size;
             if entry_count == 0 {
                 metrics.lookup_iterations.observe(iterations as f64);
                 return None;
             }
 
-            // Use binary search to find the position
             let (found_pos, insertion_point, _) =
                 binary_search(&buffer, prev_key, element_size, key_size, metrics);
 
             let next_pos = match direction {
                 Direction::Forward => {
                     if let Some(pos) = found_pos {
-                        // Move to the next position after the found key
                         pos + 1
                     } else {
-                        // If key not found, use the insertion point
                         insertion_point
                     }
                 }
                 Direction::Backward => {
                     if let Some(pos) = found_pos {
-                        // Move to the previous position before the found key
                         if pos == 0 {
-                            // If at the beginning of this buffer, we might need to check previous buffers
                             if from_offset == 0 {
-                                return None; // Already at the beginning of the file
+                                return None;
                             }
-
-                            // Move window down and continue search
                             (from_offset, to_offset) = Self::move_window_down(
                                 from_offset,
                                 half_window_size,
@@ -375,14 +493,10 @@ impl IndexFormat for UniformLookupIndex {
                         }
                         pos - 1
                     } else {
-                        // If key not found, use the position before insertion point
                         if insertion_point == 0 {
-                            // If at the beginning of this buffer, we might need to check previous buffers
                             if from_offset == 0 {
-                                return None; // Already at the beginning of the file
+                                return None;
                             }
-
-                            // Move window down and continue search
                             (from_offset, to_offset) = Self::move_window_down(
                                 from_offset,
                                 half_window_size,
@@ -396,21 +510,25 @@ impl IndexFormat for UniformLookupIndex {
                 }
             };
 
-            // Check if there's a valid entry at the position
             if next_pos >= entry_count {
-                // If we've reached the end of this buffer, try to move up
                 if to_offset == file_length {
                     metrics.lookup_iterations.observe(iterations as f64);
-                    return None; // Already at the end of the file
+                    return None;
                 }
-
-                // Move window up and continue search
                 (from_offset, to_offset) =
                     Self::move_window_up(to_offset, half_window_size, element_size, file_length);
                 continue;
             }
 
-            // Extract the key and value at the position
+            // Populate cache with the window we just read.
+            *cache = Some(IndexIterCache::UniformLookup {
+                position,
+                from_offset,
+                to_offset,
+                buffer: buffer.clone(),
+                last_returned_pos: next_pos,
+            });
+
             let entry_start = next_pos * element_size;
             let key = buffer.slice(entry_start..entry_start + key_size);
             let value_bytes = &buffer[entry_start + key_size..entry_start + element_size];

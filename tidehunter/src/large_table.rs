@@ -2,8 +2,7 @@ use crate::cell::{CellId, CellIdBytesContainer};
 use crate::config::Config;
 use crate::context::{KsContext, LookupResult, LookupSource};
 use crate::flusher::{FlushKind, FlusherCommand, IndexFlusher, IndexFlusherThread};
-use crate::index::index_format::Direction;
-use crate::index::index_format::IndexFormat;
+use crate::index::index_format::{Direction, IndexFormat, IndexIterCache};
 use crate::index::index_table::IndexTable;
 use crate::index::pending_table::{PendingTable, Transaction};
 use crate::index::utils::{NextEntryResult, take_next_entry};
@@ -721,6 +720,7 @@ impl LargeTable {
     /// Takes a next entry in the large table.
     ///
     /// See Db::next_entry for documentation.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn next_entry<L: Loader>(
         &self,
         context: &KsContext,
@@ -729,13 +729,14 @@ impl LargeTable {
         loader: &L,
         end_cell_exclusive: &Option<CellId>,
         reverse: bool,
+        cache: &mut Option<IndexIterCache>,
     ) -> Result<Option<IteratorResult<WalPosition>>, L::Error> {
         let ks_table = self.ks_rows(&context.ks_config);
         loop {
             let next_in_cell = {
                 let row = context.ks_config.mutex_for_cell(&cell);
                 let mut row = ks_table.lock(row, &context.large_table_contention);
-                Self::next_in_cell(loader, &mut row, &cell, prev_key, reverse)?
+                Self::next_in_cell(loader, &mut row, &cell, prev_key, reverse, cache)?
                 // drop row mutex as required by Self::next_cell called below
             };
             if let Some((key, value)) = next_in_cell {
@@ -746,6 +747,8 @@ impl LargeTable {
                 }));
             } else {
                 prev_key = None;
+                // Moving to a new cell — the cached buffer is no longer valid.
+                *cache = None;
                 let Some(next_cell) = self.next_cell(context, &cell, reverse) else {
                     return Ok(None);
                 };
@@ -769,6 +772,7 @@ impl LargeTable {
         cell: &CellId,
         mut prev_key: Option<Bytes>,
         reverse: bool,
+        cache: &mut Option<IndexIterCache>,
     ) -> Result<Option<(Bytes, WalPosition)>, L::Error> {
         let Some(entry) = row.try_entry_mut(cell) else {
             return Ok(None);
@@ -781,8 +785,9 @@ impl LargeTable {
         }
 
         match &entry.state {
-            // If already loaded, just use what's in memory
+            // If already loaded, just use what's in memory — cache is not used.
             LargeTableEntryState::Loaded(_) | LargeTableEntryState::DirtyLoaded(_) => {
+                *cache = None;
                 let mut prev_key = prev_key;
                 // Skip entries marked as invalid (deleted)
                 while let Some((key, pos)) = entry.next_entry(prev_key.take(), reverse) {
@@ -797,12 +802,16 @@ impl LargeTable {
             }
 
             // For empty state, we have nothing to return
-            LargeTableEntryState::Empty => Ok(None),
+            LargeTableEntryState::Empty => {
+                *cache = None;
+                Ok(None)
+            }
 
             // For unloaded states, read from disk without loading everything
             LargeTableEntryState::Unloaded(position) => {
+                let position = *position;
                 // Get reader for on-disk index
-                let index_reader = loader.index_reader(*position)?;
+                let index_reader = loader.index_reader(position)?;
                 let format = entry.context.ks_config.index_format();
 
                 // Use the format to find the next entry from on-disk index
@@ -815,6 +824,8 @@ impl LargeTable {
                         prev_key.as_deref(),
                         direction,
                         &entry.context.metrics,
+                        position,
+                        cache,
                     )
                 });
 
@@ -841,6 +852,8 @@ impl LargeTable {
                             prev_key.as_deref(),
                             direction,
                             &entry.context.metrics,
+                            position,
+                            cache,
                         )
                     });
 
@@ -1986,7 +1999,8 @@ mod tests {
 
             // Test next_in_cell with empty state
             let result =
-                LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, false).unwrap();
+                LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, false, &mut None)
+                    .unwrap();
             assert!(result.is_none(), "Empty state should return None");
         }
 
@@ -2004,7 +2018,8 @@ mod tests {
 
             // Test forward iteration with loaded state
             let result =
-                LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, false).unwrap();
+                LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, false, &mut None)
+                    .unwrap();
             assert!(result.is_some(), "Loaded state should return first entry");
             let (key, pos) = result.unwrap();
             assert_eq!(key.as_ref(), 10_u64.to_be_bytes());
@@ -2017,6 +2032,7 @@ mod tests {
                 &cell_id,
                 Some(Bytes::from(20_u64.to_be_bytes().to_vec())),
                 false,
+                &mut None,
             )
             .unwrap();
             assert!(result.is_some());
@@ -2025,7 +2041,9 @@ mod tests {
             assert_eq!(pos, WalPosition::test_value(3));
 
             // Test backward iteration
-            let result = LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, true).unwrap();
+            let result =
+                LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, true, &mut None)
+                    .unwrap();
             assert!(result.is_some());
             let (key, pos) = result.unwrap();
             assert_eq!(key.as_ref(), 50_u64.to_be_bytes());
@@ -2050,7 +2068,8 @@ mod tests {
 
             // Test forward iteration with unloaded state
             let result =
-                LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, false).unwrap();
+                LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, false, &mut None)
+                    .unwrap();
             assert!(
                 result.is_some(),
                 "Unloaded state should return first entry from disk"
@@ -2066,6 +2085,7 @@ mod tests {
                 &cell_id,
                 Some(Bytes::from(20_u64.to_be_bytes().to_vec())),
                 false,
+                &mut None,
             )
             .unwrap();
             assert!(result.is_some());
@@ -2104,6 +2124,7 @@ mod tests {
                 &cell_id,
                 Some(Bytes::from(30_u64.to_be_bytes().to_vec())),
                 false,
+                &mut None,
             )
             .unwrap();
             assert!(result.is_some());
@@ -2118,6 +2139,7 @@ mod tests {
                 &cell_id,
                 Some(Bytes::from(10_u64.to_be_bytes().to_vec())),
                 false,
+                &mut None,
             )
             .unwrap();
             assert!(result.is_some());
@@ -2162,6 +2184,7 @@ mod tests {
                 &cell_id,
                 Some(Bytes::from(10_u64.to_be_bytes().to_vec())),
                 false,
+                &mut None,
             )
             .unwrap();
             assert!(result.is_some());
@@ -2176,6 +2199,7 @@ mod tests {
                 &cell_id,
                 Some(Bytes::from(30_u64.to_be_bytes().to_vec())),
                 false,
+                &mut None,
             )
             .unwrap();
             assert!(result.is_some());

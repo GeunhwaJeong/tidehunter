@@ -11,6 +11,46 @@ use crate::metrics::{Metrics, TimerExt};
 use crate::wal::position::WalPosition;
 use crate::{index::index_table::IndexTable, key_shape::KeySpaceDesc, lookup::RandomRead};
 
+/// Per-iterator cache for on-disk index reads.
+///
+/// Stores the last-read data buffer so that sequential iteration can reuse it
+/// across consecutive `next_entry_unloaded` calls without issuing redundant
+/// disk reads.  The `position` field is compared against the current cell's
+/// `WalPosition` to detect flushes that invalidate the cached data.
+pub enum IndexIterCache {
+    LookupHeader {
+        /// WAL position of the index snapshot this buffer came from.
+        position: WalPosition,
+        /// Which micro-cell's data is stored in `buffer`.
+        micro_cell: usize,
+        /// The raw micro-cell data buffer (key+WalPosition entries).
+        buffer: Bytes,
+        /// Entry-index within `buffer` of the last key returned to the caller.
+        /// Allows O(1) sequential lookup: the next key is at `last_returned_pos ± 1`.
+        last_returned_pos: usize,
+    },
+    UniformLookup {
+        /// WAL position of the index snapshot this buffer came from.
+        position: WalPosition,
+        /// Byte range `[from_offset, to_offset)` within the index file.
+        from_offset: usize,
+        to_offset: usize,
+        /// The window data buffer.
+        buffer: Bytes,
+        /// Entry-index within `buffer` of the last key returned to the caller.
+        last_returned_pos: usize,
+    },
+}
+
+impl IndexIterCache {
+    pub fn position(&self) -> WalPosition {
+        match self {
+            IndexIterCache::LookupHeader { position, .. } => *position,
+            IndexIterCache::UniformLookup { position, .. } => *position,
+        }
+    }
+}
+
 pub const HEADER_ELEMENTS: usize = 128;
 pub const HEADER_ELEMENT_SIZE: usize = 8;
 pub const HEADER_SIZE: usize = HEADER_ELEMENTS * HEADER_ELEMENT_SIZE;
@@ -29,6 +69,16 @@ pub trait IndexFormat {
 
     /// Find the next entry in the index after the given key in the specified direction.
     /// If prev is None, returns the first entry in forward direction or last entry in backward direction.
+    ///
+    /// `position` is the WAL position of the on-disk index snapshot; it is
+    /// stored in the cache and used to detect staleness if a flush occurs
+    /// between calls.
+    ///
+    /// `cache` is an in/out parameter that carries a data buffer across calls.
+    /// On a cache hit the buffer is searched without issuing any disk I/O.
+    /// On a cache miss the implementation reads from disk and updates `cache`.
+    /// Callers must set `*cache = None` when moving to a different cell.
+    #[allow(clippy::too_many_arguments)]
     fn next_entry_unloaded(
         &self,
         ks: &KeySpaceDesc,
@@ -36,6 +86,8 @@ pub trait IndexFormat {
         prev: Option<&[u8]>,
         direction: Direction,
         metrics: &Metrics,
+        position: WalPosition,
+        cache: &mut Option<IndexIterCache>,
     ) -> Option<(Bytes, WalPosition)>;
 
     #[cfg(any(test, feature = "test_methods"))]
@@ -88,13 +140,14 @@ impl IndexFormat for IndexFormatType {
         prev: Option<&[u8]>,
         direction: Direction,
         metrics: &Metrics,
+        position: WalPosition,
+        cache: &mut Option<IndexIterCache>,
     ) -> Option<(Bytes, WalPosition)> {
         match self {
-            IndexFormatType::Header => {
-                LookupHeaderIndex.next_entry_unloaded(ks, reader, prev, direction, metrics)
-            }
+            IndexFormatType::Header => LookupHeaderIndex
+                .next_entry_unloaded(ks, reader, prev, direction, metrics, position, cache),
             IndexFormatType::Uniform(index) => {
-                index.next_entry_unloaded(ks, reader, prev, direction, metrics)
+                index.next_entry_unloaded(ks, reader, prev, direction, metrics, position, cache)
             }
         }
     }
@@ -453,18 +506,33 @@ pub mod test {
         // Convert the table to bytes
         let serialized = index_format.clean_serialize_index(&mut table, ks);
         let reader = MockRandomRead::new(serialized);
+        let dummy_pos = WalPosition::test_value(0);
 
         // Test forward iteration with no previous key (should return first entry)
-        let result =
-            index_format.next_entry_unloaded(ks, &reader, None, Direction::Forward, &metrics);
+        let result = index_format.next_entry_unloaded(
+            ks,
+            &reader,
+            None,
+            Direction::Forward,
+            &metrics,
+            dummy_pos,
+            &mut None,
+        );
         assert!(result.is_some());
         let (key, pos) = result.unwrap();
         assert_eq!(key, 10_u64.to_be_bytes());
         assert_eq!(pos, WalPosition::test_value(1));
 
         // Test backward iteration with no previous key (should return last entry)
-        let result =
-            index_format.next_entry_unloaded(ks, &reader, None, Direction::Backward, &metrics);
+        let result = index_format.next_entry_unloaded(
+            ks,
+            &reader,
+            None,
+            Direction::Backward,
+            &metrics,
+            dummy_pos,
+            &mut None,
+        );
         assert!(result.is_some());
         let (key, pos) = result.unwrap();
         assert_eq!(key, 50_u64.to_be_bytes());
@@ -478,6 +546,8 @@ pub mod test {
             Some(&prev_key),
             Direction::Forward,
             &metrics,
+            dummy_pos,
+            &mut None,
         );
         assert!(result.is_some());
         let (key, pos) = result.unwrap();
@@ -492,6 +562,8 @@ pub mod test {
             Some(&prev_key),
             Direction::Backward,
             &metrics,
+            dummy_pos,
+            &mut None,
         );
         assert!(result.is_some());
         let (key, pos) = result.unwrap();
@@ -506,6 +578,8 @@ pub mod test {
             Some(&prev_key),
             Direction::Forward,
             &metrics,
+            dummy_pos,
+            &mut None,
         );
         assert!(result.is_none());
 
@@ -517,6 +591,8 @@ pub mod test {
             Some(&prev_key),
             Direction::Backward,
             &metrics,
+            dummy_pos,
+            &mut None,
         );
         assert!(result.is_none());
 
@@ -528,6 +604,8 @@ pub mod test {
             Some(&prev_key),
             Direction::Forward,
             &metrics,
+            dummy_pos,
+            &mut None,
         );
         assert!(result.is_some());
         let (key, pos) = result.unwrap();
@@ -542,6 +620,8 @@ pub mod test {
             Some(&prev_key),
             Direction::Backward,
             &metrics,
+            dummy_pos,
+            &mut None,
         );
         assert!(result.is_some());
         let (key, pos) = result.unwrap();
@@ -561,14 +641,29 @@ pub mod test {
         // Convert the table to bytes
         let serialized = index_format.serialize_index(&table, ks);
         let reader = MockRandomRead::new(serialized);
+        let dummy_pos = WalPosition::test_value(0);
 
         // Test with empty index should return None
-        let result =
-            index_format.next_entry_unloaded(ks, &reader, None, Direction::Forward, &metrics);
+        let result = index_format.next_entry_unloaded(
+            ks,
+            &reader,
+            None,
+            Direction::Forward,
+            &metrics,
+            dummy_pos,
+            &mut None,
+        );
         assert!(result.is_none());
 
-        let result =
-            index_format.next_entry_unloaded(ks, &reader, None, Direction::Backward, &metrics);
+        let result = index_format.next_entry_unloaded(
+            ks,
+            &reader,
+            None,
+            Direction::Backward,
+            &metrics,
+            dummy_pos,
+            &mut None,
+        );
         assert!(result.is_none());
     }
 }
