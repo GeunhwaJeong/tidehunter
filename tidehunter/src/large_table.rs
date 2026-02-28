@@ -51,7 +51,9 @@ pub struct LargeTableEntry {
     /// - `None`: No flush is pending
     /// - `Some(pos)`: Async flush is in progress, will update `last_processed` to `pos` when complete
     pending_last_processed: Option<LastProcessed>,
-    value_lru: Option<LruCache<Bytes, Bytes>>,
+    // (full_key, value). full_key is the original (non-reduced) WAL key; for
+    // non-key-reduction keyspaces it equals the index key.
+    value_lru: Option<LruCache<Bytes, (Bytes, Bytes)>>,
 }
 
 enum LargeTableEntryState {
@@ -235,19 +237,20 @@ impl LargeTable {
     pub fn insert<L: Loader>(
         &self,
         context: &KsContext,
-        k: Bytes,
+        reduced_key: Bytes,
+        full_key: Bytes,
         guard: WalGuard,
         value: &Bytes,
         loader: &L,
     ) -> Result<(), L::Error> {
         self.fp.fp_insert_before_lock();
         let v = *guard.wal_position();
-        let (mut row, cell) = self.row(context, &k);
+        let (mut row, cell) = self.row(context, &reduced_key);
         let entry = self.entry_mut(&mut row, &cell);
 
-        entry.promote_pending_for(&k);
+        entry.promote_pending_for(&reduced_key);
 
-        if !entry.insert(k.clone(), v, Some(value)) {
+        if !entry.insert(reduced_key.clone(), v, full_key, Some(value)) {
             return Ok(());
         }
 
@@ -301,7 +304,7 @@ impl LargeTable {
         context: &KsContext,
         k: Bytes,
         position: WalPosition,
-        lru_update: Option<Bytes>,
+        lru_update: Option<(Bytes, Bytes)>,
         transaction: &Transaction,
     ) {
         let (mut row, cell) = self.row(context, &k);
@@ -325,17 +328,23 @@ impl LargeTable {
         context.pending_table_len.add(1);
     }
 
-    pub fn update_lru(&self, context: &KsContext, key: Bytes, value: Bytes) {
+    pub fn update_lru(
+        &self,
+        context: &KsContext,
+        reduced_key: Bytes,
+        full_key: Bytes,
+        value: Bytes,
+    ) {
         if context.ks_config.value_cache_size().is_none() {
             return;
         }
-        let (mut row, cell) = self.row(context, &key);
+        let (mut row, cell) = self.row(context, &reduced_key);
         let entry = self.entry_mut(&mut row, &cell);
         let Some(value_lru) = &mut entry.value_lru else {
             unreachable!()
         };
-        let delta: i64 = (key.len() + value.len()) as i64;
-        let previous = value_lru.push(key, value);
+        let delta: i64 = (reduced_key.len() + full_key.len() + value.len()) as i64;
+        let previous = value_lru.push(reduced_key, (full_key, value));
         LargeTableEntry::update_lru_metric(context, previous, delta);
     }
 
@@ -357,10 +366,10 @@ impl LargeTable {
         entry.promote_pending();
 
         if let Some(value_lru) = &mut entry.value_lru
-            && let Some(value) = value_lru.get(k)
+            && let Some((full_key, value)) = value_lru.get(k)
         {
             context.inc_lookup_result(LookupResult::Found, LookupSource::Lru);
-            return Ok(GetResult::Value(value.clone()));
+            return Ok(GetResult::Value(full_key.clone(), value.clone()));
         }
 
         if entry.bloom_filter_not_found(k) {
@@ -776,9 +785,9 @@ impl LargeTable {
     ) -> Result<Option<(Bytes, GetResult)>, L::Error> {
         fn lru_or_wal(entry: &mut LargeTableEntry, key: &[u8], pos: WalPosition) -> GetResult {
             if let Some(lru) = &mut entry.value_lru
-                && let Some(v) = lru.get(key)
+                && let Some((full_key, value)) = lru.get(key)
             {
-                GetResult::Value(v.clone())
+                GetResult::Value(full_key.clone(), value.clone())
             } else {
                 GetResult::WalPosition(pos)
             }
@@ -1048,6 +1057,20 @@ pub trait Loader {
     fn min_wal_position(&self) -> u64;
 }
 
+/// Splits an `lru_update` from the pending table into `(full_key, lru_value)`.
+///
+/// When `lru_update` is `None` (LRU not configured or deletion), the reduced key
+/// is returned as `full_key` — it won't be stored in the LRU anyway.
+fn split_lru_update(
+    reduced_key: &Bytes,
+    lru_update: Option<(Bytes, Bytes)>,
+) -> (Bytes, Option<Bytes>) {
+    match lru_update {
+        Some((full_key, value)) => (full_key, Some(value)),
+        None => (reduced_key.clone(), None),
+    }
+}
+
 impl LargeTableEntry {
     pub fn new_unloaded(
         context: KsContext,
@@ -1145,7 +1168,13 @@ impl LargeTableEntry {
 
     /// Returns true if successful, false if update was skipped.
     /// The lru_value must be provided if LRU is configured.
-    pub fn insert(&mut self, k: Bytes, v: WalPosition, lru_value: Option<&Bytes>) -> bool {
+    pub fn insert(
+        &mut self,
+        k: Bytes,
+        v: WalPosition,
+        full_key: Bytes,
+        lru_value: Option<&Bytes>,
+    ) -> bool {
         if self.skip_stale_update(&k, &v, "insert") {
             return false;
         }
@@ -1156,8 +1185,8 @@ impl LargeTableEntry {
 
         if let Some(value_lru) = &mut self.value_lru {
             let lru_value = lru_value.expect("lru_value must be provided if LRU is configured");
-            let delta: i64 = (k.len() + lru_value.len()) as i64;
-            let previous = value_lru.push(k, lru_value.clone());
+            let delta: i64 = (k.len() + full_key.len() + lru_value.len()) as i64;
+            let previous = value_lru.push(k, (full_key, lru_value.clone()));
             Self::update_lru_metric(&self.context, previous, delta);
         }
         true
@@ -1173,7 +1202,11 @@ impl LargeTableEntry {
         // Remove from LRU cache if enabled
         if let Some(value_lru) = &mut self.value_lru {
             let previous = value_lru.pop(&k);
-            Self::update_lru_metric(&self.context, previous.map(|v| (k.clone(), v)), 0);
+            Self::update_lru_metric(
+                &self.context,
+                previous.map(|(full_key, v)| (k.clone(), (full_key, v))),
+                0,
+            );
         }
 
         self.data.make_mut().remove(k, v);
@@ -1194,10 +1227,13 @@ impl LargeTableEntry {
             // the same skip_stale_update logic as regular updates
             if committed_change.is_modified {
                 // todo perf - report_loaded_keys_count and make_mut calls can be done once
+                let (full_key, lru_value) =
+                    split_lru_update(&committed_change.key, committed_change.lru_update);
                 self.insert(
                     committed_change.key,
                     committed_change.value,
-                    committed_change.lru_update.as_ref(),
+                    full_key,
+                    lru_value.as_ref(),
                 );
             } else {
                 self.remove(committed_change.key, committed_change.value);
@@ -1213,10 +1249,13 @@ impl LargeTableEntry {
         }
         for committed_change in committed {
             if committed_change.is_modified {
+                let (full_key, lru_value) =
+                    split_lru_update(&committed_change.key, committed_change.lru_update);
                 self.insert(
                     committed_change.key,
                     committed_change.value,
-                    committed_change.lru_update.as_ref(),
+                    full_key,
+                    lru_value.as_ref(),
                 );
             } else {
                 self.remove(committed_change.key, committed_change.value);
@@ -1273,9 +1312,13 @@ impl LargeTableEntry {
         }
     }
 
-    fn update_lru_metric(context: &KsContext, previous: Option<(Bytes, Bytes)>, mut delta: i64) {
-        if let Some((p_key, p_value)) = previous {
-            delta -= (p_key.len() + p_value.len()) as i64;
+    fn update_lru_metric(
+        context: &KsContext,
+        previous: Option<(Bytes, (Bytes, Bytes))>,
+        mut delta: i64,
+    ) {
+        if let Some((p_key, (p_full_key, p_value))) = previous {
+            delta -= (p_key.len() + p_full_key.len() + p_value.len()) as i64;
         }
         context
             .metrics
@@ -1638,7 +1681,9 @@ impl LargeTableEntryState {
 
 #[derive(Debug)]
 pub enum GetResult {
-    Value(Bytes),
+    /// LRU hit: `(full_key, value)`. `full_key` is the original (non-reduced) WAL
+    /// key. For non-key-reduction keyspaces, `full_key == index_key`.
+    Value(Bytes, Bytes),
     WalPosition(WalPosition),
     NotFound,
 }
@@ -1646,7 +1691,7 @@ pub enum GetResult {
 impl GetResult {
     pub fn is_found(&self) -> bool {
         match self {
-            GetResult::Value(_) => true,
+            GetResult::Value(..) => true,
             GetResult::WalPosition(_) => true,
             GetResult::NotFound => false,
         }

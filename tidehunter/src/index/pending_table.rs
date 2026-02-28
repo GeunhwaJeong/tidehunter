@@ -36,14 +36,14 @@ pub struct CommittedChange {
     /// True if change was modification, false if change was deletion
     pub is_modified: bool,
     pub value: WalPosition,
-    /// Value bytes for LRU cache updates. None for deletions or if LRU is not configured.
-    pub lru_update: Option<Bytes>,
+    /// `(full_key, value)` for LRU cache updates. None for deletions or if LRU is not configured.
+    pub lru_update: Option<(Bytes, Bytes)>,
 }
 
 #[derive(Clone)]
 struct PendingUpdateInner {
     update: WalPosition,
-    lru_update: Option<Bytes>,
+    lru_update: Option<(Bytes, Bytes)>,
 }
 
 #[derive(Default, Clone)]
@@ -67,7 +67,7 @@ impl PendingTable {
         &mut self,
         key: Bytes,
         position: WalPosition,
-        lru_update: Option<Bytes>,
+        lru_update: Option<(Bytes, Bytes)>,
         transaction: &Transaction,
     ) {
         self.insert_pending(key, true, position, lru_update, transaction);
@@ -82,7 +82,7 @@ impl PendingTable {
         key: Bytes,
         is_modified: bool,
         position: WalPosition,
-        lru_update: Option<Bytes>,
+        lru_update: Option<(Bytes, Bytes)>,
         transaction: &Transaction,
     ) {
         self.len += 1;
@@ -184,7 +184,7 @@ impl PendingUpdate {
         transaction_status: TransactionStatus,
         is_modified: bool,
         position: WalPosition,
-        lru_update: Option<Bytes>,
+        lru_update: Option<(Bytes, Bytes)>,
     ) -> Self {
         let inner = PendingUpdateInner {
             update: position,

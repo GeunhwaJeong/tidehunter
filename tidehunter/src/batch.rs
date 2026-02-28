@@ -25,7 +25,8 @@ pub(crate) enum PendingOp {
     Insert {
         ks: KeySpace,
         reduced_key: Bytes,
-        lru_update: Option<Bytes>,
+        /// `(full_key, value)` for LRU updates. None if LRU is not configured.
+        lru_update: Option<(Bytes, Bytes)>,
     },
     Remove {
         ks: KeySpace,
@@ -65,8 +66,11 @@ impl WriteBatch {
         let context = self.db.ks_context(ks);
         context.ks_config.check_key(&k);
         let reduced_key = context.ks_config.reduced_key_bytes(k.clone());
-        // Pass value for LRU cache if enabled
-        let lru_update = context.ks_config.value_cache_size().map(|_| v.clone());
+        // Pass (full_key, value) for LRU cache if enabled
+        let lru_update = context
+            .ks_config
+            .value_cache_size()
+            .map(|_| (k.clone(), v.clone()));
 
         // Store operation to be applied on commit
         self.pending_ops.push(PendingOp::Insert {

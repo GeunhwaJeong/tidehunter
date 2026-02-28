@@ -279,9 +279,10 @@ impl Db {
         self.metrics
             .wal_written_bytes
             .set(guard.wal_position().offset() as i64);
+        let full_key = k.clone();
         let reduced_key = context.ks_config.reduced_key_bytes(k);
         self.large_table
-            .insert(context, reduced_key, guard, &v, self)?;
+            .insert(context, reduced_key, full_key, guard, &v, self)?;
         Ok(())
     }
 
@@ -302,7 +303,7 @@ impl Db {
         let _timer = context.db_op_timer(DbOpKind::Get);
         let reduced_key = context.ks_config.reduce_key(k);
         match self.large_table.get(context, reduced_key.as_ref(), self)? {
-            GetResult::Value(value) => {
+            GetResult::Value(_, value) => {
                 // todo check collision ?
                 Ok(Some(value))
             }
@@ -311,8 +312,12 @@ impl Db {
                 let Some(value) = value else {
                     return Ok(None);
                 };
-                self.large_table
-                    .update_lru(context, reduced_key.to_vec().into(), value.clone());
+                self.large_table.update_lru(
+                    context,
+                    reduced_key.to_vec().into(),
+                    Bytes::from(k.to_vec()),
+                    value.clone(),
+                );
                 Ok(Some(value))
             }
             GetResult::NotFound => Ok(None),
@@ -618,13 +623,13 @@ impl Db {
             return Ok(None);
         };
         let (key, value) = match result.value {
-            GetResult::Value(ref v) => (result.key.clone(), v.clone()),
+            GetResult::Value(ref full_key, ref v) => (full_key.clone(), v.clone()),
             GetResult::WalPosition(w) => {
                 let Some((k, v)) = self.read_record(w)? else {
                     return Ok(None);
                 };
                 self.large_table
-                    .update_lru(context, result.key.clone(), v.clone());
+                    .update_lru(context, result.key.clone(), k.clone(), v.clone());
                 (k, v)
             }
             GetResult::NotFound => unreachable!(),
@@ -750,9 +755,10 @@ impl Db {
                         continue;
                     }
                     let context = contexts.ks_context(ks);
+                    let full_key = k.clone();
                     let reduced_key = context.ks_config.reduced_key_bytes(k);
                     let guard = WalGuard::replay_guard(position);
-                    large_table.insert(context, reduced_key, guard, &v, indexes)?;
+                    large_table.insert(context, reduced_key, full_key, guard, &v, indexes)?;
                 }
                 WalEntry::Index(_ks, _bytes) => {
                     unreachable!("Should not have index entries in wal");
