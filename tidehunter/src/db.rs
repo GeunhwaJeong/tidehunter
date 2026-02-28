@@ -617,10 +617,18 @@ impl Db {
         else {
             return Ok(None);
         };
-        let Some(record) = self.read_record(result.value)? else {
-            return Ok(None);
+        let (key, value) = match result.value {
+            GetResult::Value(ref v) => (result.key.clone(), v.clone()),
+            GetResult::WalPosition(w) => {
+                let Some((k, v)) = self.read_record(w)? else {
+                    return Ok(None);
+                };
+                self.large_table
+                    .update_lru(context, result.key.clone(), v.clone());
+                (k, v)
+            }
+            GetResult::NotFound => unreachable!(),
         };
-        let (key, value) = record;
         Ok(Some(result.with_key_value(key, value)))
     }
 

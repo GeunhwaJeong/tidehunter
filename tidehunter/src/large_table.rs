@@ -730,7 +730,7 @@ impl LargeTable {
         end_cell_exclusive: &Option<CellId>,
         reverse: bool,
         cache: &mut Option<IndexIterCache>,
-    ) -> Result<Option<IteratorResult<WalPosition>>, L::Error> {
+    ) -> Result<Option<IteratorResult<GetResult>>, L::Error> {
         let ks_table = self.ks_rows(&context.ks_config);
         loop {
             let next_in_cell = {
@@ -773,7 +773,16 @@ impl LargeTable {
         mut prev_key: Option<Bytes>,
         reverse: bool,
         cache: &mut Option<IndexIterCache>,
-    ) -> Result<Option<(Bytes, WalPosition)>, L::Error> {
+    ) -> Result<Option<(Bytes, GetResult)>, L::Error> {
+        fn lru_or_wal(entry: &mut LargeTableEntry, key: &[u8], pos: WalPosition) -> GetResult {
+            if let Some(lru) = &mut entry.value_lru
+                && let Some(v) = lru.get(key)
+            {
+                GetResult::Value(v.clone())
+            } else {
+                GetResult::WalPosition(pos)
+            }
+        }
         let Some(entry) = row.try_entry_mut(cell) else {
             return Ok(None);
         };
@@ -792,7 +801,8 @@ impl LargeTable {
                 // Skip entries marked as invalid (deleted)
                 while let Some((key, pos)) = entry.next_entry(prev_key.take(), reverse) {
                     if pos.is_valid() {
-                        return Ok(Some((key, pos)));
+                        let get_result = lru_or_wal(entry, &key, pos);
+                        return Ok(Some((key, get_result)));
                     }
                     // Get next entry after the invalid one
                     prev_key = Some(key);
@@ -829,7 +839,13 @@ impl LargeTable {
                     )
                 });
 
-                Ok(result)
+                Ok(match result {
+                    Some((key, pos)) => {
+                        let get_result = lru_or_wal(entry, &key, pos);
+                        Some((key, get_result))
+                    }
+                    None => None,
+                })
             }
 
             // For dirty unloaded, combine in-memory and on-disk entries
@@ -859,7 +875,10 @@ impl LargeTable {
 
                     match take_next_entry(in_memory_next, on_disk_next, direction) {
                         NextEntryResult::NotFound => return Ok(None),
-                        NextEntryResult::Found(key, val) => return Ok(Some((key, val))),
+                        NextEntryResult::Found(key, val) => {
+                            let get_result = lru_or_wal(entry, &key, val);
+                            return Ok(Some((key, get_result)));
+                        }
                         NextEntryResult::SkipDeleted(skip_key) => {
                             prev_key = Some(skip_key);
                         }
@@ -1632,6 +1651,14 @@ impl GetResult {
             GetResult::NotFound => false,
         }
     }
+
+    #[cfg(test)]
+    pub fn unwrap_wal_position(self) -> WalPosition {
+        match self {
+            GetResult::WalPosition(p) => p,
+            other => panic!("expected WalPosition, got {other:?}"),
+        }
+    }
 }
 
 enum UnloadedState {
@@ -2021,7 +2048,8 @@ mod tests {
                 LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, false, &mut None)
                     .unwrap();
             assert!(result.is_some(), "Loaded state should return first entry");
-            let (key, pos) = result.unwrap();
+            let (key, get_result) = result.unwrap();
+            let pos = get_result.unwrap_wal_position();
             assert_eq!(key.as_ref(), 10_u64.to_be_bytes());
             assert_eq!(pos, WalPosition::test_value(1));
 
@@ -2036,7 +2064,8 @@ mod tests {
             )
             .unwrap();
             assert!(result.is_some());
-            let (key, pos) = result.unwrap();
+            let (key, get_result) = result.unwrap();
+            let pos = get_result.unwrap_wal_position();
             assert_eq!(key.as_ref(), 30_u64.to_be_bytes());
             assert_eq!(pos, WalPosition::test_value(3));
 
@@ -2045,7 +2074,8 @@ mod tests {
                 LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, true, &mut None)
                     .unwrap();
             assert!(result.is_some());
-            let (key, pos) = result.unwrap();
+            let (key, get_result) = result.unwrap();
+            let pos = get_result.unwrap_wal_position();
             assert_eq!(key.as_ref(), 50_u64.to_be_bytes());
             assert_eq!(pos, WalPosition::test_value(5));
         }
@@ -2074,7 +2104,8 @@ mod tests {
                 result.is_some(),
                 "Unloaded state should return first entry from disk"
             );
-            let (key, pos) = result.unwrap();
+            let (key, get_result) = result.unwrap();
+            let pos = get_result.unwrap_wal_position();
             assert_eq!(key.as_ref(), 10_u64.to_be_bytes());
             assert_eq!(pos, WalPosition::test_value(1));
 
@@ -2089,7 +2120,8 @@ mod tests {
             )
             .unwrap();
             assert!(result.is_some());
-            let (key, pos) = result.unwrap();
+            let (key, get_result) = result.unwrap();
+            let pos = get_result.unwrap_wal_position();
             assert_eq!(key.as_ref(), 30_u64.to_be_bytes());
             assert_eq!(pos, WalPosition::test_value(3));
         }
@@ -2128,7 +2160,8 @@ mod tests {
             )
             .unwrap();
             assert!(result.is_some());
-            let (key, pos) = result.unwrap();
+            let (key, get_result) = result.unwrap();
+            let pos = get_result.unwrap_wal_position();
             assert_eq!(key.as_ref(), 50_u64.to_be_bytes()); // Should skip over the deleted 40
             assert_eq!(pos, WalPosition::test_value(5));
 
@@ -2143,7 +2176,8 @@ mod tests {
             )
             .unwrap();
             assert!(result.is_some());
-            let (key, pos) = result.unwrap();
+            let (key, get_result) = result.unwrap();
+            let pos = get_result.unwrap_wal_position();
             assert_eq!(key.as_ref(), 15_u64.to_be_bytes()); // Should find our new key
             assert_eq!(pos, WalPosition::test_value(15));
         }
@@ -2188,7 +2222,8 @@ mod tests {
             )
             .unwrap();
             assert!(result.is_some());
-            let (key, pos) = result.unwrap();
+            let (key, get_result) = result.unwrap();
+            let pos = get_result.unwrap_wal_position();
             assert_eq!(key.as_ref(), 15_u64.to_be_bytes());
             assert_eq!(pos, WalPosition::test_value(15));
 
@@ -2203,7 +2238,8 @@ mod tests {
             )
             .unwrap();
             assert!(result.is_some());
-            let (key, pos) = result.unwrap();
+            let (key, get_result) = result.unwrap();
+            let pos = get_result.unwrap_wal_position();
             assert_eq!(key.as_ref(), 50_u64.to_be_bytes()); // Should skip over the deleted 40
             assert_eq!(pos, WalPosition::test_value(5));
         }
