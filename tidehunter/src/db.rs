@@ -24,6 +24,7 @@ use bloom::needed_bits;
 use bytes::{Buf, BufMut, BytesMut};
 use minibytes::Bytes;
 use parking_lot::Mutex;
+use rand::Rng;
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -222,9 +223,7 @@ impl Db {
     }
 
     fn periodic_snapshot_thread(weak: Weak<Db>, mut position: u64) -> Option<()> {
-        let start = Instant::now();
-        let mut last_snapshot = Duration::ZERO;
-        const SNAPSHOT_EVERY_SECS: u64 = 3600;
+        let mut next_snapshot = Self::next_snapshot_instant();
         loop {
             // Check if database is still alive periodically (every second) to allow faster shutdown
             for _ in 0..60 {
@@ -239,15 +238,9 @@ impl Db {
             // todo when we get to wal position wrapping around this will need to be fixed
             let current_wal_position = db.wal_writer.position();
             let written = current_wal_position.checked_sub(position).unwrap();
-            let now = start.elapsed();
-            let timed_snapshot =
-                if now.saturating_sub(last_snapshot).as_secs() >= SNAPSHOT_EVERY_SECS {
-                    last_snapshot = now;
-                    true
-                } else {
-                    false
-                };
+            let timed_snapshot = Instant::now() >= next_snapshot;
             if timed_snapshot || written > db.config.snapshot_written_bytes() {
+                next_snapshot = Self::next_snapshot_instant();
                 // todo taint storage instance on failure?
                 let snapshot_position = db
                     .rebuild_control_region()
@@ -256,6 +249,15 @@ impl Db {
                 position = snapshot_position;
             }
         }
+    }
+
+    /// Returns the next snapshot `Instant` with ±30% random jitter applied.
+    fn next_snapshot_instant() -> Instant {
+        const SNAPSHOT_EVERY_SECS: u64 = 3600;
+        const SNAPSHOT_JITTER_PCT: u64 = 30;
+        let jitter_max = SNAPSHOT_EVERY_SECS * SNAPSHOT_JITTER_PCT / 100;
+        let jitter = rand::thread_rng().gen_range(0..=jitter_max * 2);
+        Instant::now() + Duration::from_secs(SNAPSHOT_EVERY_SECS - jitter_max + jitter)
     }
 
     fn read_or_create_control_region(
