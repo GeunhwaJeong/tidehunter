@@ -562,7 +562,7 @@ impl LargeTable {
 
         entry.promote_pending();
 
-        entry.sync_flush(loader, true, relocation_updates, relocation_cutoff)
+        entry.sync_flush(loader, true, relocation_updates, relocation_cutoff, true)
     }
 
     fn ks_rows(&self, ks: &KeySpaceDesc) -> &ShardedMutex<Row> {
@@ -1404,21 +1404,22 @@ impl LargeTableEntry {
         }
         let position = self.last_processed;
         // Check if this entry's position is at or before the threshold position
-        let should_unload = position.as_u64() <= threshold_position;
-        if forced_relocation || should_unload {
+        let should_flush = position.as_u64() <= threshold_position;
+        if forced_relocation || should_flush {
             self.context
                 .metrics
                 .snapshot_force_unload
                 .with_label_values(&[self.context.name()])
                 .inc();
-            self.sync_flush(loader, forced_relocation, None, None)?;
+            self.sync_flush(loader, forced_relocation, None, None, false)?;
         }
         Ok(())
     }
 
     /// Performs a synchronous flush regardless of the config setting.
-    /// If forced_relocation is set, the flush happens even for clean state
-    /// Caller is responsible for checking to things:
+    /// If forced_relocation is set, the flush happens even for clean state.
+    /// If unload is false, the in-memory index is kept after the flush (no eviction from cache).
+    /// Caller is responsible for checking two things:
     /// * pending_last_processed is None
     fn sync_flush<L: Loader>(
         &mut self,
@@ -1426,6 +1427,7 @@ impl LargeTableEntry {
         forced_relocation: bool,
         relocation_updates: Option<RelocationUpdates>,
         relocation_cutoff: Option<u64>,
+        unload: bool,
     ) -> Result<(), L::Error> {
         assert!(
             self.pending_last_processed.is_none(),
@@ -1457,7 +1459,7 @@ impl LargeTableEntry {
             return Ok(());
         };
         self.last_processed = last_processed;
-        self.clear_after_flush(position, last_processed);
+        self.clear_after_flush(position, last_processed, unload);
         Ok(())
     }
 
@@ -1471,7 +1473,7 @@ impl LargeTableEntry {
         }
         if self.pending_last_processed.is_none() {
             if self.context.config.sync_flush {
-                self.sync_flush(loader, false, None, None)?;
+                self.sync_flush(loader, false, None, None, true)?;
             } else {
                 // Perform async flush - store the captured value for later
                 self.pending_last_processed = Some(loader.last_processed_wal_position());
@@ -1489,8 +1491,13 @@ impl LargeTableEntry {
         Ok(())
     }
 
-    fn clear_after_flush(&mut self, position: WalPosition, last_processed: LastProcessed) {
-        if self.context.ks_config.unloading_disabled() && self.state.is_loaded() {
+    fn clear_after_flush(
+        &mut self,
+        position: WalPosition,
+        last_processed: LastProcessed,
+        unload: bool,
+    ) {
+        if !unload || (self.context.ks_config.unloading_disabled() && self.state.is_loaded()) {
             if self.data.has_unprocessed(last_processed) {
                 // Some entries remain (newer than last_processed), keep state as DirtyLoaded
                 self.state = LargeTableEntryState::DirtyLoaded(position);
@@ -1540,7 +1547,7 @@ impl LargeTableEntry {
         // Now that flush is complete, update last_processed
         self.last_processed = pending_last_processed;
         if self.data.same_shared(&original_index) {
-            self.clear_after_flush(position, pending_last_processed);
+            self.clear_after_flush(position, pending_last_processed, true);
         } else {
             self.data
                 .make_mut()
