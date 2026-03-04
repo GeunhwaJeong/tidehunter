@@ -1504,7 +1504,16 @@ impl LargeTableEntry {
         last_processed: LastProcessed,
         unload: bool,
     ) {
-        if !unload || (self.context.ks_config.unloading_disabled() && self.state.is_loaded()) {
+        if !unload {
+            if let LargeTableEntryState::DirtyUnloaded(_) = self.state {
+                // Keep dirty entries in memory; just update the on-disk index position.
+                // Transitioning to DirtyLoaded would be wrong — self.data only has the dirty
+                // overlay, not the full merged index that was written to disk.
+                self.state = LargeTableEntryState::DirtyUnloaded(position);
+                return;
+            }
+        }
+        if self.state.is_loaded() && (!unload || self.context.ks_config.unloading_disabled()) {
             if self.data.has_unprocessed(last_processed) {
                 // Some entries remain (newer than last_processed), keep state as DirtyLoaded
                 self.state = LargeTableEntryState::DirtyLoaded(position);
