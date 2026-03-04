@@ -2545,6 +2545,9 @@ fn test_concurrent_index_reclaim() {
     db.wal_writer.wal_tracker_barrier();
     db.force_rebuild_control_region().unwrap();
     assert!(db.large_table.is_all_clean());
+    // Snapshot keeps entries loaded in memory; force-unload clean entries so that the
+    // subsequent get() goes through the disk-read path and hits the fail point.
+    db.large_table.force_unload_clean();
     let (lookup_latch, lookup_latch_guard) = Latch::new();
     db.large_table.fp.0.write().fp_lookup_after_lock_drop = FailPoint::latch(lookup_latch);
     let lookup_thread = {

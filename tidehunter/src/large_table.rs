@@ -1025,6 +1025,21 @@ impl LargeTable {
         }
         true
     }
+
+    #[cfg(test)]
+    pub fn force_unload_clean(&self) {
+        for ks_table in &self.table {
+            for mutex in ks_table.rows.mutexes() {
+                let mut row = mutex.lock();
+                for entry in row.entries.iter_mut() {
+                    if let LargeTableEntryState::Loaded(pos) = entry.state {
+                        entry.state = LargeTableEntryState::Unloaded(pos);
+                        entry.data = Default::default();
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Row {
@@ -1504,14 +1519,12 @@ impl LargeTableEntry {
         last_processed: LastProcessed,
         unload: bool,
     ) {
-        if !unload {
-            if let LargeTableEntryState::DirtyUnloaded(_) = self.state {
-                // Keep dirty entries in memory; just update the on-disk index position.
-                // Transitioning to DirtyLoaded would be wrong — self.data only has the dirty
-                // overlay, not the full merged index that was written to disk.
-                self.state = LargeTableEntryState::DirtyUnloaded(position);
-                return;
-            }
+        if !unload && let LargeTableEntryState::DirtyUnloaded(_) = self.state {
+            // Keep dirty entries in memory; just update the on-disk index position.
+            // Transitioning to DirtyLoaded would be wrong — self.data only has the dirty
+            // overlay, not the full merged index that was written to disk.
+            self.state = LargeTableEntryState::DirtyUnloaded(position);
+            return;
         }
         if self.state.is_loaded() && (!unload || self.context.ks_config.unloading_disabled()) {
             if self.data.has_unprocessed(last_processed) {
