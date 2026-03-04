@@ -380,7 +380,14 @@ impl LargeTable {
                 return Ok(context.report_lookup_result(None, LookupSource::Cache));
             }
             LargeTableEntryState::Loaded(_) => {
-                return Ok(context.report_lookup_result(entry.get(k), LookupSource::Cache));
+                let result = entry.get(k);
+                if result == Some(WalPosition::INVALID) {
+                    panic!(
+                        "Entry in loaded state has invalid wal position for the key {k:?} in ks {}",
+                        context.name()
+                    );
+                }
+                return Ok(context.report_lookup_result(result, LookupSource::Cache));
             }
             LargeTableEntryState::DirtyLoaded(_) => {
                 return Ok(context.report_lookup_result(
@@ -1502,6 +1509,11 @@ impl LargeTableEntry {
                 // Some entries remain (newer than last_processed), keep state as DirtyLoaded
                 self.state = LargeTableEntryState::DirtyLoaded(position);
             } else {
+                // All entries are processed — tombstones (Removed entries) must be cleaned up
+                // before entering Loaded state. In Loaded state, get() does not filter INVALID
+                // positions, so leaving Removed entries would cause WalPosition::INVALID to be
+                // returned to callers and trigger a crash in Wal::read.
+                self.data.make_mut().clean_self();
                 self.state = LargeTableEntryState::Loaded(position);
             }
             return;
