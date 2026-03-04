@@ -302,6 +302,15 @@ impl IndexTable {
         }
     }
 
+    /// Total bytes occupied by keys in this table.
+    /// For fixed-length key spaces this is O(1); for variable-length it is O(n).
+    pub fn total_key_bytes(&self, fixed_key_size: Option<usize>) -> usize {
+        match fixed_key_size {
+            Some(n) => self.data.len() * n,
+            None => self.data.keys().map(|k| k.len()).sum(),
+        }
+    }
+
     #[cfg(test)]
     pub fn into_data(self) -> BTreeMap<Bytes, WalPosition> {
         self.data

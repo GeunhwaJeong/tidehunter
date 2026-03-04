@@ -54,6 +54,10 @@ pub struct LargeTableEntry {
     // (full_key, value). full_key is the original (non-reduced) WAL key; for
     // non-key-reduction keyspaces it equals the index key.
     value_lru: Option<LruCache<Bytes, (Bytes, Bytes)>>,
+    /// Last value added to the shared `loaded_key_bytes` gauge.
+    /// Used to compute the delta on the next report so multiple cells
+    /// can safely share one gauge via `.add()` instead of `.set()`.
+    last_reported_key_bytes: i64,
 }
 
 enum LargeTableEntryState {
@@ -1145,6 +1149,7 @@ impl LargeTableEntry {
             pending_last_processed: None,
             last_processed: LastProcessed::none(),
             value_lru,
+            last_reported_key_bytes: 0,
         }
     }
 
@@ -1312,11 +1317,12 @@ impl LargeTableEntry {
         Ok(remaining_pending)
     }
 
-    fn report_loaded_keys_count(&self) {
-        // Report the total number of keys * key size as the metric
-        let num_keys = self.data.len() as i64;
-        let key_size = self.context.index_key_size().unwrap_or(64) as i64;
-        self.context.loaded_key_bytes.set(num_keys * key_size);
+    fn report_loaded_keys_count(&mut self) {
+        let key_size = self.context.index_key_size();
+        let new_bytes = self.data.total_key_bytes(key_size) as i64;
+        let delta = new_bytes - self.last_reported_key_bytes;
+        self.last_reported_key_bytes = new_bytes;
+        self.context.loaded_key_bytes.add(delta);
     }
 
     fn insert_bloom_filter(&mut self, key: &[u8]) {
@@ -1622,6 +1628,7 @@ impl LargeTableEntry {
             bloom.clear();
         }
         self.last_processed = LastProcessed::none();
+        self.report_loaded_keys_count();
     }
 
     pub fn flush_kind(&mut self) -> Option<FlushKind> {
@@ -1904,11 +1911,12 @@ impl Entries {
                 let CellId::Bytes(cell) = cell_id else {
                     panic!("Invalid cell id for tree entry list: {cell_id:?}");
                 };
-                if let Some(entry) = tree.remove(cell) {
+                if let Some(mut entry) = tree.remove(cell) {
                     assert!(
                         entry.pending_last_processed.is_none(),
                         "remove_entry on cell while async flush is pending"
                     );
+                    entry.clear();
                 }
             }
         }
