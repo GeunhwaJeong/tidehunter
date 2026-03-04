@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, HashSet};
 #[doc(hidden)]
 pub struct IndexTable {
     data: BTreeMap<Bytes, IndexWalPosition>,
+    /// Sum of all key lengths currently in `data`. Maintained incrementally.
+    key_bytes: usize,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -48,6 +50,7 @@ impl IndexTable {
         // todo might want a separate test with snapshot enabled
         match self.data.entry(k) {
             Entry::Vacant(va) => {
+                self.key_bytes += va.key().len();
                 va.insert(v);
                 None
             }
@@ -77,9 +80,11 @@ impl IndexTable {
                 panic!("found.offset {} > v.offset {}", found.offset, v.offset);
             }
             if v.is_removed() {
-                self.data.remove(k);
-            } else {
-                self.data.insert(k.clone(), v.as_clean_modified());
+                if self.data.remove(k).is_some() {
+                    self.key_bytes -= k.len();
+                }
+            } else if self.data.insert(k.clone(), v.as_clean_modified()).is_none() {
+                self.key_bytes += k.len();
             }
         }
     }
@@ -88,7 +93,9 @@ impl IndexTable {
     pub fn merge_dirty_no_clean(&mut self, dirty: &Self) {
         // todo implement this efficiently taking into account both self and dirty are sorted
         for (k, v) in dirty.data.iter() {
-            self.data.insert(k.clone(), *v);
+            if self.data.insert(k.clone(), *v).is_none() {
+                self.key_bytes += k.len();
+            }
         }
     }
 
@@ -108,6 +115,7 @@ impl IndexTable {
                 }
                 Entry::Occupied(oc) => {
                     if oc.get().into_wal_position() == v.into_wal_position() {
+                        self.key_bytes -= k.len();
                         oc.remove();
                     }
                 }
@@ -121,9 +129,25 @@ impl IndexTable {
         self.data.values().filter(|p| !p.is_clean()).count()
     }
 
+    fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&Bytes, &mut IndexWalPosition) -> bool,
+    {
+        let mut removed_bytes = 0usize;
+        self.data.retain(|k, v| {
+            if f(k, v) {
+                true
+            } else {
+                removed_bytes += k.len();
+                false
+            }
+        });
+        self.key_bytes -= removed_bytes;
+    }
+
     /// Change loaded dirty IndexTable into unloaded dirty by retaining dirty keys and tombstones
     pub fn retain_dirty(&mut self) {
-        self.data.retain(|_, pos| !pos.is_clean());
+        self.retain(|_, pos| !pos.is_clean());
     }
 
     pub fn get(&self, k: &[u8]) -> Option<WalPosition> {
@@ -234,6 +258,7 @@ impl IndexTable {
     pub fn deserialize_index_entries(ks: &KeySpaceDesc, bytes: Bytes) -> Self {
         let mut bytes = SliceBuf::new(bytes);
         let mut data = BTreeMap::new();
+        let mut key_bytes = 0usize;
         while bytes.has_remaining() {
             let key = if let Some(key_len) = ks.index_key_size() {
                 bytes.slice_n(key_len)
@@ -242,6 +267,7 @@ impl IndexTable {
                 bytes.slice_n(key_len as usize)
             };
             let value = WalPosition::read_from_buf(&mut bytes);
+            key_bytes += key.len();
             if data
                 .insert(key, IndexWalPosition::new_clean(value))
                 .is_some()
@@ -249,12 +275,12 @@ impl IndexTable {
                 panic!("Duplicate keys detected in index");
             }
         }
-        IndexTable { data }
+        IndexTable { data, key_bytes }
     }
 
     /// Marks all elements in this index as clean and remove tombstones
     pub fn clean_self(&mut self) {
-        self.data.retain(|_k, v| match v.kind {
+        self.retain(|_, v| match v.kind {
             IndexEntryKind::Clean => true,
             IndexEntryKind::Modified => {
                 *v = v.as_clean_modified();
@@ -266,7 +292,7 @@ impl IndexTable {
 
     /// Retain only unprocessed entries
     pub fn retain_unprocessed(&mut self, last_processed: LastProcessed) {
-        self.data.retain(|_k, v| !last_processed.is_processed(v));
+        self.retain(|_, v| !last_processed.is_processed(v));
     }
 
     /// Returns if this index table has any unprocessed entries.
@@ -279,7 +305,7 @@ impl IndexTable {
     /// Retain only entries with offset >= last_processed
     pub fn retain_above_position(&mut self, last_processed: u64) {
         // todo ideally should use LastProcessed::is_processed here
-        self.data.retain(|_k, v| v.offset >= last_processed);
+        self.retain(|_, v| v.offset >= last_processed);
     }
 
     /// Compact index by retaining keys identified by the compactor.
@@ -290,7 +316,7 @@ impl IndexTable {
     {
         let mut iter = self.data.keys();
         let to_retain = compactor(&mut iter);
-        self.data.retain(|k, _| to_retain.contains(k));
+        self.retain(|k, _| to_retain.contains(k));
     }
 
     /// Apply given update function to a value with a given key.
@@ -302,13 +328,9 @@ impl IndexTable {
         }
     }
 
-    /// Total bytes occupied by keys in this table.
-    /// For fixed-length key spaces this is O(1); for variable-length it is O(n).
-    pub fn total_key_bytes(&self, fixed_key_size: Option<usize>) -> usize {
-        match fixed_key_size {
-            Some(n) => self.data.len() * n,
-            None => self.data.keys().map(|k| k.len()).sum(),
-        }
+    /// Total bytes occupied by keys in this table. Always O(1).
+    pub fn total_key_bytes(&self) -> usize {
+        self.key_bytes
     }
 
     #[cfg(test)]
@@ -453,7 +475,8 @@ mod tests {
             (vec![2, 5].into(), iwp(23)),
             (vec![].into(), iwp(25)),
         ]);
-        let index = IndexTable { data };
+        let key_bytes: usize = data.keys().map(|k: &Bytes| k.len()).sum();
+        let index = IndexTable { data, key_bytes };
         let (shape, ks) = KeyShape::new_single_config_indexing(
             KeyIndexing::variable_length(),
             1,

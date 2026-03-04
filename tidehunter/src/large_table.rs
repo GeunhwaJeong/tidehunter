@@ -1318,8 +1318,7 @@ impl LargeTableEntry {
     }
 
     fn report_loaded_keys_count(&mut self) {
-        let key_size = self.context.index_key_size();
-        let new_bytes = self.data.total_key_bytes(key_size) as i64;
+        let new_bytes = self.data.total_key_bytes() as i64;
         let delta = new_bytes - self.last_reported_key_bytes;
         self.last_reported_key_bytes = new_bytes;
         self.context.loaded_key_bytes.add(delta);
