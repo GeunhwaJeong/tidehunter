@@ -44,6 +44,7 @@ impl IndexTable {
     }
 
     fn checked_insert(&mut self, k: Bytes, v: IndexWalPosition) -> Option<WalPosition> {
+        let k = k.into_owned();
         // Only update index entry if new entry has higher wal position then the previous entry
         // See test_concurrent_single_value_update for details how this is tested
         // todo handle this comparison correctly when we have data relocation

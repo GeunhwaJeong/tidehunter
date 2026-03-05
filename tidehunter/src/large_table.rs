@@ -347,6 +347,9 @@ impl LargeTable {
         let Some(value_lru) = &mut entry.value_lru else {
             unreachable!()
         };
+        let reduced_key = reduced_key.into_owned();
+        let full_key = full_key.into_owned();
+        let value = value.into_owned();
         let delta: i64 = (reduced_key.len() + full_key.len() + value.len()) as i64;
         let previous = value_lru.push(reduced_key, (full_key, value));
         LargeTableEntry::update_lru_metric(context, previous, delta);

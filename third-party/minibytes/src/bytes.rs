@@ -196,6 +196,24 @@ impl Bytes {
         }
     }
 
+    /// Ensure bytes are backed by an owned allocation rather than a mapped segment.
+    ///
+    /// Returns `self` unchanged if already backed by an owned type (e.g. `Vec<u8>`).
+    /// Copies into a fresh `Vec<u8>` if backed by `Mmap` or `MmapMut`, so that the
+    /// mapped segment can be unmapped once no other references to it remain.
+    ///
+    /// Call this before storing bytes in long-lived structures (indices, caches) to
+    /// avoid pinning entire WAL segments.
+    pub fn into_owned(self) -> Self {
+        #[cfg(feature = "frommmap")]
+        if self.downcast_ref::<memmap2::Mmap>().is_some()
+            || self.downcast_ref::<memmap2::MmapMut>().is_some()
+        {
+            return Self::copy_from_slice(self.as_slice());
+        }
+        self
+    }
+
     /// Convert to `Vec<u8>`, in a zero-copy way if possible.
     pub fn into_vec(mut self) -> Vec<u8> {
         let len = self.len();
