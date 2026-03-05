@@ -9,6 +9,10 @@ use std::cmp;
 pub struct Config {
     pub frag_size: u64,
     pub max_maps: usize,
+    /// Maximum number of memory-mapped regions for index WAL files.
+    /// If set, overrides `max_maps` for index maps specifically.
+    #[serde(default)]
+    pub max_index_maps: Option<usize>,
     /// The maximum number of dirty keys per LargeTable entry before it's counted as loaded
     /// This can be overwritten for individual key space via KeySpaceConfig::max_dirty_keys
     pub max_dirty_keys: usize,
@@ -55,6 +59,7 @@ impl Default for Config {
         Self {
             frag_size: 128 * 1024 * 1024,
             max_maps: 16, // Max 2 Gb mapped space
+            max_index_maps: None,
             max_dirty_keys: 16 * 1024,
             snapshot_written_bytes: 128 * 1024 * 1024 * 1024,
             snapshot_unload_threshold: 64 * 1024 * 1024 * 1024,
@@ -76,6 +81,7 @@ impl Config {
         Self {
             frag_size: 1024 * 1024,
             max_maps: 16,
+            max_index_maps: None,
             max_dirty_keys: 32,
             snapshot_written_bytes: 128 * 1024 * 1024, // 128 Mb
             snapshot_unload_threshold: 2 * 128 * 1024 * 1024, // 256 Mb
@@ -97,9 +103,13 @@ impl Config {
 
     #[doc(hidden)] // Used by tools/wal_inspector to get WAL configuration
     pub fn wal_layout(&self, kind: WalKind) -> WalLayout {
+        let max_maps = match kind {
+            WalKind::Index => self.max_index_maps.unwrap_or(self.max_maps),
+            WalKind::Replay => self.max_maps,
+        };
         WalLayout {
             frag_size: self.frag_size,
-            max_maps: self.max_maps,
+            max_maps,
             direct_io: self.direct_io,
             wal_file_size: self.wal_file_size,
             kind,
