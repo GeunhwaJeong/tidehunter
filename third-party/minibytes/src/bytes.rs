@@ -196,20 +196,30 @@ impl Bytes {
         }
     }
 
-    /// Ensure bytes are backed by an owned allocation rather than a mapped segment.
+    /// Ensure bytes are independent of any larger backing buffer.
     ///
-    /// Returns `self` unchanged if already backed by an owned type (e.g. `Vec<u8>`).
-    /// Copies into a fresh `Vec<u8>` if backed by `Mmap` or `MmapMut`, so that the
-    /// mapped segment can be unmapped once no other references to it remain.
+    /// Copies into a fresh `Vec<u8>` if:
+    /// - backed by `Mmap`/`MmapMut` (avoids pinning mapped segments), or
+    /// - a sub-slice of a larger owned allocation (avoids keeping the full
+    ///   buffer alive for the sake of a small slice, e.g. a key sliced from
+    ///   a large micro-cell read buffer).
     ///
-    /// Call this before storing bytes in long-lived structures (indices, caches) to
-    /// avoid pinning entire WAL segments.
+    /// Returns `self` unchanged only when it already owns exactly its content
+    /// (i.e. the backing allocation is the same length as this slice).
+    ///
+    /// Call this before storing bytes in long-lived structures (indices, caches).
     pub fn into_owned(self) -> Self {
         #[cfg(feature = "frommmap")]
         if self.downcast_ref::<memmap2::Mmap>().is_some()
             || self.downcast_ref::<memmap2::MmapMut>().is_some()
         {
             return Self::copy_from_slice(self.as_slice());
+        }
+        if let Some(owner) = &self.owner {
+            let backing_len = AsRef::<[u8]>::as_ref(owner.as_ref()).len();
+            if backing_len.saturating_sub(self.len) > 128 {
+                return Self::copy_from_slice(self.as_slice());
+            }
         }
         self
     }
