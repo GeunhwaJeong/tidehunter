@@ -6,13 +6,14 @@ mod mapper;
 pub mod position;
 mod syncer;
 pub(crate) mod tracker;
+pub(crate) mod tracking_mmap;
 
 use crate::context::ReadType;
 use crate::crc::{CrcFrame, CrcReadError, IntoBytesFixed};
 use crate::file_reader::FileReader;
 use crate::file_reader::set_direct_options;
 use crate::lookup::{FileRange, RandomRead};
-use crate::metrics::Metrics;
+use crate::metrics::{MetricIntGauge, Metrics};
 use arc_swap::ArcSwap;
 use minibytes::Bytes;
 use std::fs::{File, OpenOptions};
@@ -365,8 +366,14 @@ impl WalIterator {
         let mut maps = WalMaps::default();
         let (map_id, _) = wal.layout.locate(position);
         let files = wal.files.load();
-        let map = Self::make_map(&wal.layout, map_id, &files, &mut maps)?
-            .expect("First map must be available"); // todo check this is actually true
+        let map = Self::make_map(
+            &wal.layout,
+            map_id,
+            &files,
+            &mut maps,
+            wal.metrics.wal_mmap_bytes.clone(),
+        )?
+        .expect("First map must be available"); // todo check this is actually true
         Ok(Self {
             maps,
             wal,
@@ -401,7 +408,13 @@ impl WalIterator {
         let (map_id, offset) = self.wal.layout.locate(self.position);
         if self.map.id != map_id {
             let files = self.wal.files.load();
-            let Some(map) = Self::make_map(&self.wal.layout, map_id, &files, &mut self.maps)?
+            let Some(map) = Self::make_map(
+                &self.wal.layout,
+                map_id,
+                &files,
+                &mut self.maps,
+                self.wal.metrics.wal_mmap_bytes.clone(),
+            )?
             else {
                 return Err(WalError::EndOfWal);
             };
@@ -415,12 +428,13 @@ impl WalIterator {
         map_id: MapId,
         files: &WalFiles,
         maps: &mut WalMaps,
+        wal_mmap_bytes: MetricIntGauge,
     ) -> Result<Option<Map>, WalError> {
         Wal::extend_to_map_id(layout, files, map_id)?;
         let Some(file) = files.get_checked(layout.file_for_map(map_id)) else {
             return Ok(None);
         };
-        Ok(Some(maps.map(file, layout, map_id).clone()))
+        Ok(Some(maps.map(file, layout, map_id, wal_mmap_bytes).clone()))
     }
 
     pub fn into_writer(self, position_override: Option<u64>) -> WalWriter {

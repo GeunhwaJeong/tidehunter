@@ -1,6 +1,6 @@
 use super::Map;
+use super::tracking_mmap::TrackingMMapMut;
 use crate::metrics::Metrics;
-use memmap2::MmapMut;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::thread::JoinHandle;
@@ -53,8 +53,8 @@ impl WalSyncerThread {
             let map = request
                 .map
                 .data
-                .downcast_ref::<MmapMut>()
-                .expect("Failed to downcast to MmapMut");
+                .downcast_ref::<TrackingMMapMut>()
+                .expect("Failed to downcast to TrackingMMapMut");
             map.flush().expect("Wal sync failed");
             // todo we can also monitor here number of dangling maps to make sure it does not happen
             self.metrics

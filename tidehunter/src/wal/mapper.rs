@@ -1,7 +1,8 @@
 use super::layout::WalLayout;
 use super::position::{MapId, WalFileId};
+use super::tracking_mmap::TrackingMMapMut;
 use super::{Map, Wal, WalFiles};
-use crate::metrics::Metrics;
+use crate::metrics::{MetricIntGauge, Metrics};
 use crate::wal::syncer::WalSyncer;
 use arc_swap::ArcSwap;
 use std::collections::BTreeMap;
@@ -208,7 +209,12 @@ impl WalMapperThread {
             files = self.files.load();
         }
         Wal::extend_to_map_id(&self.layout, &files, map_id).expect("Failed to extend wal file");
-        self.maps.map(files.get(file_id), &self.layout, map_id);
+        self.maps.map(
+            files.get(file_id),
+            &self.layout,
+            map_id,
+            self.metrics.wal_mmap_bytes.clone(),
+        );
 
         self.publish_maps();
     }
@@ -224,18 +230,24 @@ impl WalMaps {
         self.maps.get(&map_id)
     }
 
-    pub fn map(&mut self, file: &File, layout: &WalLayout, map_id: MapId) -> &Map {
+    pub fn map(
+        &mut self,
+        file: &File,
+        layout: &WalLayout,
+        map_id: MapId,
+        wal_mmap_bytes: MetricIntGauge,
+    ) -> &Map {
         let range = layout.map_range(map_id);
         let data = unsafe {
             let mut options = memmap2::MmapOptions::new();
             options
                 .offset(layout.offset_in_wal_file(range.start))
                 .len(layout.frag_size as usize);
-            options
+            let mmap = options
                 .populate()
                 .map_mut(file)
-                .expect("Failed to mmap on wal file")
-                .into()
+                .expect("Failed to mmap on wal file");
+            TrackingMMapMut::new(mmap, wal_mmap_bytes).into()
         };
         let map = Map {
             id: map_id,
