@@ -637,7 +637,7 @@ impl LargeTable {
 
         entry.promote_pending();
 
-        entry.sync_flush(loader, true, relocation_updates, relocation_cutoff, true)
+        entry.sync_flush(loader, true, relocation_updates, relocation_cutoff)
     }
 
     fn ks_rows(&self, ks: &KeySpaceDesc) -> &ShardedMutex<Row> {
@@ -1568,7 +1568,6 @@ impl LargeTableEntry {
         forced_relocation: bool,
         relocation_updates: Option<RelocationUpdates>,
         relocation_cutoff: Option<u64>,
-        unload: bool,
     ) -> Result<(), L::Error> {
         assert!(
             self.pending_last_processed.is_none(),
@@ -1600,7 +1599,7 @@ impl LargeTableEntry {
             return Ok(());
         };
         self.last_processed = last_processed;
-        self.clear_after_flush(position, last_processed, unload);
+        self.clear_after_flush(position, last_processed, true);
         Ok(())
     }
 
@@ -1614,7 +1613,7 @@ impl LargeTableEntry {
         }
         if self.pending_last_processed.is_none() {
             if self.context.config.sync_flush {
-                self.sync_flush(loader, false, None, None, true)?;
+                self.sync_flush(loader, false, None, None)?;
             } else {
                 // Perform async flush - store the captured value for later
                 self.pending_last_processed = Some(loader.last_processed_wal_position());

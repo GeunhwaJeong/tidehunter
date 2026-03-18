@@ -52,6 +52,12 @@ no IO. For each entry it calls `request_async_snapshot_flush`, which:
 
 The row lock is released immediately after queuing — IO happens off the critical path.
 
+> **Note:** the async flush path always evicts entries from memory after flushing (equivalent
+> to `unload=true`). The previous synchronous snapshot path used `unload=false`, preserving
+> in-memory state after the flush. The practical impact is limited because only entries with
+> `last_processed <= threshold_position` are flushed here — entries that have not been written
+> to for at least `snapshot_unload_threshold` bytes of WAL and are therefore unlikely to be hot.
+
 ### Barrier
 
 `self.large_table.flusher.barrier()` blocks until all previously enqueued flusher messages
