@@ -224,7 +224,7 @@ impl Db {
             .unwrap();
     }
 
-    fn periodic_snapshot_thread(weak: Weak<Db>, position: u64) -> Option<()> {
+    fn periodic_snapshot_thread(weak: Weak<Db>, mut position: u64) -> Option<()> {
         let start = Instant::now();
         let mut last_snapshot = Duration::ZERO;
         const SNAPSHOT_EVERY_SECS: u64 = 3600;

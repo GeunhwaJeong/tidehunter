@@ -16,7 +16,7 @@ impl DbLock {
             .open(&lock_path)?;
         let fd = file.as_raw_fd();
         let mut flock = libc::flock {
-            l_type: libc::F_WRLCK as i16, // Exclusive write lock
+            l_type: libc::F_WRLCK, // Exclusive write lock
             l_whence: libc::SEEK_SET as i16,
             l_start: 0,
             l_len: 0, // Lock the entire file
