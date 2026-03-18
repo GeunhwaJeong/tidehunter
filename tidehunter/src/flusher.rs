@@ -1,3 +1,5 @@
+// See docs/snapshot_mechanism.md for an overview of how the flusher integrates
+// with the two-pass snapshot mechanism.
 use crate::cell::CellId;
 use crate::context::KsContext;
 use crate::db::Db;
@@ -26,13 +28,18 @@ pub(crate) struct IndexFlusherThread {
     thread_id: usize,
 }
 
-pub struct FlusherCommand {
-    ks: KeySpace,
-    cell: CellId,
-    flush_kind: FlushKind,
+pub enum FlusherCommand {
+    Command(IndexFlushCommand),
+    Barrier(Arc<SendGuard>),
 }
 
-impl FlusherCommand {
+pub struct IndexFlushCommand {
+    pub(crate) ks: KeySpace,
+    pub(crate) cell: CellId,
+    pub(crate) flush_kind: FlushKind,
+}
+
+impl IndexFlushCommand {
     pub fn new(ks: KeySpace, cell: CellId, flush_kind: FlushKind) -> Self {
         Self {
             ks,
@@ -45,8 +52,7 @@ impl FlusherCommand {
 pub enum FlushKind {
     MergeUnloaded(WalPosition, Arc<IndexTable>),
     FlushLoaded(Arc<IndexTable>),
-    #[cfg(test)]
-    Barrier(#[allow(dead_code)] SendGuard),
+    ForceRelocate(WalPosition),
 }
 
 impl IndexFlusher {
@@ -78,10 +84,10 @@ impl IndexFlusher {
 
     pub fn request_flush(&self, ks: KeySpace, cell: CellId, flush_kind: FlushKind) {
         let thread_index = self.get_thread_for_cell(&cell);
-        let command = FlusherCommand::new(ks, cell, flush_kind);
+        let command = IndexFlushCommand::new(ks, cell, flush_kind);
         self.metrics.flush_pending.add(1);
         self.senders[thread_index]
-            .send(command)
+            .send(FlusherCommand::Command(command))
             .expect("Flusher has stopped unexpectedly")
     }
 
@@ -95,26 +101,18 @@ impl IndexFlusher {
         Self::new(vec![sender], Metrics::new())
     }
 
-    /// Wait until all messages that are currently queued for flusher are processed
-    #[cfg(test)]
+    /// Wait until all messages that are currently queued for all flusher threads are processed.
     pub fn barrier(&self) {
-        use parking_lot::Mutex;
-        let mutex = Arc::new(Mutex::new(()));
-
-        // Send a barrier command to each thread
-        for (thread_id, sender) in self.senders.iter().enumerate() {
-            let lock = mutex.lock_arc();
-            let command = FlusherCommand::new(
-                KeySpace::new_test(0),
-                CellId::Integer(thread_id), // Use thread_id to ensure it goes to the right thread
-                FlushKind::Barrier(SendGuard(lock)),
-            );
+        let mutex = Arc::new(parking_lot::Mutex::new(()));
+        let guard = Arc::new(SendGuard(mutex.lock_arc()));
+        for sender in &self.senders {
             self.metrics.flush_pending.add(1);
-            sender.send(command).unwrap();
+            sender
+                .send(FlusherCommand::Barrier(Arc::clone(&guard)))
+                .expect("Flusher has stopped unexpectedly");
         }
-
-        // Wait for all threads to process their barriers
-        let _ = mutex.lock();
+        drop(guard);
+        drop(mutex.lock());
     }
 }
 
@@ -135,29 +133,47 @@ impl IndexFlusherThread {
 
     pub fn run(self) {
         while let Ok(command) = self.receiver.recv() {
-            self.metrics.flush_pending.add(-1);
-            let now = Instant::now();
-            let Some(db) = self.db.upgrade() else {
-                return;
-            };
+            match command {
+                FlusherCommand::Barrier(_guard) => {
+                    self.metrics.flush_pending.add(-1);
+                    // Dropping _guard releases the mutex, allowing the barrier() caller to proceed
+                }
+                FlusherCommand::Command(command) => {
+                    self.metrics.flush_pending.add(-1);
+                    let now = Instant::now();
+                    let Some(db) = self.db.upgrade() else {
+                        return;
+                    };
 
-            let ks_context = db.ks_context(command.ks);
-            if let Some((original_index, position)) =
-                Self::handle_command(&*db, &command, ks_context, None, None)
-            {
-                db.update_flushed_index(command.ks, command.cell, original_index, position);
+                    let ks_context = db.ks_context(command.ks);
+                    let is_relocation = matches!(command.flush_kind, FlushKind::ForceRelocate(_));
+                    if let Some((original_index, position)) =
+                        Self::handle_command(&*db, &command, ks_context, None, None)
+                    {
+                        if is_relocation {
+                            db.update_relocated_index(command.ks, command.cell, position);
+                        } else {
+                            db.update_flushed_index(
+                                command.ks,
+                                command.cell,
+                                original_index,
+                                position,
+                            );
+                        }
+                    }
+
+                    self.metrics
+                        .flush_time_mcs
+                        .with_label_values(&[&self.thread_id.to_string()])
+                        .inc_by(now.elapsed().as_micros() as u64);
+                }
             }
-
-            self.metrics
-                .flush_time_mcs
-                .with_label_values(&[&self.thread_id.to_string()])
-                .inc_by(now.elapsed().as_micros() as u64);
         }
     }
 
     pub(crate) fn handle_command<L: Loader>(
         loader: &L,
-        command: &FlusherCommand,
+        command: &IndexFlushCommand,
         ctx: &KsContext,
         relocation_updates: Option<RelocationUpdates>,
         relocation_cutoff: Option<u64>,
@@ -178,8 +194,17 @@ impl IndexFlusherThread {
                 index_copy.clean_self();
                 (index.clone(), index_copy)
             }
-            #[cfg(test)]
-            FlushKind::Barrier(_) => return None,
+            FlushKind::ForceRelocate(position) => {
+                ctx.metrics
+                    .unload
+                    .with_label_values(&["force_relocate"])
+                    .inc();
+                let disk_index = loader
+                    .load(&ctx.ks_config, *position)
+                    .expect("Failed to load index for forced relocation");
+                let arc_index = Arc::new(disk_index);
+                (arc_index.clone(), IndexTable::clone(&arc_index))
+            }
         };
 
         if let Some(relocation_updates) = relocation_updates {
@@ -222,10 +247,8 @@ impl IndexFlusherThread {
     }
 }
 
-#[cfg(test)]
 pub struct SendGuard(#[allow(dead_code)] parking_lot::ArcMutexGuard<parking_lot::RawMutex, ()>);
 
-#[cfg(test)]
 // Rather than enable send_guard feature globally in parking_lot,
 // using this just for flusher barrier
 unsafe impl Send for SendGuard {}

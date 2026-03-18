@@ -698,6 +698,12 @@ impl Db {
             .update_flushed_index(context, &cell, original_index, position)
     }
 
+    pub(crate) fn update_relocated_index(&self, ks: KeySpace, cell: CellId, position: WalPosition) {
+        let context = self.ks_context(ks);
+        self.large_table
+            .update_relocated_index(context, &cell, position);
+    }
+
     fn read_record_check_key(
         &self,
         context: &KsContext,
@@ -837,6 +843,18 @@ impl Db {
     }
 
     pub(crate) fn rebuild_control_region_from(&self, threshold_position: u64) -> DbResult<u64> {
+        let force_relocate_below = self.control_region_store.lock().force_relocation_position();
+
+        // Pass 1: trigger async flushes for dirty/relocatable entries — no IO under cell locks
+        self.large_table.prefetch_flushes_for_snapshot(
+            self,
+            force_relocate_below,
+            threshold_position,
+        );
+        // Wait for all queued flushes to complete before taking the snapshot
+        self.large_table.flusher.barrier();
+
+        // Pass 2: take snapshot (entries are mostly clean after the barrier)
         let mut crs = self.control_region_store.lock();
         let _timer = self
             .metrics
@@ -844,9 +862,7 @@ impl Db {
             .clone()
             .mcs_timer();
         let _snapshot_timer = self.metrics.snapshot_lock_time_mcs.clone().mcs_timer();
-        let snapshot =
-            self.large_table
-                .snapshot(self, crs.force_relocation_position(), threshold_position)?;
+        let snapshot = self.large_table.snapshot(self);
         let min_index_position = snapshot.data.iter_valid_val_positions().min();
         if let Some(min_index_position) = min_index_position {
             self.index_writer.gc(min_index_position.offset())?;

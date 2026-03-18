@@ -1,7 +1,7 @@
 use crate::cell::{CellId, CellIdBytesContainer};
 use crate::config::Config;
 use crate::context::{KsContext, LookupResult, LookupSource};
-use crate::flusher::{FlushKind, FlusherCommand, IndexFlusher, IndexFlusherThread};
+use crate::flusher::{FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread};
 use crate::index::index_format::{Direction, IndexFormat, IndexIterCache};
 use crate::index::index_table::IndexTable;
 use crate::index::pending_table::{PendingTable, Transaction};
@@ -655,97 +655,39 @@ impl LargeTable {
     }
 
     /// Provides a snapshot of this large table along with replay position in the wal for the snapshot.
-    pub(crate) fn snapshot<L: Loader>(
-        &self,
-        loader: &L,
-        // All entries below this wal positions will be relocated
-        force_relocate_below: Option<WalPosition>,
-        // Entries at or before this position should be force unloaded
-        threshold_position: u64,
-    ) -> Result<LargeTableSnapshot, L::Error> {
-        assert!(loader.flush_supported());
-        // Capture the WAL's last_processed position at snapshot time
+    pub(crate) fn snapshot<L: Loader>(&self, loader: &L) -> LargeTableSnapshot {
+        // Capture the WAL's last_processed position before iterating entries.
+        // Used as replay_from for the empty-database case; must be captured early so
+        // any writes that arrive during iteration are not silently skipped on replay.
         let wal_last_processed = loader.last_processed_wal_position();
-        // See ks_snapshot documentation for details
-        // on how snapshot replay position is determined.
         let mut replay_from: Option<u64> = None;
-        let mut max_position: Option<WalPosition> = None;
         let mut data = Vec::with_capacity(self.table.len());
         for ks_table in self.table.iter() {
-            let (ks_data, ks_replay_from, ks_max_position) =
-                self.ks_snapshot(ks_table, loader, force_relocate_below, threshold_position)?;
+            let (ks_data, ks_replay_from) = self.ks_snapshot(ks_table, loader);
             data.push(ks_data);
             if let Some(ks_replay_from) = ks_replay_from {
                 replay_from = Some(cmp::min(replay_from.unwrap_or(u64::MAX), ks_replay_from));
             }
-            if let Some(ks_max_position) = ks_max_position {
-                max_position = Some(if let Some(max_position) = max_position {
-                    cmp::max(ks_max_position, max_position)
-                } else {
-                    ks_max_position
-                });
-            }
         }
 
-        let replay_from = if let Some(replay_from) = replay_from {
-            // Case 1: Some entries are dirty - use minimum last_processed
-            replay_from
-        } else if let Some(max_pos) = max_position {
-            // Case 2: All clean - use highest flushed position
-            max_pos.offset()
-        } else {
-            // Case 3: Empty database - use WAL's last_processed position
-            wal_last_processed.as_u64()
-        };
+        // replay_from is None only when every keyspace has zero non-empty entries (empty DB).
+        let replay_from = replay_from.unwrap_or_else(|| wal_last_processed.as_u64());
 
         let data = LargeTableContainer { data };
-        Ok(LargeTableSnapshot { data, replay_from })
+        LargeTableSnapshot { data, replay_from }
     }
 
     /// Takes snapshot of a given key space.
-    /// Returns (Snapshot, ReplayFrom, MaximumValidEntryWalPosition).
+    /// Returns (Snapshot, ReplayFrom).
     ///
-    /// Replay from is calculated as the lowest wal position across all dirty entries
-    /// Replay from is None if all entries in ks are clean entries.
-    ///
-    /// Maximum valid entry wal position is a maximum wal position of all entries persisted to disk
-    /// This position is None if no entries are persisted to disk (all entries are Empty).
-    ///
-    /// The combined snapshot replay position across all key spaces is determined as following:
-    ///
-    /// * If at least one replay_from for ks table is not None, the replay_from for entire snapshot
-    ///   is a minimum across all key spaces where replay_from is not None.
-    ///   Reasoning here is that if some key space has some dirty entry,
-    ///   the entire snapshot needs to be replayed from the position of that dirty entry.
-    ///
-    /// * If all the ReplayFrom are None, the replay position for snapshot
-    ///   is a maximum of all non-None MaximumValidEntryWalPosition across all key spaces.
-    ///   The Reasoning is that if all entries in all key spaces are clean, it is safe to replay
-    ///   wal from the highest written index entry.
-    ///   As more entries could be added to the wal while snapshot is created,
-    ///   we cannot simply take the current wal writer position here as a snapshot replay position.
-    ///
-    /// * If all ReplayFrom are None and all MaximumValidEntryWalPosition are None,
-    ///   then the database is empty at the time of a snapshot, and the replay_position
-    ///   for snapshot is set to WalPosition::INVALID to indicate wal needs to be replayed
-    ///   from the beginning.
-    #[allow(clippy::type_complexity)] // todo fix
+    /// ReplayFrom is the minimum `last_processed` across all non-empty entries, or None if
+    /// the keyspace has no non-empty entries. See docs/snapshot_mechanism.md for details.
     fn ks_snapshot<L: Loader>(
         &self,
         ks_table: &KsTable,
         loader: &L,
-        force_relocate_below: Option<WalPosition>,
-        threshold_position: u64,
-    ) -> Result<
-        (
-            BTreeMap<CellId, SnapshotEntryData>,
-            Option<u64>,
-            Option<WalPosition>,
-        ),
-        L::Error,
-    > {
+    ) -> (BTreeMap<CellId, SnapshotEntryData>, Option<u64>) {
         let mut replay_from: Option<u64> = None;
-        let mut max_wal_position: Option<WalPosition> = None;
         // Collect all cells from all rows into one BTreeMap
         let mut ks_data = BTreeMap::new();
         const SNAPSHOT_ROW_SLEEP: Duration = Duration::from_millis(2);
@@ -753,30 +695,22 @@ impl LargeTable {
             thread::sleep(SNAPSHOT_ROW_SLEEP);
             let mut row = mutex.lock();
             for entry in row.entries.iter_mut() {
-                // Important - read Loader::last_processed_wal_position before calling promote_pending.
+                // Important - read last_processed_wal_position before promote_pending.
                 // See also comments in unload_if_ks_enabled.
                 let loader_last_processed = loader.last_processed_wal_position();
                 entry.promote_pending();
-
-                entry.maybe_flush_for_snapshot(
-                    loader,
-                    force_relocate_below,
-                    threshold_position,
-                    loader_last_processed,
-                )?;
+                // For clean entries, advance last_processed to the current WAL position so
+                // that replay_from in the snapshot reflects the actual WAL frontier rather
+                // than the stale position from when the entry was last written.
+                if !entry.state.is_dirty() && !entry.state.is_empty() {
+                    entry.last_processed = loader_last_processed;
+                }
                 let position = entry.state.wal_position();
                 let snapshot_data = SnapshotEntryData {
                     position,
                     last_processed: entry.last_processed,
                 };
                 ks_data.insert(entry.cell.clone(), snapshot_data);
-                if let Some(valid_position) = position.valid() {
-                    max_wal_position = if let Some(max_wal_position) = max_wal_position {
-                        Some(cmp::max(max_wal_position, valid_position))
-                    } else {
-                        Some(valid_position)
-                    };
-                }
                 // Do not use last_processed from empty entries
                 if !entry.state.is_empty() {
                     replay_from = Some(cmp::min(
@@ -800,7 +734,7 @@ impl LargeTable {
                 metric.set(tail_position.saturating_sub(position) as i64)
             }
         }
-        Ok((ks_data, replay_from, max_wal_position))
+        (ks_data, replay_from)
     }
 
     /// Takes a next entry in the large table.
@@ -1064,6 +998,53 @@ impl LargeTable {
         let entry = self.entry_mut(&mut row, cell);
         entry.promote_pending();
         entry.update_flushed_index(original_index, position);
+    }
+
+    /// Called by the flusher after a `ForceRelocate` flush completes.
+    /// Updates the entry's WAL position to the new location without requiring the original index.
+    pub(crate) fn update_relocated_index(
+        &self,
+        context: &KsContext,
+        cell: &CellId,
+        position: WalPosition,
+    ) {
+        let row = context.ks_config.mutex_for_cell(cell);
+        let ks_table = self.ks_rows(&context.ks_config);
+        let mut row = ks_table.lock(row, &context.large_table_contention);
+        let entry = self.entry_mut(&mut row, cell);
+        entry.promote_pending();
+        entry.update_relocated_position(position);
+    }
+
+    /// Pass 1 of the two-pass snapshot flush: iterate all entries and queue async flushes
+    /// for dirty entries and forced-relocation entries. No IO is performed under cell locks.
+    ///
+    /// See docs/snapshot_mechanism.md for the full two-pass protocol, correctness argument,
+    /// and the relationship between `threshold_position` and `replay_from` bounds.
+    pub(crate) fn prefetch_flushes_for_snapshot<L: Loader>(
+        &self,
+        loader: &L,
+        force_relocate_below: Option<WalPosition>,
+        threshold_position: u64,
+    ) {
+        for ks_table in self.table.iter() {
+            for mutex in ks_table.rows.mutexes() {
+                let mut row = mutex.lock();
+                for entry in row.entries.iter_mut() {
+                    // Important - read last_processed_wal_position before promote_pending.
+                    // See also comments in unload_if_ks_enabled.
+                    let loader_last_processed = loader.last_processed_wal_position();
+                    entry.promote_pending();
+                    entry.request_async_snapshot_flush(
+                        &self.flusher,
+                        loader_last_processed,
+                        force_relocate_below,
+                        threshold_position,
+                    );
+                }
+                // row lock released immediately — no IO under lock
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1471,16 +1452,19 @@ impl LargeTableEntry {
         Ok(())
     }
 
-    pub fn maybe_flush_for_snapshot<L: Loader>(
+    /// Queues an async flush for this entry if it needs flushing for a snapshot.
+    /// Called during pass 1 of the two-pass snapshot flush mechanism.
+    /// No IO is performed — flushes are dispatched asynchronously.
+    pub fn request_async_snapshot_flush(
         &mut self,
-        loader: &L,
+        flusher: &IndexFlusher,
+        loader_last_processed: LastProcessed,
         force_relocate_below: Option<WalPosition>,
         threshold_position: u64,
-        loader_last_processed: LastProcessed,
-    ) -> Result<(), L::Error> {
+    ) {
+        // Skip if already has a pending flush in flight
         if self.pending_last_processed.is_some() {
-            // todo metric / log?
-            return Ok(());
+            return;
         }
         let forced_relocation = if let (Some(index_wal_position), Some(force_relocate_below)) =
             (self.state.wal_position().valid(), force_relocate_below)
@@ -1497,21 +1481,80 @@ impl LargeTableEntry {
                 .inc();
         }
         if !forced_relocation && !self.state.is_dirty() {
-            self.last_processed = loader_last_processed;
-            return Ok(());
+            return;
         }
-        let position = self.last_processed;
-        // Check if this entry's position is at or before the threshold position
-        let should_flush = position.as_u64() <= threshold_position;
-        if forced_relocation || should_flush {
+        if !forced_relocation {
+            // Only flush dirty entries at or below threshold
+            let should_flush = self.last_processed.as_u64() <= threshold_position;
+            if !should_flush {
+                return;
+            }
+        }
+
+        self.pending_last_processed = Some(loader_last_processed);
+
+        if forced_relocation {
             self.context
                 .metrics
                 .snapshot_force_unload
                 .with_label_values(&[self.context.name()])
                 .inc();
-            self.sync_flush(loader, forced_relocation, None, None, false)?;
+            // For forced relocation: use ForceRelocate — flusher loads from disk at old position
+            let old_position = self
+                .state
+                .wal_position()
+                .valid()
+                .expect("forced relocation entry must have valid wal position");
+            flusher.request_flush(
+                self.context.id(),
+                self.cell.clone(),
+                FlushKind::ForceRelocate(old_position),
+            );
+        } else {
+            self.context
+                .metrics
+                .snapshot_force_unload
+                .with_label_values(&[self.context.name()])
+                .inc();
+            let flush_kind = self
+                .flush_kind()
+                .expect("entry must be dirty for non-relocation async snapshot flush");
+            flusher.request_flush(self.context.id(), self.cell.clone(), flush_kind);
         }
-        Ok(())
+    }
+
+    /// Updates the entry's WAL position after a `ForceRelocate` flush completes.
+    /// Unlike `update_flushed_index`, this handles clean entries (Unloaded/Loaded)
+    /// since forced relocation re-flushes an already-clean entry to a new position.
+    pub fn update_relocated_position(&mut self, position: WalPosition) {
+        let pending_last_processed = self
+            .pending_last_processed
+            .take()
+            .expect("update_relocated_position called while pending_last_processed is not set");
+        self.last_processed = pending_last_processed;
+        // Update position in state. New writes may have arrived making the entry dirty —
+        // in that case, just update the base position. The dirty overlay remains valid.
+        match self.state {
+            LargeTableEntryState::Unloaded(_) => {
+                self.state = LargeTableEntryState::Unloaded(position);
+            }
+            LargeTableEntryState::Loaded(_) => {
+                // Unload after relocation (snapshot context)
+                self.state = LargeTableEntryState::Unloaded(position);
+                self.data = Default::default();
+                self.report_loaded_keys_count();
+            }
+            LargeTableEntryState::DirtyUnloaded(_) => {
+                // New write arrived while relocation was in flight — update base position
+                self.state = LargeTableEntryState::DirtyUnloaded(position);
+            }
+            LargeTableEntryState::DirtyLoaded(_) => {
+                self.state = LargeTableEntryState::DirtyLoaded(position);
+            }
+            LargeTableEntryState::Empty => {
+                panic!("update_relocated_position called in Empty state")
+            }
+        }
     }
 
     /// Performs a synchronous flush regardless of the config setting.
@@ -1549,7 +1592,7 @@ impl LargeTableEntry {
         // Perform a synchronous flush
         let Some((_original_index, position)) = IndexFlusherThread::handle_command(
             loader,
-            &FlusherCommand::new(self.context.id(), self.cell.clone(), flush_kind),
+            &IndexFlushCommand::new(self.context.id(), self.cell.clone(), flush_kind),
             &self.context,
             relocation_updates,
             relocation_cutoff,
