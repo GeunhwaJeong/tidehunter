@@ -4,7 +4,7 @@ use crate::context::{KsContext, LookupResult, LookupSource};
 use crate::flusher::{FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread};
 use crate::index::index_format::{Direction, IndexFormat, IndexIterCache};
 use crate::index::index_table::IndexTable;
-use crate::index::pending_table::{PendingTable, Transaction};
+use crate::index::pending_table::{CommittedChange, PendingTable, Transaction};
 use crate::index::utils::{NextEntryResult, take_next_entry};
 use crate::iterators::IteratorResult;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc, KeyType};
@@ -1295,26 +1295,7 @@ impl LargeTableEntry {
         if removed > 0 {
             self.context.pending_table_len.add(-(removed as i64));
         }
-        if committed.is_empty() {
-            return;
-        }
-        for committed_change in committed {
-            // changes from the committed batch goes over
-            // the same skip_stale_update logic as regular updates
-            if committed_change.is_modified {
-                // todo perf - report_loaded_keys_count and make_mut calls can be done once
-                let (full_key, lru_value) =
-                    split_lru_update(&committed_change.key, committed_change.lru_update);
-                self.insert(
-                    committed_change.key,
-                    committed_change.value,
-                    full_key,
-                    lru_value.as_ref(),
-                );
-            } else {
-                self.remove(committed_change.key, committed_change.value);
-            }
-        }
+        self.apply_committed_changes(committed);
     }
 
     /// Promotes pending entries for a single key.
@@ -1323,7 +1304,13 @@ impl LargeTableEntry {
         if removed > 0 {
             self.context.pending_table_len.add(-(removed as i64));
         }
+        self.apply_committed_changes(committed);
+    }
+
+    fn apply_committed_changes(&mut self, committed: Vec<CommittedChange>) {
         for committed_change in committed {
+            // todo perf - report_loaded_keys_count and make_mut calls can be done once
+            // Changes from a committed batch go over the same skip_stale_update logic as regular updates.
             if committed_change.is_modified {
                 let (full_key, lru_value) =
                     split_lru_update(&committed_change.key, committed_change.lru_update);
