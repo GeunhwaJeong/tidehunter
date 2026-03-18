@@ -15,6 +15,7 @@ impl DbLock {
             .truncate(false)
             .open(&lock_path)?;
         let fd = file.as_raw_fd();
+        #[allow(clippy::unnecessary_cast)] // l_type is i16 on some platforms, i32 on others
         let mut flock = libc::flock {
             l_type: libc::F_WRLCK as i16, // Exclusive write lock
             l_whence: libc::SEEK_SET as i16,
