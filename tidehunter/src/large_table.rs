@@ -330,6 +330,9 @@ impl LargeTable {
         let mut row = self.row_by_mutex(context, mutex_idx);
         for (cell_id, op, position) in ops {
             let entry = self.entry_mut(&mut row, cell_id);
+            // Promote any previously committed pending entries while the mutex is held,
+            // keeping the pending table small rather than letting it accumulate.
+            entry.promote_pending();
             match op {
                 PendingBatchOp::Insert {
                     reduced_key,
