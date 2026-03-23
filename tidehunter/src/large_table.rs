@@ -486,12 +486,18 @@ impl LargeTable {
     /// Promotes pending entries for cells whose dirty flag was set by the commit path.
     /// Called by the event-driven pending-promotion thread immediately after batches commit.
     ///
+    /// Only processes mutex shards assigned to this shard: `mutex_idx % num_shards == shard_idx`.
     /// Commits that arrive after the flag is swapped to false will set it again and be
-    /// processed on the next wakeup, or caught by the 1-second flat-promotion fallback.
-    pub(crate) fn promote_dirty_pending<L: Loader>(&self, loader: &L) -> Result<(), L::Error> {
+    /// processed on the next wakeup, or caught by the flat-promotion fallback.
+    pub(crate) fn promote_dirty_pending<L: Loader>(
+        &self,
+        loader: &L,
+        shard_idx: usize,
+        num_shards: usize,
+    ) -> Result<(), L::Error> {
         for ks_table in &self.table {
             for (mutex_idx, flag) in ks_table.pending_dirty.iter().enumerate() {
-                if flag.swap(false, Ordering::Acquire) {
+                if mutex_idx % num_shards == shard_idx && flag.swap(false, Ordering::Acquire) {
                     let mut row = ks_table
                         .rows
                         .lock(mutex_idx, &ks_table.context.large_table_contention);

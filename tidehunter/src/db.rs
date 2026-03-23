@@ -43,8 +43,9 @@ pub struct Db {
     pub(crate) key_shape: KeyShape,
     relocator: Relocator,
     commit_pool: Option<rayon::ThreadPool>,
-    /// Handle to the pending-promotion thread for waking it after batch commits.
-    pending_promotion_thread: OnceLock<thread::Thread>,
+    /// One handle per pending-promotion shard, for waking threads after batch commits.
+    /// Index `i` owns mutex shards where `mutex_idx % len == i`.
+    pending_promotion_threads: Box<[OnceLock<thread::Thread>]>,
     _lock: DbLock,
 }
 
@@ -105,6 +106,11 @@ impl Db {
             None
         };
 
+        let num_promotion_threads = config.num_pending_promotion_threads.max(1);
+        let pending_promotion_threads = (0..num_promotion_threads)
+            .map(|_| OnceLock::new())
+            .collect::<Box<[_]>>();
+
         let this = Self {
             large_table,
             wal_writer,
@@ -117,7 +123,7 @@ impl Db {
             key_shape,
             relocator,
             commit_pool,
-            pending_promotion_thread: OnceLock::new(),
+            pending_promotion_threads,
             _lock: lock,
         };
         this.report_memory_estimates();
@@ -135,8 +141,14 @@ impl Db {
             metrics.clone(),
         );
 
-        // Start the event-driven pending-promotion thread and the flat-promotion polling thread.
-        let _pending_handle = Self::start_pending_promotion_job(Arc::downgrade(&this));
+        // Start the event-driven pending-promotion threads (one per shard) and the flat-promotion
+        // polling thread.
+        let num_shards = this.pending_promotion_threads.len();
+        let _pending_handles: Vec<_> = (0..num_shards)
+            .map(|shard_idx| {
+                Self::start_pending_promotion_job(Arc::downgrade(&this), shard_idx, num_shards)
+            })
+            .collect();
         let _flat_handle = Self::start_flat_promotion_job(Arc::downgrade(&this));
 
         // todo: store handles and wait for them on Db drop
@@ -537,8 +549,16 @@ impl Db {
 
         // keep all guards active until transaction is committed
         transaction.commit();
-        if let Some(t) = self.pending_promotion_thread.get() {
-            t.unpark();
+        let num_shards = self.pending_promotion_threads.len();
+        // Wake only the promotion shard(s) that own the mutexes touched by this batch.
+        let mut shards_to_wake = vec![false; num_shards];
+        for (_, mutex_idx, _, _, _) in &grouped {
+            shards_to_wake[mutex_idx % num_shards] = true;
+        }
+        for (shard_idx, should_wake) in shards_to_wake.iter().enumerate() {
+            if *should_wake && let Some(t) = self.pending_promotion_threads[shard_idx].get() {
+                t.unpark();
+            }
         }
 
         self.metrics.wal_written_bytes.set(
@@ -965,16 +985,22 @@ impl Db {
             .set(maps_estimate as i64);
     }
 
-    /// Starts an event-driven thread that promotes pending entries immediately after batch commits.
-    /// The thread parks itself and is unparked by `do_write_batch` after each committed batch,
-    /// and by `Drop` when the Db is torn down.
-    fn start_pending_promotion_job(db: Weak<Db>) -> thread::JoinHandle<()> {
+    /// Starts an event-driven thread for one pending-promotion shard.
+    /// The thread parks itself and is unparked by `do_write_batch` when a batch touches any mutex
+    /// in this shard, and by `Drop` when the Db is torn down.
+    fn start_pending_promotion_job(
+        db: Weak<Db>,
+        shard_idx: usize,
+        num_shards: usize,
+    ) -> thread::JoinHandle<()> {
         thread::Builder::new()
-            .name("pending-promotion".to_string())
+            .name(format!("pending-promotion-{shard_idx}"))
             .spawn(move || {
                 let Some(initial) = db.upgrade() else { return };
                 // OnceLock::set can only fail if set twice; this thread runs once so it always succeeds.
-                initial.pending_promotion_thread.set(thread::current()).ok();
+                initial.pending_promotion_threads[shard_idx]
+                    .set(thread::current())
+                    .ok();
                 drop(initial);
                 loop {
                     thread::park();
@@ -984,7 +1010,10 @@ impl Db {
                         .pending_promotion_job_time_mcs
                         .clone()
                         .mcs_timer();
-                    if let Err(e) = db.large_table.promote_dirty_pending(db.as_ref()) {
+                    if let Err(e) =
+                        db.large_table
+                            .promote_dirty_pending(db.as_ref(), shard_idx, num_shards)
+                    {
                         eprintln!("Error in pending promotion job: {:?}", e);
                     }
                 }
@@ -1112,8 +1141,10 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
-        if let Some(t) = self.pending_promotion_thread.get() {
-            t.unpark();
+        for slot in self.pending_promotion_threads.iter() {
+            if let Some(t) = slot.get() {
+                t.unpark();
+            }
         }
         let (sender, recv) = mpsc::channel();
         self.relocator

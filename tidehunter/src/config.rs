@@ -44,10 +44,19 @@ pub struct Config {
     /// Using this feature does not change batch atomicity and isolation guarantees.
     #[serde(default)]
     pub commit_pool_size: usize,
+    /// Number of event-driven pending-promotion threads. Each thread owns a consistent
+    /// subset of mutex shards (`mutex_idx % num_pending_promotion_threads == shard_idx`),
+    /// eliminating contention between promotion threads on different keyspace shards.
+    #[serde(default = "default_num_pending_promotion_threads")]
+    pub num_pending_promotion_threads: usize,
 }
 
 fn default_metrics_enabled() -> bool {
     true
+}
+
+fn default_num_pending_promotion_threads() -> usize {
+    4
 }
 
 fn default_relocation_max_reclaim_pct() -> u8 {
@@ -72,6 +81,7 @@ impl Default for Config {
             relocation_max_reclaim_pct: default_relocation_max_reclaim_pct(),
             metrics_enabled: true,
             commit_pool_size: 0,
+            num_pending_promotion_threads: default_num_pending_promotion_threads(),
         }
     }
 }
@@ -94,6 +104,7 @@ impl Config {
             metrics_enabled: true,
             relocation_max_reclaim_pct: 100,
             commit_pool_size: 0,
+            num_pending_promotion_threads: default_num_pending_promotion_threads(),
         }
     }
 
