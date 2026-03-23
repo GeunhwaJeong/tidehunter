@@ -964,7 +964,7 @@ impl Db {
             .name("pending-promotion".to_string())
             .spawn(move || {
                 loop {
-                    thread::sleep(Duration::from_secs(10));
+                    thread::sleep(Duration::from_secs(1));
 
                     let Some(db) = db.upgrade() else {
                         // Db has been dropped, exit the thread
