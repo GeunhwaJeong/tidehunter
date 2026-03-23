@@ -27,7 +27,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak, mpsc};
+use std::sync::{Arc, OnceLock, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,8 @@ pub struct Db {
     pub(crate) key_shape: KeyShape,
     relocator: Relocator,
     commit_pool: Option<rayon::ThreadPool>,
+    /// Handle to the pending-promotion thread for waking it after batch commits.
+    pending_promotion_thread: OnceLock<thread::Thread>,
     _lock: DbLock,
 }
 
@@ -115,6 +117,7 @@ impl Db {
             key_shape,
             relocator,
             commit_pool,
+            pending_promotion_thread: OnceLock::new(),
             _lock: lock,
         };
         this.report_memory_estimates();
@@ -132,8 +135,9 @@ impl Db {
             metrics.clone(),
         );
 
-        // Start the pending promotion background job
-        let _promotion_handle = Self::start_pending_promotion_job(Arc::downgrade(&this));
+        // Start the event-driven pending-promotion thread and the flat-promotion polling thread.
+        let _pending_handle = Self::start_pending_promotion_job(Arc::downgrade(&this));
+        let _flat_handle = Self::start_flat_promotion_job(Arc::downgrade(&this));
 
         // todo: store handles and wait for them on Db drop
 
@@ -533,6 +537,9 @@ impl Db {
 
         // keep all guards active until transaction is committed
         transaction.commit();
+        if let Some(t) = self.pending_promotion_thread.get() {
+            t.unpark();
+        }
 
         self.metrics.wal_written_bytes.set(
             guards
@@ -958,26 +965,45 @@ impl Db {
             .set(maps_estimate as i64);
     }
 
-    /// Starts a background job that periodically promotes pending entries and checks for flush.
+    /// Starts an event-driven thread that promotes pending entries immediately after batch commits.
+    /// The thread parks itself and is unparked by `do_write_batch` after each committed batch,
+    /// and by `Drop` when the Db is torn down.
     fn start_pending_promotion_job(db: Weak<Db>) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("pending-promotion".to_string())
             .spawn(move || {
+                let Some(initial) = db.upgrade() else { return };
+                // OnceLock::set can only fail if set twice; this thread runs once so it always succeeds.
+                initial.pending_promotion_thread.set(thread::current()).ok();
+                drop(initial);
                 loop {
-                    thread::sleep(Duration::from_secs(1));
-
-                    let Some(db) = db.upgrade() else {
-                        // Db has been dropped, exit the thread
-                        break;
-                    };
-
+                    thread::park();
+                    let Some(db) = db.upgrade() else { break };
                     let _timer = db
                         .metrics
                         .pending_promotion_job_time_mcs
                         .clone()
                         .mcs_timer();
-                    if let Err(e) = db.large_table.promote_pending_job(db.as_ref()) {
+                    if let Err(e) = db.large_table.promote_dirty_pending(db.as_ref()) {
                         eprintln!("Error in pending promotion job: {:?}", e);
+                    }
+                }
+            })
+            .unwrap()
+    }
+
+    /// Starts a background thread that compacts BTreeMap index entries into flat arrays.
+    /// Runs on a 10-second polling cadence, independently of the pending-promotion thread.
+    fn start_flat_promotion_job(db: Weak<Db>) -> thread::JoinHandle<()> {
+        thread::Builder::new()
+            .name("flat-promotion".to_string())
+            .spawn(move || {
+                loop {
+                    thread::sleep(Duration::from_secs(10));
+                    let Some(db) = db.upgrade() else { break };
+                    let _timer = db.metrics.flat_promotion_job_time_mcs.clone().mcs_timer();
+                    if let Err(e) = db.large_table.promote_flat_job(db.as_ref()) {
+                        eprintln!("Error in flat promotion job: {:?}", e);
                     }
                 }
             })
@@ -1086,6 +1112,9 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
+        if let Some(t) = self.pending_promotion_thread.get() {
+            t.unpark();
+        }
         let (sender, recv) = mpsc::channel();
         self.relocator
             .0

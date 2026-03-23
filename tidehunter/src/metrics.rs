@@ -207,6 +207,7 @@ pub struct Metrics {
     pub pending_table_len: MetricIntGaugeVec,
     pub pending_promotion_job_remaining: MetricIntGaugeVec,
     pub pending_promotion_job_time_mcs: MetricIntCounter,
+    pub flat_promotion_job_time_mcs: MetricIntCounter,
     pub promote_flat_arc_miss: MetricIntCounter,
 }
 
@@ -439,6 +440,7 @@ impl Metrics {
                 registry,
                 enabled
             ),
+            flat_promotion_job_time_mcs: counter!("flat_promotion_job_time_mcs", registry, enabled),
             promote_flat_arc_miss: counter!("promote_flat_arc_miss", registry, enabled),
         };
         Arc::new(this)

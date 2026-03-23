@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::{cmp, mem, thread};
 
@@ -83,6 +83,9 @@ struct KsTable {
     /// The write lock on this lock is acquire within scope of row lock.
     /// No new locks are acquired withing the scope of cell_index lock(read or write).
     cell_index: RwLock<BTreeSet<CellIdBytesContainer>>,
+    /// One flag per mutex shard. Set by the commit path when a batch is applied to that shard;
+    /// cleared and consumed by the pending-promotion thread.
+    pending_dirty: Box<[AtomicBool]>,
 }
 
 struct Row {
@@ -233,10 +236,14 @@ impl LargeTable {
                         KeyType::Uniform(_) => Default::default(),
                     };
 
+                    let pending_dirty = (0..num_mutexes)
+                        .map(|_| AtomicBool::new(false))
+                        .collect::<Box<[_]>>();
                     KsTable {
                         context,
                         rows,
                         cell_index,
+                        pending_dirty,
                     }
                 },
             )
@@ -350,6 +357,7 @@ impl LargeTable {
             }
             context.pending_table_len.add(1);
         }
+        self.ks_table(&context.ks_config).pending_dirty[mutex_idx].store(true, Ordering::Release);
     }
 
     pub fn update_lru(
@@ -475,45 +483,64 @@ impl LargeTable {
             .all(|m| m.rows.mutexes().iter().all(|m| m.lock().entries.is_empty()))
     }
 
-    /// Promotes pending entries for all cells in all keyspaces and checks for flush.
-    /// Reports remaining pending entries per keyspace to metrics.
-    pub(crate) fn promote_pending_job<L: Loader>(&self, loader: &L) -> Result<(), L::Error> {
+    /// Promotes pending entries for cells whose dirty flag was set by the commit path.
+    /// Called by the event-driven pending-promotion thread immediately after batches commit.
+    ///
+    /// Commits that arrive after the flag is swapped to false will set it again and be
+    /// processed on the next wakeup, or caught by the 1-second flat-promotion fallback.
+    pub(crate) fn promote_dirty_pending<L: Loader>(&self, loader: &L) -> Result<(), L::Error> {
+        for ks_table in &self.table {
+            for (mutex_idx, flag) in ks_table.pending_dirty.iter().enumerate() {
+                if flag.swap(false, Ordering::Acquire) {
+                    let mut row = ks_table
+                        .rows
+                        .lock(mutex_idx, &ks_table.context.large_table_contention);
+                    for entry in row.entries.iter_mut() {
+                        entry.promote_pending_and_check_flush(loader, &self.flusher)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compacts BTreeMap index entries into flat sorted arrays for all cells in all keyspaces.
+    /// Also reports remaining pending entry counts per keyspace to metrics.
+    /// Runs on a 10-second polling cadence, independently of the pending-promotion thread.
+    pub(crate) fn promote_flat_job<L: Loader>(&self, loader: &L) -> Result<(), L::Error> {
         for ks_table in &self.table {
             let mut total_remaining = 0;
             for mutex in ks_table.rows.mutexes() {
-                // Phase 1: under lock — promote pending entries and check flush threshold
-                // (promote_pending changes dirty count), then grab a shared snapshot so
-                // promote_to_flat can run outside the lock.
-                let snapshots: Vec<(CellId, usize, Arc<IndexTable>)> = {
+                // Phase 1: under lock — promote any remaining pending entries and check flush.
+                // promote_pending must run before flush to ensure pending entries are applied
+                // before the flusher snapshots the index. The event-driven thread handles
+                // the common case; this is a 1-second catch-all for anything it missed.
+                let snapshots: Vec<(CellId, Arc<IndexTable>)> = {
                     let mut row = mutex.lock();
                     let mut snapshots = Vec::with_capacity(row.entries.iter().count());
                     for entry in row.entries.iter_mut() {
                         let remaining =
                             entry.promote_pending_and_check_flush(loader, &self.flusher)?;
+                        total_remaining += remaining;
                         let arc = entry.data.clone_shared();
-                        snapshots.push((entry.cell.clone(), remaining, arc));
+                        snapshots.push((entry.cell.clone(), arc));
                     }
                     snapshots
                     // lock released here
                 };
 
                 // Phase 2: outside the lock — clone each snapshot and compact BTreeMap into flat.
-                // promote_to_flat does not change the dirty count, so the flush check above is
-                // sufficient. If a writer modifies an entry concurrently it will clone on make_mut
+                // If a writer modifies an entry concurrently it will clone on make_mut
                 // (ArcCow semantics); the same_shared check below detects this and discards stale work.
                 let promoted: Vec<(CellId, Arc<IndexTable>, IndexTable)> = snapshots
                     .iter()
-                    .filter_map(|(cell, _, arc)| {
+                    .filter_map(|(cell, arc)| {
                         let mut table = (**arc).clone();
                         table
                             .promote_to_flat()
                             .then_some((cell.clone(), arc.clone(), table))
                     })
                     .collect();
-                total_remaining += snapshots
-                    .iter()
-                    .map(|(_, remaining, _)| remaining)
-                    .sum::<usize>();
 
                 // Phase 3: re-acquire lock — write back promoted table only if the entry was
                 // not modified while we were outside the lock, then update metrics.
