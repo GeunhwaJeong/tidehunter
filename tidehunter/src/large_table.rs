@@ -1421,11 +1421,7 @@ impl LargeTableEntry {
         if let Some((p_key, (p_full_key, p_value))) = previous {
             delta -= (p_key.len() + p_full_key.len() + p_value.len()) as i64;
         }
-        context
-            .metrics
-            .value_cache_size
-            .with_label_values(&[context.name()])
-            .add(delta);
+        context.value_cache_size.add(delta);
     }
 
     pub fn get(&self, k: &[u8]) -> Option<WalPosition> {
