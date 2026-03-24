@@ -1,14 +1,13 @@
-use std::cmp::Ordering;
 use std::time::Instant;
 
 use bytes::{Buf, BufMut, BytesMut};
 use minibytes::Bytes;
 
-use crate::index::index_table::IndexSerializationVisitor;
+use crate::index::index_table::{IndexSerializationVisitor, IndexTable};
 use crate::math::{next_bounded, rescale_u32};
 use crate::metrics::{Metrics, TimerExt};
 use crate::wal::position::WalPosition;
-use crate::{index::index_table::IndexTable, key_shape::KeySpaceDesc, lookup::RandomRead};
+use crate::{key_shape::KeySpaceDesc, lookup::RandomRead};
 
 use super::index_format::{
     Direction, HEADER_ELEMENT_SIZE, HEADER_ELEMENTS, HEADER_SIZE, IndexFormat, IndexIterCache,
@@ -151,18 +150,12 @@ impl IndexFormat for LookupHeaderIndex {
         }
 
         // Variable-length key path: group entries by micro-cell, then write each
-        // section with a leading offset table so lookup can binary-search.
-        //
-        // Per-section format:
-        //   [count: u32][offsets: u32 * count][key_len: u16][key][WalPosition]*
-        //
-        // `offsets[i]` is the byte offset of entry `i` from the start of the
-        // entries region (immediately after the count + offsets array).
+        // section using build_flat_varlen_section (same format as the in-memory
+        // flat buffer, so the flat-buffer binary-search primitives work directly).
         let mut mc_entries: Vec<Vec<(Bytes, WalPosition)>> =
             (0..HEADER_ELEMENTS).map(|_| vec![]).collect();
         for (key, pos) in table.iter() {
-            let mc = Self::key_micro_cell(ks, &key);
-            mc_entries[mc].push((key, pos));
+            mc_entries[Self::key_micro_cell(ks, &key)].push((key, pos));
         }
 
         let capacity = ks.index_element_size_for_capacity() * table.len() + HEADER_SIZE;
@@ -170,40 +163,16 @@ impl IndexFormat for LookupHeaderIndex {
         out.put_bytes(0, HEADER_SIZE);
         let mut header: Vec<(u32, u32)> = vec![(0, 0); HEADER_ELEMENTS];
 
-        for (mc, entries) in mc_entries.iter().enumerate() {
+        for (mc, entries) in mc_entries.into_iter().enumerate() {
             if entries.is_empty() {
                 continue;
             }
             let from = out.len() as u32;
-
-            out.put_u32(entries.len() as u32);
-
-            // Reserve space for per-entry offsets; filled in below.
-            let offsets_pos = out.len();
-            for _ in 0..entries.len() {
-                out.put_u32(0u32);
-            }
-
-            // Write entries, recording each one's byte offset into the entries section.
-            let entries_section_start = out.len();
-            let mut entry_offsets: Vec<u32> = Vec::with_capacity(entries.len());
-            for (key, pos) in entries {
-                entry_offsets.push((out.len() - entries_section_start) as u32);
-                out.put_u16(key.len() as u16);
-                out.put_slice(key);
-                pos.write_to_buf(&mut out);
-            }
-
-            // Back-fill offsets now that we know them.
-            for (i, off) in entry_offsets.iter().enumerate() {
-                let start = offsets_pos + i * 4;
-                out[start..start + 4].copy_from_slice(&off.to_be_bytes());
-            }
-
+            let section = IndexTable::build_flat_varlen_section(entries);
+            out.extend_from_slice(&section);
             header[mc] = (from, out.len() as u32);
         }
 
-        // Write the micro-cell header into the reserved space.
         for (i, (from, to)) in header.iter().enumerate() {
             let start = i * HEADER_ELEMENT_SIZE;
             out[start..start + 4].copy_from_slice(&from.to_be_bytes());
@@ -388,58 +357,16 @@ impl IndexFormat for LookupHeaderIndex {
         }
     }
 }
-/// Binary search a variable-length key micro-cell section for `key`.
-///
-/// The section has the format written by `serialize_index` for varlen key spaces:
-///   [count: u32][offsets: u32 * count][key_len: u16][key][WalPosition]*
-///
-/// `offsets[i]` is the byte offset of entry `i` from the start of the entries
-/// region (immediately after the count + offsets array).
+/// Binary-search a variable-length key micro-cell section for `key`.
+/// Delegates to the shared flat-buffer primitive so the logic is not duplicated.
 fn binary_search_varlen(buffer: &[u8], key: &[u8], metrics: &Metrics) -> Option<WalPosition> {
-    if buffer.len() < 4 {
-        return None;
-    }
     let _timer = metrics.lookup_scan_mcs.clone().mcs_timer();
-    let count = u32::from_be_bytes(buffer[0..4].try_into().unwrap()) as usize;
-    if count == 0 {
-        return None;
-    }
-    let entries_start = 4 + 4 * count;
-    let entries = &buffer[entries_start..];
-
-    let mut lo = 0usize;
-    let mut hi = count;
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let off =
-            u32::from_be_bytes(buffer[4 + mid * 4..4 + mid * 4 + 4].try_into().unwrap()) as usize;
-        let (mid_key, _) = parse_varlen_entry(entries, off);
-        match key.cmp(mid_key) {
-            Ordering::Less => hi = mid,
-            Ordering::Greater => lo = mid + 1,
-            Ordering::Equal => {
-                let (_, pos) = parse_varlen_entry(entries, off);
-                return Some(pos);
-            }
-        }
-    }
-    None
-}
-
-/// Parse one entry from the entries region of a varlen section.
-/// Layout: [key_len: u16][key][WalPosition]
-fn parse_varlen_entry(entries: &[u8], off: usize) -> (&[u8], WalPosition) {
-    let key_len = u16::from_be_bytes(entries[off..off + 2].try_into().unwrap()) as usize;
-    let key = &entries[off + 2..off + 2 + key_len];
-    let pos_start = off + 2 + key_len;
-    let pos = WalPosition::from_slice(&entries[pos_start..pos_start + WalPosition::LENGTH]);
-    (key, pos)
+    IndexTable::flat_varlen_lookup(buffer, key)
 }
 
 /// Deserialize a variable-length key index blob written by `LookupHeaderIndex::serialize_index`.
-///
-/// Reads the micro-cell header to find each section, then iterates entries within
-/// each section using the embedded offset table.
+/// The per-micro-cell section format is identical to the in-memory flat buffer, so
+/// `flat_varlen_iter` can be used directly without manual offset-table parsing.
 fn deserialize_varlen_index(b: Bytes) -> IndexTable {
     let mut entries: Vec<(Bytes, WalPosition)> = Vec::new();
     let b_ptr = b.as_ptr() as usize;
@@ -450,20 +377,9 @@ fn deserialize_varlen_index(b: Bytes) -> IndexTable {
         if from == 0 && to == 0 {
             continue;
         }
-        let section = &b[from..to];
-        let count = u32::from_be_bytes(section[0..4].try_into().unwrap()) as usize;
-        if count == 0 {
-            continue;
-        }
-        let entries_start = 4 + 4 * count;
-        let section_entries = &section[entries_start..];
-        for i in 0..count {
-            let off =
-                u32::from_be_bytes(section[4 + i * 4..4 + i * 4 + 4].try_into().unwrap()) as usize;
-            let (key_slice, pos) = parse_varlen_entry(section_entries, off);
+        for (key_slice, pos) in IndexTable::flat_varlen_iter(&b[from..to]) {
             let key_abs = key_slice.as_ptr() as usize - b_ptr;
-            let key = b.slice(key_abs..key_abs + key_slice.len());
-            entries.push((key, pos));
+            entries.push((b.slice(key_abs..key_abs + key_slice.len()), pos));
         }
     }
     IndexTable::from_clean_entries(entries)

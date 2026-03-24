@@ -645,6 +645,43 @@ impl IndexTable {
         pos.write_to_buf(out);
     }
 
+    // -------------------------------------------------------------------------
+    // pub(super) helpers shared with lookup_header.rs
+    //
+    // The on-disk variable-length key section format written by
+    // LookupHeaderIndex is identical to the in-memory flat buffer format used
+    // by IndexTable.  These thin wrappers expose the flat-buffer primitives
+    // (which return/accept IndexWalPosition) as a WalPosition-based API that
+    // lookup_header.rs can use without touching IndexWalPosition internals.
+    // -------------------------------------------------------------------------
+
+    /// Binary-search a variable-length flat section for `key`.
+    /// Returns the WAL position if found, None otherwise.
+    pub(super) fn flat_varlen_lookup(buffer: &[u8], key: &[u8]) -> Option<WalPosition> {
+        let idx = flat_lower_bound(buffer, None, key);
+        if idx >= flat_count(buffer, None) {
+            return None;
+        }
+        let (found_key, iwp) = flat_entry_at(buffer, None, idx);
+        (found_key == key).then(|| iwp.into_update_position())
+    }
+
+    /// Iterate `(key_slice, WalPosition)` pairs from a variable-length flat section.
+    /// `key_slice` borrows from `buffer`.
+    pub(super) fn flat_varlen_iter(buffer: &[u8]) -> impl Iterator<Item = (&[u8], WalPosition)> {
+        FlatIter::new(buffer, None).map(|(k, iwp)| (k, iwp.into_update_position()))
+    }
+
+    /// Serialize a list of `(key, WalPosition)` pairs into a variable-length flat section.
+    /// All entries are stored as clean (the on-disk index never persists tombstones).
+    pub(super) fn build_flat_varlen_section(entries: Vec<(Bytes, WalPosition)>) -> Bytes {
+        let iwp_entries = entries
+            .into_iter()
+            .map(|(k, pos)| (k, IndexWalPosition::new_clean(pos)))
+            .collect();
+        build_flat_bytes(iwp_entries, None)
+    }
+
     /// Builds an IndexTable from an iterator of clean (key, WalPosition) pairs.
     /// All entries are marked as clean. Used when deserializing from the on-disk
     /// variable-length key format where tombstones are never persisted.
