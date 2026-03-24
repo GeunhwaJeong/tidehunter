@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 use super::lookup_header::LookupHeaderIndex;
 use super::uniform_lookup::UniformLookupIndex;
-use crate::index::index_table::VariableLenKeyIndexIterator;
 use crate::metrics::{Metrics, TimerExt};
 use crate::wal::position::WalPosition;
 use crate::{index::index_table::IndexTable, key_shape::KeySpaceDesc, lookup::RandomRead};
@@ -237,29 +236,6 @@ pub fn binary_search(
     });
 
     (found_pos, left, position)
-}
-
-/// Performs linear search in the loaded portion of an index.
-/// Unlike binary search, linear search can operate on key spaces with variable key lens
-/// Same arguments and return values as binary_search.
-pub fn linear_search(
-    buffer: &[u8],
-    key: &[u8],
-    metrics: &Metrics,
-) -> (Option<usize>, usize, Option<WalPosition>) {
-    let _timer = metrics.lookup_scan_mcs.clone().mcs_timer();
-    let index_iterator = VariableLenKeyIndexIterator::new(buffer);
-    for (pos, it_key, it_pos) in index_iterator {
-        match key.cmp(it_key) {
-            Ordering::Less => {}
-            Ordering::Equal => {
-                return (Some(pos), pos, Some(it_pos));
-            }
-            Ordering::Greater => return (None, pos, None),
-        }
-    }
-    // todo this will need to change to support unloaded iterator for variable len keys
-    (None, 0, None)
 }
 
 #[cfg(test)]

@@ -645,6 +645,25 @@ impl IndexTable {
         pos.write_to_buf(out);
     }
 
+    /// Builds an IndexTable from an iterator of clean (key, WalPosition) pairs.
+    /// All entries are marked as clean. Used when deserializing from the on-disk
+    /// variable-length key format where tombstones are never persisted.
+    pub fn from_clean_entries(entries: impl IntoIterator<Item = (Bytes, WalPosition)>) -> Self {
+        let mut data = BTreeMap::new();
+        let mut key_bytes = 0usize;
+        for (k, v) in entries {
+            key_bytes += k.len();
+            data.insert(k, IndexWalPosition::new_clean(v));
+        }
+        IndexTable {
+            data,
+            key_bytes,
+            flat: Bytes::default(),
+            key_size: None,
+            dirty_count: 0,
+        }
+    }
+
     /// Deserializes IndexTable from bytes
     /// - data_offset: Where actual data begins (after any headers)
     /// - ks: KeySpaceDesc to determine element sizes

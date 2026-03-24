@@ -2388,6 +2388,123 @@ fn test_variable_length_keys_it() {
     }
 }
 
+/// Tests variable-length key lookup with enough keys to span multiple micro-cells,
+/// exercising binary search on the flushed on-disk index. Also covers absent-key
+/// lookups after flush and a reopen round-trip.
+#[test]
+fn test_variable_length_keys_many() {
+    let dir = tempdir::TempDir::new("test_variable_length_keys_many").unwrap();
+    let mut config = Config::small();
+    config.sync_flush = false;
+    let config = Arc::new(config);
+    let metrics = Metrics::new();
+    // max_dirty_keys=1 forces every insert to flush, so lookups after the first
+    // insert hit the on-disk binary-search path.
+    let ks_config = KeySpaceConfig::default().with_max_dirty_keys(1);
+    let (key_shape, ks) = KeyShape::new_single_config_indexing(
+        KeyIndexing::VariableLength,
+        16,
+        KeyType::uniform(1),
+        ks_config,
+    );
+
+    // Build keys of varying lengths to spread across many micro-cells.
+    // Single-byte keys [0x00]..[0xff] naturally cover the full key-space prefix range.
+    let keys: Vec<Vec<u8>> = (0u8..=255)
+        .map(|b| vec![b])
+        .chain((0u8..=255).map(|b| vec![b, b]))
+        .collect();
+
+    {
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            metrics.clone(),
+        )
+        .unwrap();
+
+        for (i, key) in keys.iter().enumerate() {
+            db.insert(ks, key.clone(), vec![i as u8]).unwrap();
+        }
+
+        db.large_table.flusher.barrier();
+        db.rebuild_control_region().unwrap();
+
+        // Do absent-key lookups first, before present-key lookups warm the cell
+        // cache. Cells are unloaded at this point, so each absent lookup reaches
+        // the on-disk index. Without a bloom filter nothing is intercepted early,
+        // so on_disk_not_found must equal exactly the number of absent lookups.
+        const ABSENT_KEYS: &[&[u8]] = &[&[], &[0, 1], &[1, 0], &[0xab, 0xcd, 0xef]];
+        for key in ABSENT_KEYS {
+            assert!(db.get(ks, key).unwrap().is_none());
+        }
+
+        // All inserted keys must be found with correct values.
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                Some(vec![i as u8].into()),
+                db.get(ks, key).unwrap(),
+                "lookup failed for key {key:?}",
+            );
+        }
+
+        let on_disk_found = metrics
+            .lookup_result
+            .with_label_values(&["root", "found", "lookup"])
+            .get();
+        let cache_found = metrics
+            .lookup_result
+            .with_label_values(&["root", "found", "cache"])
+            .get();
+        // Every inserted key must be accounted for.
+        assert_eq!(
+            keys.len() as u64,
+            on_disk_found + cache_found,
+            "total found lookups should equal number of inserted keys",
+        );
+        // At least half must have hit the on-disk binary-search path.
+        assert!(
+            on_disk_found >= keys.len() as u64 / 2,
+            "expected at least {} on-disk found lookups, got {on_disk_found}",
+            keys.len() / 2,
+        );
+        // Without a bloom filter every absent-key lookup reaches the index.
+        // Cells are unloaded when we do these lookups (done before the present-key
+        // loop above), so they all land in the on-disk not_found bucket.
+        let on_disk_not_found = metrics
+            .lookup_result
+            .with_label_values(&["root", "not_found", "lookup"])
+            .get();
+        assert_eq!(
+            ABSENT_KEYS.len() as u64,
+            on_disk_not_found,
+            "each absent-key lookup should produce exactly one on-disk not_found",
+        );
+    }
+
+    // Reopen and verify all lookups still work from disk.
+    {
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            metrics.clone(),
+        )
+        .unwrap();
+
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                Some(vec![i as u8].into()),
+                db.get(ks, key).unwrap(),
+                "post-reopen lookup failed for key {key:?}",
+            );
+        }
+        assert!(db.get(ks, &[]).unwrap().is_none());
+        assert!(db.get(ks, &[0xab, 0xcd, 0xef]).unwrap().is_none());
+    }
+}
+
 #[test]
 fn test_reverse_iterator_without_bounds() {
     // Test that reverse iterator works without setting any bounds
