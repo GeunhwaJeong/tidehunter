@@ -1,9 +1,11 @@
 mod flat;
 use flat::{
-    FlatIter, build_flat_bytes, flat_count, flat_entry_at, flat_lower_bound, flat_upper_bound,
+    FlatIter, append_flat_varlen, build_flat_bytes, flat_count, flat_entry_at, flat_lower_bound,
+    flat_upper_bound,
 };
 
 use crate::key_shape::KeySpaceDesc;
+#[cfg(test)]
 use crate::primitives::cursor::SliceCursor;
 use crate::primitives::slice_buf::SliceBuf;
 use crate::primitives::var_int::{MAX_U16_VARINT, deserialize_u16_varint, serialize_u16_varint};
@@ -672,20 +674,27 @@ impl IndexTable {
         FlatIter::new(buffer, None).map(|(k, iwp)| (k, iwp.into_update_position()))
     }
 
-    /// Serialize a list of `(key, WalPosition)` pairs into a variable-length flat section.
+    /// Append `(key, WalPosition)` pairs as a variable-length flat section into `out`.
     /// All entries are stored as clean (the on-disk index never persists tombstones).
-    pub(super) fn build_flat_varlen_section(entries: Vec<(Bytes, WalPosition)>) -> Bytes {
-        let iwp_entries = entries
+    /// Writes directly into the caller's buffer, avoiding a separate allocation.
+    pub(super) fn append_flat_varlen_section(
+        entries: Vec<(Bytes, WalPosition)>,
+        out: &mut BytesMut,
+    ) {
+        let iwp_entries: Vec<(Bytes, IndexWalPosition)> = entries
             .into_iter()
             .map(|(k, pos)| (k, IndexWalPosition::new_clean(pos)))
             .collect();
-        build_flat_bytes(iwp_entries, None)
+        append_flat_varlen(&iwp_entries, out);
     }
 
     /// Builds an IndexTable from an iterator of clean (key, WalPosition) pairs.
     /// All entries are marked as clean. Used when deserializing from the on-disk
     /// variable-length key format where tombstones are never persisted.
-    pub fn from_clean_entries(entries: impl IntoIterator<Item = (Bytes, WalPosition)>) -> Self {
+    #[doc(hidden)] // Used by lookup_header.rs for varlen index deserialization
+    pub(crate) fn from_clean_entries(
+        entries: impl IntoIterator<Item = (Bytes, WalPosition)>,
+    ) -> Self {
         let mut data = BTreeMap::new();
         let mut key_bytes = 0usize;
         for (k, v) in entries {
@@ -1135,11 +1144,14 @@ impl IndexSerializationVisitor for () {
     fn add_key(&mut self, _key: &[u8], _offset: usize) {}
 }
 
-/// An iterator for unloaded portion of an index for variable length keys.
+/// An iterator for the old (pre-flat-buffer) varint-encoded variable-length key format.
+/// Only retained for the unit test that validates `serialize_index_entries` round-trips.
+#[cfg(test)]
 pub struct VariableLenKeyIndexIterator<'a> {
     buf: SliceCursor<'a>,
 }
 
+#[cfg(test)]
 impl<'a> VariableLenKeyIndexIterator<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
         Self {
@@ -1148,6 +1160,7 @@ impl<'a> VariableLenKeyIndexIterator<'a> {
     }
 }
 
+#[cfg(test)]
 impl<'a> Iterator for VariableLenKeyIndexIterator<'a> {
     type Item = (usize, &'a [u8], WalPosition);
 

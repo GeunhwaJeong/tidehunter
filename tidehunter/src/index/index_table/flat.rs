@@ -21,6 +21,7 @@
 
 use super::{IndexEntryKind, IndexWalPosition};
 use crate::wal::position::WalPosition;
+use bytes::BytesMut;
 use minibytes::Bytes;
 
 // ---- Variable-length helpers (operate on the flat buffer directly) --------
@@ -224,6 +225,42 @@ pub(super) fn build_flat_bytes(
         result.extend_from_slice(&data_section);
         Bytes::from(result)
     }
+}
+
+/// Append variable-length entries directly into `out`, avoiding a separate allocation.
+///
+/// Format: `[count: u32][offsets: u32*n][key_len: u16][key][wal_offset: u64][encoded_len: u32]*`
+///
+/// Offsets are relative to the start of the entries section (immediately after the offset table),
+/// which is the same convention used by `build_flat_bytes` and the read-side helpers.
+pub(super) fn append_flat_varlen(entries: &[(Bytes, IndexWalPosition)], out: &mut BytesMut) {
+    let n = entries.len();
+    if n == 0 {
+        return;
+    }
+    let header_start = out.len();
+    let offsets_start = header_start + 4; // after count field
+    let data_start = offsets_start + 4 * n; // after offset table
+
+    // Reserve header: [count: u32][offsets: u32 * n] — placeholders filled in below.
+    out.extend_from_slice(&(n as u32).to_be_bytes());
+    for _ in 0..n {
+        out.extend_from_slice(&0u32.to_be_bytes());
+    }
+
+    // Write data entries and back-fill each offset as we go.
+    for (i, (key, iwp)) in entries.iter().enumerate() {
+        let entry_offset = (out.len() - data_start) as u32;
+        out[offsets_start + 4 * i..offsets_start + 4 * i + 4]
+            .copy_from_slice(&entry_offset.to_be_bytes());
+        out.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        out.extend_from_slice(key);
+        out.extend_from_slice(&iwp.offset.to_be_bytes());
+        out.extend_from_slice(&encode_kind_in_len(iwp.len, iwp.kind).to_be_bytes());
+    }
+
+    // Back-fill the count field.
+    out[header_start..header_start + 4].copy_from_slice(&(n as u32).to_be_bytes());
 }
 
 // ---------------------------------------------------------------------------

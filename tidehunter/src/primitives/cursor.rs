@@ -1,11 +1,14 @@
+#[cfg(test)]
 use bytes::Buf;
 
 /// Slice cursor implements Buf on top of slice and tracks the current offset.
+#[cfg(test)]
 pub struct SliceCursor<'a> {
     data: &'a [u8],
     offset: usize,
 }
 
+#[cfg(test)]
 impl<'a> SliceCursor<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self { data, offset: 0 }
@@ -36,6 +39,7 @@ impl<'a> SliceCursor<'a> {
     }
 }
 
+#[cfg(test)]
 impl Buf for SliceCursor<'_> {
     fn remaining(&self) -> usize {
         self.data.len().saturating_sub(self.offset)

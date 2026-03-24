@@ -1,5 +1,7 @@
 use std::time::Instant;
 
+use std::collections::BTreeMap;
+
 use bytes::{Buf, BufMut, BytesMut};
 use minibytes::Bytes;
 
@@ -146,16 +148,21 @@ impl IndexFormat for LookupHeaderIndex {
             let mut header = IndexTableHeaderBuilder::new(ks);
             table.serialize_index_entries_with_visitor(ks, &mut out, &mut header);
             header.write_header(out.len(), &mut out[..HEADER_SIZE]);
-            return out.to_vec().into();
+            return Bytes::from(out.freeze());
         }
 
         // Variable-length key path: group entries by micro-cell, then write each
-        // section using build_flat_varlen_section (same format as the in-memory
-        // flat buffer, so the flat-buffer binary-search primitives work directly).
-        let mut mc_entries: Vec<Vec<(Bytes, WalPosition)>> =
-            (0..HEADER_ELEMENTS).map(|_| vec![]).collect();
+        // section directly into `out` (same flat-buffer format as the in-memory
+        // buffer, so binary-search primitives work without re-parsing).
+        //
+        // Use a BTreeMap so only non-empty micro-cells allocate, and iteration
+        // order matches the 0..HEADER_ELEMENTS micro-cell sequence.
+        let mut mc_entries: BTreeMap<usize, Vec<(Bytes, WalPosition)>> = BTreeMap::new();
         for (key, pos) in table.iter() {
-            mc_entries[Self::key_micro_cell(ks, &key)].push((key, pos));
+            mc_entries
+                .entry(Self::key_micro_cell(ks, &key))
+                .or_default()
+                .push((key, pos));
         }
 
         let capacity = ks.index_element_size_for_capacity() * table.len() + HEADER_SIZE;
@@ -163,13 +170,9 @@ impl IndexFormat for LookupHeaderIndex {
         out.put_bytes(0, HEADER_SIZE);
         let mut header: Vec<(u32, u32)> = vec![(0, 0); HEADER_ELEMENTS];
 
-        for (mc, entries) in mc_entries.into_iter().enumerate() {
-            if entries.is_empty() {
-                continue;
-            }
+        for (mc, entries) in mc_entries {
             let from = out.len() as u32;
-            let section = IndexTable::build_flat_varlen_section(entries);
-            out.extend_from_slice(&section);
+            IndexTable::append_flat_varlen_section(entries, &mut out);
             header[mc] = (from, out.len() as u32);
         }
 
@@ -179,7 +182,7 @@ impl IndexFormat for LookupHeaderIndex {
             out[start + 4..start + 8].copy_from_slice(&to.to_be_bytes());
         }
 
-        out.to_vec().into()
+        Bytes::from(out.freeze())
     }
 
     fn deserialize_index(&self, ks: &KeySpaceDesc, b: Bytes) -> IndexTable {
@@ -238,7 +241,13 @@ impl IndexFormat for LookupHeaderIndex {
             direction.first_in_range(0..HEADER_ELEMENTS)
         };
 
-        let (key_size, element_size) = ks.index_key_element_size().unwrap();
+        let Some((key_size, element_size)) = ks.index_key_element_size() else {
+            unimplemented!(
+                "unloaded forward/backward iteration is not yet supported for \
+                 variable-length key spaces (ks={})",
+                ks.name()
+            );
+        };
         let mut current_micro_cell = start_micro_cell;
 
         loop {
@@ -357,6 +366,7 @@ impl IndexFormat for LookupHeaderIndex {
         }
     }
 }
+
 /// Binary-search a variable-length key micro-cell section for `key`.
 /// Delegates to the shared flat-buffer primitive so the logic is not duplicated.
 fn binary_search_varlen(buffer: &[u8], key: &[u8], metrics: &Metrics) -> Option<WalPosition> {
@@ -374,10 +384,16 @@ fn deserialize_varlen_index(b: Bytes) -> IndexTable {
         let hs = mc * HEADER_ELEMENT_SIZE;
         let from = u32::from_be_bytes(b[hs..hs + 4].try_into().unwrap()) as usize;
         let to = u32::from_be_bytes(b[hs + 4..hs + 8].try_into().unwrap()) as usize;
+        // from=0 is an unambiguous empty sentinel: all data starts at offsets
+        // >= HEADER_SIZE (1024), so a micro-cell with from=0 was never written.
         if from == 0 && to == 0 {
             continue;
         }
         for (key_slice, pos) in IndexTable::flat_varlen_iter(&b[from..to]) {
+            // key_slice borrows from the sub-slice &b[from..to], which is a
+            // contiguous region of the same backing allocation as `b`.  We
+            // recover the byte offset within `b` via pointer arithmetic so we
+            // can hand out zero-copy Bytes sub-slices sharing `b`'s refcount.
             let key_abs = key_slice.as_ptr() as usize - b_ptr;
             entries.push((b.slice(key_abs..key_abs + key_slice.len()), pos));
         }
