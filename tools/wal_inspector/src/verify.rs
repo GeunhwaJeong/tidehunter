@@ -401,7 +401,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tidehunter::batch::WriteBatch;
     use tidehunter::config::Config;
     use tidehunter::db::Db;
     use tidehunter::key_shape::{KeyShape, KeyType};
@@ -432,7 +431,7 @@ mod tests {
             .map_err(|e| anyhow::anyhow!("Failed to write batch: {:?}", e))?;
 
         // Close the database
-        drop(db);
+        db.wait_for_background_threads_to_finish();
 
         // Now verify the WAL using InspectorContext
         let context = InspectorContext::load(db_path, false)?;
@@ -489,7 +488,7 @@ mod tests {
             .map_err(|e| anyhow::anyhow!("Failed to write delete batch: {:?}", e))?;
 
         // Close the database
-        drop(db);
+        db.wait_for_background_threads_to_finish();
 
         // Now verify the WAL using InspectorContext
         let context = InspectorContext::load(db_path, false)?;

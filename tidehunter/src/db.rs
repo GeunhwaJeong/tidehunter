@@ -1430,7 +1430,7 @@ mod multi_flusher_tests {
                 assert_eq!(value.unwrap().as_ref(), format!("value{}", i).as_bytes());
             }
 
-            drop(db);
+            db.wait_for_background_threads_to_finish();
         }
     }
 }

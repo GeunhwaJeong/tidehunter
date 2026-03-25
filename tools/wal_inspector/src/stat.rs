@@ -477,7 +477,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tidehunter::batch::WriteBatch;
     use tidehunter::config::Config;
     use tidehunter::db::Db;
     use tidehunter::key_shape::{KeyShape, KeyType};
