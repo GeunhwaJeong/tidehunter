@@ -149,6 +149,16 @@ mod tests {
     use tempdir::TempDir;
 
     #[test]
+    fn test_lock_stale_lock_file() {
+        // A LOCK file left behind by a crashed process must not prevent reopening.
+        // fcntl locks are released automatically by the OS on process exit, so the
+        // file's presence alone is not an error.
+        let dir = TempDir::new("test-lock-stale").unwrap();
+        std::fs::write(dir.path().join("LOCK"), b"").unwrap();
+        let _lock = DbLock::acquire(dir.path(), Duration::ZERO).unwrap();
+    }
+
+    #[test]
     fn test_lock_same_process() {
         let dir = TempDir::new("test-lock").unwrap();
         let canonical = dir.path().canonicalize().unwrap();
