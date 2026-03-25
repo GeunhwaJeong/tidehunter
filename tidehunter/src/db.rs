@@ -156,6 +156,13 @@ impl Db {
         Ok(this)
     }
 
+    /// Deletes the database directory at `path` if no other process holds the lock.
+    /// Returns `ErrorKind::AlreadyExists` if the database is currently open.
+    pub fn drop_db(path: &Path) -> io::Result<()> {
+        let _lock = DbLock::acquire(path)?;
+        std::fs::remove_dir_all(path)
+    }
+
     pub fn shape_file_path(path: &Path) -> PathBuf {
         path.join("shape.yaml")
     }

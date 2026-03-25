@@ -3007,3 +3007,30 @@ fn test_drop_cells_in_range_prefixed_uniform() {
         db.get(ks, &hex!("9ABC0000000000000000")).unwrap()
     );
 }
+
+#[test]
+fn test_drop_db() {
+    drop_db(default_key_shape())
+}
+
+pub(super) fn drop_db((key_shape, ks): (KeyShape, KeySpace)) {
+    let dir = tempdir::TempDir::new("test-drop-db").unwrap();
+    let path = dir.path().to_path_buf();
+    let config = Arc::new(Config::small());
+
+    let db = Db::open(&path, key_shape, config, Metrics::new()).unwrap();
+    db.insert(ks, vec![1, 2, 3, 4], vec![5, 6]).unwrap();
+
+    // DB is open — drop_db must fail
+    let err = Db::drop_db(&path).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(path.exists());
+
+    // DB is closed — drop_db must remove the directory
+    drop(db);
+    Db::drop_db(&path).unwrap();
+    assert!(!path.exists());
+
+    // Prevent TempDir from trying to delete the already-removed directory
+    std::mem::forget(dir);
+}
