@@ -46,7 +46,7 @@ pub struct Db {
     /// One handle per pending-promotion shard, for waking threads after batch commits.
     /// Index `i` owns mutex shards where `mutex_idx % len == i`.
     pending_promotion_threads: Box<[OnceLock<thread::Thread>]>,
-    _lock: DbLock,
+    _lock: Mutex<Option<DbLock>>,
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -124,7 +124,7 @@ impl Db {
             relocator,
             commit_pool,
             pending_promotion_threads,
-            _lock: lock,
+            _lock: Mutex::new(Some(lock)),
         };
         this.report_memory_estimates();
         let this = Arc::new(this);
@@ -1098,28 +1098,31 @@ impl Db {
         use std::thread;
         use std::time::Duration;
 
-        // Convert Arc to Weak to track when all references are dropped
-        let weak_db = Arc::downgrade(&self);
+        // Take the lock out before releasing the Arc. This ensures the registry removal
+        // happens exactly once, here in the calling thread, after all background threads
+        // have finished — not racing with DbLock::drop in a background thread.
+        let lock = self._lock.lock().take();
 
-        // Drop our strong reference
+        let weak_db = Arc::downgrade(&self);
         drop(self);
 
-        // Wait for all background threads to finish
         let mut poll_count = 0;
         loop {
             if weak_db.upgrade().is_none() {
-                // All references dropped, safe to proceed
                 break;
             }
             poll_count += 1;
             if poll_count > 10000 {
-                // Increased timeout
                 panic!(
                     "Database shutdown timeout: background threads not terminating after {poll_count} polls"
                 );
             }
-            thread::sleep(Duration::from_millis(10)); // Longer sleep
+            thread::sleep(Duration::from_millis(10));
         }
+
+        // Drop the lock now that all background threads are done.
+        // DbLock::drop removes from the registry and releases the fcntl lock.
+        drop(lock);
     }
 
     /// Test utility accessor methods

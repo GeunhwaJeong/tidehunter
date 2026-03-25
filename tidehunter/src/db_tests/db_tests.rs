@@ -2753,6 +2753,7 @@ fn setup_corrupted_db(
     }));
 
     assert!(result.is_err(), "Expected panic during batch write");
+    db.wait_for_background_threads_to_finish();
 }
 
 #[test]
@@ -2786,6 +2787,7 @@ fn test_batch_after_incomplete_batch() {
         batch.write(ks, vec![2, 3, 4, 5], vec![20]);
         batch.write(ks, vec![3, 4, 5, 6], vec![30]);
         batch.commit().unwrap();
+        db.wait_for_background_threads_to_finish();
     }
 
     // Reopen the database again and verify all keys are accessible
