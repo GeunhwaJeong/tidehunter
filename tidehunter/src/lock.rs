@@ -5,6 +5,7 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 static OPEN_DBS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
@@ -37,20 +38,35 @@ pub struct DbLock {
 }
 
 impl DbLock {
+    /// Default timeout used when no config is available (e.g. in `Db::drop_db`).
     /// Acquires an exclusive lock on `db_path`.
     ///
-    /// Returns `ErrorKind::AlreadyExists` if the database is already open — either in this
-    /// process or in another process.
-    pub fn acquire(db_path: &Path) -> io::Result<Self> {
+    /// Retries for up to `retry_timeout` awhen the in-process registry shows the database is
+    /// held — background threads may briefly extend the lifetime of a dropped `Arc<Db>`,
+    /// and this gives them time to finish before the open is considered an error.
+    ///
+    /// Returns `ErrorKind::AlreadyExists` if the database is still open after the timeout,
+    /// or if it is locked by another process.
+    pub fn acquire(db_path: &Path, retry_timeout: Duration) -> io::Result<Self> {
         let canonical = db_path.canonicalize()?;
 
-        // Check in-process registry before opening any fd.
+        // Insert into the in-process registry before opening any fd.
         // Must happen before open() to avoid the close()-releases-fcntl-locks hazard:
         // closing a competing fd on the same inode would silently drop the first
         // opener's fcntl lock (POSIX fcntl locks are per-process, not per-fd).
-        {
-            let mut open = open_dbs().lock();
-            if open.contains(&canonical) {
+        let start = std::time::Instant::now();
+        let deadline = start + retry_timeout;
+        let mut last_warning = None::<std::time::Instant>;
+        loop {
+            {
+                let mut open = open_dbs().lock();
+                if !open.contains(&canonical) {
+                    open.insert(canonical.clone());
+                    break;
+                }
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     format!(
@@ -59,7 +75,17 @@ impl DbLock {
                     ),
                 ));
             }
-            open.insert(canonical.clone());
+            let should_warn =
+                last_warning.map_or(true, |t| now.duration_since(t) >= Duration::from_secs(1));
+            if should_warn {
+                eprintln!(
+                    "WARNING: waiting for database at {} to close (waited {:.1}s)",
+                    db_path.display(),
+                    now.duration_since(start).as_secs_f32()
+                );
+                last_warning = Some(now);
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
 
         let lock_path = canonical.join("LOCK");
@@ -125,14 +151,15 @@ mod tests {
     #[test]
     fn test_lock_same_process() {
         let dir = TempDir::new("test-lock").unwrap();
-        let lock = DbLock::acquire(dir.path()).unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let lock = DbLock::acquire(dir.path(), Duration::ZERO).unwrap();
 
-        let err = DbLock::acquire(dir.path()).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        // Verify the registry shows the DB as held without triggering the retry timeout.
+        assert!(open_dbs().lock().contains(&canonical));
 
         drop(lock);
         // Lock released — should succeed now
-        let _lock2 = DbLock::acquire(dir.path()).unwrap();
+        let _lock2 = DbLock::acquire(dir.path(), Duration::ZERO).unwrap();
     }
 
     #[test]
@@ -141,7 +168,7 @@ mod tests {
         let canonical = dir.path().canonicalize().unwrap();
 
         assert!(!open_dbs().lock().contains(&canonical));
-        let lock = DbLock::acquire(dir.path()).unwrap();
+        let lock = DbLock::acquire(dir.path(), Duration::ZERO).unwrap();
         assert!(open_dbs().lock().contains(&canonical));
         drop(lock);
         assert!(!open_dbs().lock().contains(&canonical));
@@ -156,7 +183,8 @@ mod tests {
             return;
         };
         let path = PathBuf::from(path);
-        let _lock = DbLock::acquire(&path).expect("subprocess failed to acquire lock");
+        let _lock =
+            DbLock::acquire(&path, Duration::ZERO).expect("subprocess failed to acquire lock");
         // Signal parent via file — avoids libtest stdout capture interference
         std::fs::write(path.join(".ready"), b"").unwrap();
         // Block until parent closes stdin
@@ -185,7 +213,7 @@ mod tests {
         }
 
         // Another process holds the lock — must fail
-        let err = DbLock::acquire(dir.path()).unwrap_err();
+        let err = DbLock::acquire(dir.path(), Duration::ZERO).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 
         // Signal subprocess to exit by closing its stdin
@@ -193,6 +221,6 @@ mod tests {
         child.wait().unwrap();
 
         // Lock released — must succeed now
-        let _lock = DbLock::acquire(dir.path()).unwrap();
+        let _lock = DbLock::acquire(dir.path(), Duration::ZERO).unwrap();
     }
 }

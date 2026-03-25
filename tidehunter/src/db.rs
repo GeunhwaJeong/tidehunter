@@ -62,7 +62,7 @@ impl Db {
         metrics: Arc<Metrics>,
     ) -> DbResult<Arc<Self>> {
         let path = path.canonicalize()?;
-        let lock = DbLock::acquire(&path)?;
+        let lock = DbLock::acquire(&path, config.open_lock_retry_timeout)?;
         Self::maybe_create_shape_file(&path, &key_shape)?;
         Self::maybe_create_config_file(&path, &config)?;
         let (control_region_store, control_region) =
@@ -159,7 +159,7 @@ impl Db {
     /// Deletes the database directory at `path` if no other process holds the lock.
     /// Returns `ErrorKind::AlreadyExists` if the database is currently open.
     pub fn drop_db(path: &Path) -> io::Result<()> {
-        let _lock = DbLock::acquire(path)?;
+        let _lock = DbLock::acquire(path, Duration::ZERO)?;
         std::fs::remove_dir_all(path)
     }
 

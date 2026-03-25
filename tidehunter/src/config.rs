@@ -3,6 +3,7 @@ use crate::wal::layout::{WalKind, WalLayout};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::cmp;
+use std::time::Duration;
 
 // todo - remove pub
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -49,6 +50,15 @@ pub struct Config {
     /// eliminating contention between promotion threads on different keyspace shards.
     #[serde(default = "default_num_pending_promotion_threads")]
     pub num_pending_promotion_threads: usize,
+    /// TideHunter enforces exclusive access: opening a database path that is already in use
+    /// returns an error immediately. This timeout allows `Db::open` to wait for a previous
+    /// instance at the same path to fully close before giving up.
+    #[serde(default = "default_open_lock_retry_timeout")]
+    pub open_lock_retry_timeout: Duration,
+}
+
+fn default_open_lock_retry_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 
 fn default_metrics_enabled() -> bool {
@@ -82,6 +92,7 @@ impl Default for Config {
             metrics_enabled: true,
             commit_pool_size: 0,
             num_pending_promotion_threads: default_num_pending_promotion_threads(),
+            open_lock_retry_timeout: default_open_lock_retry_timeout(),
         }
     }
 }
@@ -105,6 +116,7 @@ impl Config {
             relocation_max_reclaim_pct: 100,
             commit_pool_size: 0,
             num_pending_promotion_threads: default_num_pending_promotion_threads(),
+            open_lock_retry_timeout: default_open_lock_retry_timeout(),
         }
     }
 
