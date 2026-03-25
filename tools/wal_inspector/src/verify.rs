@@ -431,7 +431,7 @@ mod tests {
             .map_err(|e| anyhow::anyhow!("Failed to write batch: {:?}", e))?;
 
         // Close the database
-        db.wait_for_background_threads_to_finish();
+        drop(db);
 
         // Now verify the WAL using InspectorContext
         let context = InspectorContext::load(db_path, false)?;
@@ -488,7 +488,7 @@ mod tests {
             .map_err(|e| anyhow::anyhow!("Failed to write delete batch: {:?}", e))?;
 
         // Close the database
-        db.wait_for_background_threads_to_finish();
+        drop(db);
 
         // Now verify the WAL using InspectorContext
         let context = InspectorContext::load(db_path, false)?;

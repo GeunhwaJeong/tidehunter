@@ -76,7 +76,7 @@ impl DbLock {
                 ));
             }
             let should_warn =
-                last_warning.map_or(true, |t| now.duration_since(t) >= Duration::from_secs(1));
+                last_warning.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1));
             if should_warn {
                 eprintln!(
                     "WARNING: waiting for database at {} to close (waited {:.1}s)",

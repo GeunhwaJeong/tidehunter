@@ -352,7 +352,6 @@ fn test_corrupted_batch_replay() {
         let record_length = CrcFrame::CRC_HEADER_LENGTH as u64 + 4 + 1 + 4;
         let offset = config.wal_layout(WalKind::Replay).align(record_length) - record_length;
         let file = db.wal.file().try_clone().unwrap();
-        db.wait_for_background_threads_to_finish();
 
         (position - offset - 1, file)
     };
@@ -410,7 +409,6 @@ fn test_concurrent_batch() {
             get_value(&db, &key_c),
         );
         assert_eq!(a + b, c);
-        db.wait_for_background_threads_to_finish();
     }
     let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
 
@@ -2921,7 +2919,7 @@ fn test_drop_cells_in_range_uniform() {
     );
 
     // Reopen the database - dropped cells should remain dropped after WAL replay
-    db.wait_for_background_threads_to_finish();
+    drop(db);
     let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
 
     // Data from cells 0 and 1 should still be gone
@@ -2997,7 +2995,7 @@ fn test_drop_cells_in_range_prefixed_uniform() {
     );
 
     // Reopen the database - dropped cells should remain dropped after WAL replay
-    db.wait_for_background_threads_to_finish();
+    drop(db);
     let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
 
     // Data from cell [0x12, 0x34] should still be gone

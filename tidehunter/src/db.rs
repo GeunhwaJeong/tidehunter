@@ -1429,8 +1429,6 @@ mod multi_flusher_tests {
                 assert!(value.is_some());
                 assert_eq!(value.unwrap().as_ref(), format!("value{}", i).as_bytes());
             }
-
-            db.wait_for_background_threads_to_finish();
         }
     }
 }
