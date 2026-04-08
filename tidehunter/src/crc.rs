@@ -83,6 +83,12 @@ impl CrcFrame {
         if len == u32::MAX && crc == u32::MAX {
             return Err(CrcReadError::SkipMarker);
         }
+        // No valid WAL entry has a zero-length payload. A zero length field
+        // almost always means we've reached unwritten (zeroed) space — treat
+        // it the same way the CRC path does (CrcMismatch terminates the walk).
+        if len == 0 {
+            return Err(CrcReadError::CrcMismatch);
+        }
         let len = len as usize;
         if b.len() < pos + Self::CRC_HEADER_LENGTH + len {
             return Err(CrcReadError::OutOfBoundsBody(len));
