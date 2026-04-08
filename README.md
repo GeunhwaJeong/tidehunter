@@ -105,7 +105,30 @@ Tidehunter has a couple of tricks up its sleeve that can provide very high speed
 * Tidehunter has a `Db::exists` check that is faster than reading the value via `get`.
 * Tidehunter uses periodic index snapshots to speed up startup time. Normally, snapshots are created automatically, but if the application performs a large backfill, calling `Db::force_rebuild_control_region` after the backfill can be beneficial to reclaim disk space and reduce startup time. 
 
-# Future work 
+# Developer tools
+
+Tidehunter includes tools for inspecting and debugging databases.
+
+## wal_inspector
+
+A CLI for offline analysis of WAL files. Commands: `stat`, `verify`, `force-snapshot`, `control-region`, `analyze-ks`.
+
+```bash
+cargo run -p wal_inspector -- stat --db /path/to/db
+```
+
+## tideconsole
+
+An interactive [Rhai](https://rhai.rs/) shell for exploring a live database.
+Walk WAL entries with visitor closures, print statistics, and inspect keyspaces interactively.
+
+```bash
+cargo run -p tideconsole --release -- --db /path/to/db
+```
+
+See [`tools/tideconsole/README.md`](tools/tideconsole/README.md) for full documentation.
+
+# Future work
 
 This section outlines things that are not currently supported but relatively easy to add in the near future:
 

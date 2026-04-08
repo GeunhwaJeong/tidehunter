@@ -1,0 +1,16 @@
+[package]
+name = "tideconsole"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tidehunter = { path = "../../tidehunter", features = ["test-utils"] }
+anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+rhai = "1"
+rustyline = "14"
+hex = "0.4.3"
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.0"
