@@ -13,6 +13,7 @@ use tidehunter::test_utils::Metrics;
 
 pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
     // --- open(path) ---
+    // Loads config and key shape only; WAL replay is deferred until the first CRUD operation.
     {
         let ctx = ctx.clone();
         engine.register_fn(
@@ -24,21 +25,14 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
                     Db::load_key_shape(&db_path).map_err(|e| -> Box<EvalAltResult> {
                         format!("Failed to load key shape: {e:?}").into()
                     })?;
-                let db = Db::open(
-                    &db_path,
-                    key_shape.clone(),
-                    Arc::new(config.clone()),
-                    Metrics::new(),
-                )
-                .map_err(|e| -> Box<EvalAltResult> {
-                    format!("Failed to open database: {e:?}").into()
-                })?;
                 let mut ctx = ctx.lock();
                 ctx.db_path = Some(db_path);
                 ctx.config = config;
                 ctx.key_shape = Some(key_shape);
-                ctx.db = Some(db);
-                (ctx.print_fn)(&format!("Opened database at {path}"));
+                ctx.db = None; // drop any previously open handle
+                (ctx.print_fn)(&format!(
+                    "Loaded {path} (WAL replay deferred until first query)"
+                ));
                 Ok(())
             },
         );
@@ -229,11 +223,25 @@ fn require_db_and_ks(
     ctx: &Arc<Mutex<ConsoleContext>>,
     ks: Dynamic,
 ) -> Result<(Arc<Db>, KeySpace), Box<EvalAltResult>> {
-    let ctx = ctx.lock();
-    let db = ctx.db.clone().ok_or_else(|| -> Box<EvalAltResult> {
-        "No database opened. Call open(\"/path/to/db\") first.".into()
-    })?;
-    let ks = resolve_ks(&ctx, ks)?;
+    let mut ctx_guard = ctx.lock();
+    if ctx_guard.db.is_none() {
+        let db_path = ctx_guard
+            .db_path
+            .as_ref()
+            .ok_or_else(|| -> Box<EvalAltResult> {
+                "No database opened. Call open(\"/path/to/db\") first.".into()
+            })?
+            .clone();
+        (ctx_guard.print_fn)("Opening database (replaying WAL, this may take a while)...");
+        let key_shape = ctx_guard.key_shape.clone().unwrap();
+        let config = ctx_guard.config.clone();
+        let db = Db::open(&db_path, key_shape, Arc::new(config), Metrics::new()).map_err(
+            |e| -> Box<EvalAltResult> { format!("Failed to open database: {e:?}").into() },
+        )?;
+        ctx_guard.db = Some(db);
+    }
+    let db = ctx_guard.db.clone().unwrap();
+    let ks = resolve_ks(&ctx_guard, ks)?;
     Ok((db, ks))
 }
 
