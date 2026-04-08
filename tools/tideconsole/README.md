@@ -17,6 +17,12 @@ tideconsole --db /path/to/db
 
 # Start without a database (call open() inside the shell)
 tideconsole
+
+# Run a one-liner and exit (no REPL)
+tideconsole --db /path/to/db --exec 'wal_stats()'
+
+# Run a script file and exit
+tideconsole --db /path/to/db --script analysis.rhai
 ```
 
 ## Available functions

@@ -16,6 +16,14 @@ struct Cli {
     /// Path to a TideHunter database directory to open on startup
     #[arg(short, long)]
     db: Option<PathBuf>,
+
+    /// Rhai snippet to evaluate non-interactively, then exit
+    #[arg(short, long)]
+    exec: Option<String>,
+
+    /// Path to a Rhai script file to evaluate non-interactively, then exit
+    #[arg(short, long)]
+    script: Option<PathBuf>,
 }
 
 mod engine;
@@ -118,6 +126,28 @@ fn main() -> Result<()> {
 
     if let Some(path) = cli.db {
         init_scope_with_db(&engine, &mut scope, &ctx, &path.display().to_string())?;
+    }
+
+    if let Some(code) = cli.exec {
+        let result = engine
+            .eval_with_scope::<Dynamic>(&mut scope, &code)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if !result.is_unit() {
+            println!("{result}");
+        }
+        return Ok(());
+    }
+
+    if let Some(path) = cli.script {
+        let code = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
+        let result = engine
+            .eval_with_scope::<Dynamic>(&mut scope, &code)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if !result.is_unit() {
+            println!("{result}");
+        }
+        return Ok(());
     }
 
     repl(&engine, &mut scope)
