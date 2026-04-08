@@ -1,0 +1,229 @@
+use super::{ConsoleContext, db_err, decode_hex};
+use parking_lot::Mutex;
+use rhai::{Dynamic, Engine, EvalAltResult, FnPtr, NativeCallContext};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tidehunter::db::Db;
+use tidehunter::key_shape::KeySpace;
+use tidehunter::test_utils::Metrics;
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
+    // --- open(path) ---
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "open",
+            move |path: &str| -> Result<(), Box<EvalAltResult>> {
+                let db_path = PathBuf::from(path);
+                let config = Db::load_config(&db_path).unwrap_or_default();
+                let key_shape =
+                    Db::load_key_shape(&db_path).map_err(|e| -> Box<EvalAltResult> {
+                        format!("Failed to load key shape: {e:?}").into()
+                    })?;
+                let db = Db::open(
+                    &db_path,
+                    key_shape.clone(),
+                    Arc::new(config.clone()),
+                    Metrics::new(),
+                )
+                .map_err(|e| -> Box<EvalAltResult> {
+                    format!("Failed to open database: {e:?}").into()
+                })?;
+                let mut ctx = ctx.lock();
+                ctx.db_path = Some(db_path);
+                ctx.config = config;
+                ctx.key_shape = Some(key_shape);
+                ctx.db = Some(db);
+                (ctx.print_fn)(&format!("Opened database at {path}"));
+                Ok(())
+            },
+        );
+    }
+
+    // --- get(ks_id, key_hex) → string | () ---
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "get",
+            move |ks_id: i64, key_hex: &str| -> Result<Dynamic, Box<EvalAltResult>> {
+                let db = require_db(&ctx)?;
+                let ks = KeySpace::new(ks_id as u8);
+                let key = decode_hex(key_hex)?;
+                let result = db_err(db.get(ks, &key))?;
+                Ok(match result {
+                    Some(v) => Dynamic::from(hex::encode(v.as_ref())),
+                    None => Dynamic::UNIT,
+                })
+            },
+        );
+    }
+
+    // --- exists(ks_id, key_hex) → bool ---
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "exists",
+            move |ks_id: i64, key_hex: &str| -> Result<bool, Box<EvalAltResult>> {
+                let db = require_db(&ctx)?;
+                let ks = KeySpace::new(ks_id as u8);
+                let key = decode_hex(key_hex)?;
+                db_err(db.exists(ks, &key))
+            },
+        );
+    }
+
+    // --- put(ks_id, key_hex, value_hex) ---
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "put",
+            move |ks_id: i64, key_hex: &str, value_hex: &str| -> Result<(), Box<EvalAltResult>> {
+                let db = require_db(&ctx)?;
+                let ks = KeySpace::new(ks_id as u8);
+                let key = decode_hex(key_hex)?;
+                let value = decode_hex(value_hex)?;
+                db_err(db.insert(ks, key, value))
+            },
+        );
+    }
+
+    // --- delete(ks_id, key_hex) ---
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "delete",
+            move |ks_id: i64, key_hex: &str| -> Result<(), Box<EvalAltResult>> {
+                let db = require_db(&ctx)?;
+                let ks = KeySpace::new(ks_id as u8);
+                let key = decode_hex(key_hex)?;
+                db_err(db.remove(ks, key))
+            },
+        );
+    }
+
+    // --- scan(ks_id, visitor) ---
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "scan",
+            move |native_ctx: NativeCallContext,
+                  ks_id: i64,
+                  visitor: FnPtr|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                let db = require_db(&ctx)?;
+                let ks = KeySpace::new(ks_id as u8);
+                let mut iter = db.iterator(ks);
+                run_scan_iter(&mut iter, &native_ctx, &visitor)?;
+                Ok(Dynamic::UNIT)
+            },
+        );
+    }
+
+    // --- scan(ks_id, lower_bound_hex, visitor) ---
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "scan",
+            move |native_ctx: NativeCallContext,
+                  ks_id: i64,
+                  lower_hex: &str,
+                  visitor: FnPtr|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                let db = require_db(&ctx)?;
+                let ks = KeySpace::new(ks_id as u8);
+                let lower = decode_hex(lower_hex)?;
+                let mut iter = db.iterator(ks);
+                iter.set_lower_bound(lower);
+                run_scan_iter(&mut iter, &native_ctx, &visitor)?;
+                Ok(Dynamic::UNIT)
+            },
+        );
+    }
+
+    // --- scan(ks_id, lower_bound_hex, upper_bound_hex, visitor) ---
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "scan",
+            move |native_ctx: NativeCallContext,
+                  ks_id: i64,
+                  lower_hex: &str,
+                  upper_hex: &str,
+                  visitor: FnPtr|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                let db = require_db(&ctx)?;
+                let ks = KeySpace::new(ks_id as u8);
+                let lower = decode_hex(lower_hex)?;
+                let upper = decode_hex(upper_hex)?;
+                let mut iter = db.iterator(ks);
+                iter.set_lower_bound(lower);
+                iter.set_upper_bound(upper);
+                run_scan_iter(&mut iter, &native_ctx, &visitor)?;
+                Ok(Dynamic::UNIT)
+            },
+        );
+    }
+
+    // --- help() ---
+    engine.register_fn("help", || {
+        println!("TideConsole — TideHunter Interactive Shell");
+        println!();
+        println!("Functions:");
+        println!("  open(path)                           Open a TideHunter database directory");
+        println!("  get(ks_id, key_hex)                  Look up a key; returns value hex or ()");
+        println!("  exists(ks_id, key_hex)               Check if a key exists");
+        println!("  put(ks_id, key_hex, value_hex)       Write a key-value record");
+        println!("  delete(ks_id, key_hex)               Delete a key");
+        println!("  scan(ks_id, visitor)                 Iterate all live keys in a keyspace");
+        println!("  scan(ks_id, lower, visitor)          Iterate from lower bound (inclusive)");
+        println!("  scan(ks_id, lower, upper, visitor)   Iterate between bounds");
+        println!("  walk_wal(visitor)                    Walk WAL from the start");
+        println!("  walk_wal(start_pos, visitor)         Walk WAL from start_pos byte offset");
+        println!(
+            "  list_wal_files()                     List WAL files with start_pos, size, created"
+        );
+        println!(
+            "  wal_stats()                          Print a WAL entry-type and keyspace summary"
+        );
+        println!("  help()                               Show this message");
+        println!();
+        println!("scan visitor receives (key_hex, value_hex) as separate string arguments.");
+        println!("walk_wal visitor receives an Entry object — use entry.key, entry.value, etc.");
+        println!();
+        println!("Example:");
+        println!("  open(\"/data/mydb\");");
+        println!("  scan(0, |key, value| {{");
+        println!("      print(key + \" -> \" + value.len() + \" bytes\");");
+        println!("  }});");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn require_db(ctx: &Arc<Mutex<ConsoleContext>>) -> Result<Arc<Db>, Box<EvalAltResult>> {
+    ctx.lock().db.clone().ok_or_else(|| -> Box<EvalAltResult> {
+        "No database opened. Call open(\"/path/to/db\") first.".into()
+    })
+}
+
+fn run_scan_iter(
+    iter: &mut tidehunter::iterators::db_iterator::DbIterator,
+    native_ctx: &NativeCallContext,
+    visitor: &FnPtr,
+) -> Result<(), Box<EvalAltResult>> {
+    for item in iter.by_ref() {
+        let (key, value) =
+            item.map_err(|e| -> Box<EvalAltResult> { format!("Iterator error: {e:?}").into() })?;
+        let key_hex = Dynamic::from(hex::encode(key.as_ref()));
+        let value_hex = Dynamic::from(hex::encode(value.as_ref()));
+        let _: Dynamic =
+            visitor.call_within_context::<Dynamic>(native_ctx, (key_hex, value_hex))?;
+    }
+    Ok(())
+}

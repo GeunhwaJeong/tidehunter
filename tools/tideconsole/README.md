@@ -27,14 +27,38 @@ tideconsole --db /path/to/db --script analysis.rhai
 
 ## Available functions
 
+### Database management
+
 | Function | Description |
 |---|---|
 | `open(path)` | Open a TideHunter database directory |
+| `help()` | Show this reference inside the shell |
+
+### Query functions
+
+| Function | Description |
+|---|---|
+| `get(ks_id, key_hex)` | Look up a key; returns value as hex string, or `()` if not found |
+| `exists(ks_id, key_hex)` | Returns `true` if the key exists |
+| `scan(ks_id, visitor)` | Iterate all live keys; calls `visitor(key_hex, value_hex)` |
+| `scan(ks_id, lower_hex, visitor)` | Iterate from `lower_hex` bound (inclusive) |
+| `scan(ks_id, lower_hex, upper_hex, visitor)` | Iterate between bounds (upper exclusive) |
+
+### Manipulation functions
+
+| Function | Description |
+|---|---|
+| `put(ks_id, key_hex, value_hex)` | Write a key-value record |
+| `delete(ks_id, key_hex)` | Delete a key |
+
+### WAL inspection
+
+| Function | Description |
+|---|---|
 | `walk_wal(visitor)` | Walk WAL from the start, calling `visitor(entry)` for each entry |
 | `walk_wal(start_pos, visitor)` | Walk WAL from `start_pos` byte offset |
 | `list_wal_files()` | List WAL files with `start_pos`, `size`, and `created` timestamp |
 | `wal_stats()` | Print entry-type counts and per-keyspace breakdown |
-| `help()` | Show this reference inside the shell |
 
 ## Entry fields
 
@@ -51,6 +75,50 @@ Inside a `walk_wal` visitor the `entry` object exposes:
 | `entry.raw_size` | int | Total frame size including CRC header |
 
 ## Examples
+
+**Look up a single key:**
+```rhai
+let v = get(0, "deadbeef00000001");
+if v == () {
+    print("not found");
+} else {
+    print("value: " + v);
+}
+```
+
+**Count live records in a keyspace:**
+```rhai
+let count = 0;
+scan(0, |key, value| { count += 1; });
+print("live records: " + count);
+```
+
+**Find keys with large values:**
+```rhai
+scan(0, |key, value| {
+    if value.len() > 64 {
+        print(key + " -> " + value.len() + " hex chars");
+    }
+});
+```
+
+**Range scan between two keys:**
+```rhai
+let start = "0000000000000001";
+let end   = "0000000000001000";
+scan(0, start, end, |key, value| {
+    print(key);
+});
+```
+
+**Write and verify a record:**
+```rhai
+put(0, "cafebabe00000001", "0102030405060708");
+print(exists(0, "cafebabe00000001"));   // true
+print(get(0, "cafebabe00000001"));      // 0102030405060708
+delete(0, "cafebabe00000001");
+print(exists(0, "cafebabe00000001"));   // false
+```
 
 **Count records per keyspace:**
 ```rhai
