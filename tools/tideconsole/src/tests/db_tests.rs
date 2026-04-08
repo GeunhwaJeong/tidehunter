@@ -8,15 +8,15 @@ use rhai::{Array, Dynamic};
 #[test]
 fn test_get_existing_key() {
     let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
     let (engine, mut scope) = open_engine(&db);
 
     // "key02___" was written with value vec![2u8; 16]
     let key_hex = hex::encode(b"key02___");
     let expected_value_hex = hex::encode(vec![2u8; 16]);
 
-    let snippet = format!("get({ks_id}, \"{key_hex}\")");
-    let result: Dynamic = engine.eval_with_scope(&mut scope, &snippet).unwrap();
+    let result: Dynamic = engine
+        .eval_with_scope(&mut scope, &format!("get(\"ks\", \"{key_hex}\")"))
+        .unwrap();
 
     assert!(!result.is_unit(), "key should be found");
     assert_eq!(result.cast::<String>(), expected_value_hex);
@@ -25,13 +25,13 @@ fn test_get_existing_key() {
 #[test]
 fn test_get_deleted_key_returns_unit() {
     let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
     let (engine, mut scope) = open_engine(&db);
 
     // "key00___" was deleted
     let key_hex = hex::encode(b"key00___");
-    let snippet = format!("get({ks_id}, \"{key_hex}\")");
-    let result: Dynamic = engine.eval_with_scope(&mut scope, &snippet).unwrap();
+    let result: Dynamic = engine
+        .eval_with_scope(&mut scope, &format!("get(\"ks\", \"{key_hex}\")"))
+        .unwrap();
 
     assert!(result.is_unit(), "deleted key should return ()");
 }
@@ -39,12 +39,12 @@ fn test_get_deleted_key_returns_unit() {
 #[test]
 fn test_get_missing_key_returns_unit() {
     let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
     let (engine, mut scope) = open_engine(&db);
 
     let key_hex = hex::encode(b"nokey___");
-    let snippet = format!("get({ks_id}, \"{key_hex}\")");
-    let result: Dynamic = engine.eval_with_scope(&mut scope, &snippet).unwrap();
+    let result: Dynamic = engine
+        .eval_with_scope(&mut scope, &format!("get(\"ks\", \"{key_hex}\")"))
+        .unwrap();
 
     assert!(result.is_unit(), "missing key should return ()");
 }
@@ -56,36 +56,36 @@ fn test_get_missing_key_returns_unit() {
 #[test]
 fn test_exists_present_key() {
     let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
     let (engine, mut scope) = open_engine(&db);
 
     let key_hex = hex::encode(b"key03___");
-    let snippet = format!("exists({ks_id}, \"{key_hex}\")");
-    let found: bool = engine.eval_with_scope(&mut scope, &snippet).unwrap();
+    let found: bool = engine
+        .eval_with_scope(&mut scope, &format!("exists(\"ks\", \"{key_hex}\")"))
+        .unwrap();
     assert!(found);
 }
 
 #[test]
 fn test_exists_deleted_key() {
     let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
     let (engine, mut scope) = open_engine(&db);
 
     let key_hex = hex::encode(b"key00___");
-    let snippet = format!("exists({ks_id}, \"{key_hex}\")");
-    let found: bool = engine.eval_with_scope(&mut scope, &snippet).unwrap();
+    let found: bool = engine
+        .eval_with_scope(&mut scope, &format!("exists(\"ks\", \"{key_hex}\")"))
+        .unwrap();
     assert!(!found, "deleted key should not exist");
 }
 
 #[test]
 fn test_exists_missing_key() {
     let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
     let (engine, mut scope) = open_engine(&db);
 
     let key_hex = hex::encode(b"nokey___");
-    let snippet = format!("exists({ks_id}, \"{key_hex}\")");
-    let found: bool = engine.eval_with_scope(&mut scope, &snippet).unwrap();
+    let found: bool = engine
+        .eval_with_scope(&mut scope, &format!("exists(\"ks\", \"{key_hex}\")"))
+        .unwrap();
     assert!(!found);
 }
 
@@ -96,7 +96,6 @@ fn test_exists_missing_key() {
 #[test]
 fn test_put_and_get() {
     let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
     let (engine, mut scope) = open_engine(&db);
 
     let key_hex = hex::encode(b"newkey__");
@@ -104,8 +103,8 @@ fn test_put_and_get() {
 
     let snippet = format!(
         r#"
-        put({ks_id}, "{key_hex}", "{value_hex}");
-        get({ks_id}, "{key_hex}")
+        put("ks", "{key_hex}", "{value_hex}");
+        get("ks", "{key_hex}")
         "#
     );
     let result: Dynamic = engine.eval_with_scope(&mut scope, &snippet).unwrap();
@@ -121,16 +120,15 @@ fn test_put_and_get() {
 #[test]
 fn test_delete_existing_key() {
     let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
     let (engine, mut scope) = open_engine(&db);
 
     let key_hex = hex::encode(b"key04___");
 
     let snippet = format!(
         r#"
-        let before = exists({ks_id}, "{key_hex}");
-        delete({ks_id}, "{key_hex}");
-        let after = exists({ks_id}, "{key_hex}");
+        let before = exists("ks", "{key_hex}");
+        delete("ks", "{key_hex}");
+        let after = exists("ks", "{key_hex}");
         [before, after]
         "#
     );
@@ -152,38 +150,34 @@ fn test_delete_existing_key() {
 #[test]
 fn test_scan_counts_live_records() {
     let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
     let (engine, mut scope) = open_engine(&db);
 
     // ks has 5 records written, 2 removed → 3 live
-    let snippet = format!(
-        r#"
-        let count = 0;
-        scan({ks_id}, |key, value| {{ count += 1; }});
-        count
-        "#
-    );
-    let count: i64 = engine.eval_with_scope(&mut scope, &snippet).unwrap();
+    let count: i64 = engine
+        .eval_with_scope(
+            &mut scope,
+            r#"let count = 0; scan("ks", |key, value| { count += 1; }); count"#,
+        )
+        .unwrap();
     assert_eq!(count, 3, "3 live records in ks after 2 deletes");
 }
 
 #[test]
 fn test_scan_returns_hex_key_and_value() {
     let db = setup_db();
-    let ks2_id = db.ks2.as_u8() as i64;
     let (engine, mut scope) = open_engine(&db);
 
-    // ks2 has 3 records with 8-byte values encoded as hex (16 hex chars each)
-    let snippet = format!(
-        r#"
-        let value_hex_lens = [];
-        scan({ks2_id}, |key, value| {{
-            value_hex_lens.push(value.len());
-        }});
-        value_hex_lens
-        "#
-    );
-    let lens: rhai::Array = engine.eval_with_scope(&mut scope, &snippet).unwrap();
+    // ks2 has 3 records with 8-byte values → 16 hex chars each
+    let lens: rhai::Array = engine
+        .eval_with_scope(
+            &mut scope,
+            r#"
+            let lens = [];
+            scan("ks2", |key, value| { lens.push(value.len()); });
+            lens
+            "#,
+        )
+        .unwrap();
     assert_eq!(lens.len(), 3);
     for len in lens {
         assert_eq!(len.cast::<i64>(), 16, "8 bytes → 16 hex chars");
@@ -197,7 +191,6 @@ fn test_scan_returns_hex_key_and_value() {
 #[test]
 fn test_scan_with_lower_bound() {
     let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
     let (engine, mut scope) = open_engine(&db);
 
     // Live keys in ks: key02___, key03___, key04___
@@ -207,7 +200,7 @@ fn test_scan_with_lower_bound() {
     let snippet = format!(
         r#"
         let keys = [];
-        scan({ks_id}, "{lower_hex}", |key, value| {{ keys.push(key); }});
+        scan("ks", "{lower_hex}", |key, value| {{ keys.push(key); }});
         keys
         "#
     );
@@ -231,7 +224,6 @@ fn test_scan_with_lower_bound() {
 #[test]
 fn test_scan_with_lower_and_upper_bound() {
     let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
     let (engine, mut scope) = open_engine(&db);
 
     // Live keys: key02___, key03___, key04___
@@ -242,7 +234,7 @@ fn test_scan_with_lower_and_upper_bound() {
     let snippet = format!(
         r#"
         let keys = [];
-        scan({ks_id}, "{lower_hex}", "{upper_hex}", |key, value| {{ keys.push(key); }});
+        scan("ks", "{lower_hex}", "{upper_hex}", |key, value| {{ keys.push(key); }});
         keys
         "#
     );
@@ -263,40 +255,22 @@ fn test_scan_with_lower_and_upper_bound() {
 }
 
 // ---------------------------------------------------------------------------
-// ks name resolution
+// ks argument forms
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_get_by_ks_name() {
+fn test_integer_ks_id_still_works() {
     let db = setup_db();
+    let ks_id = db.ks.as_u8() as i64;
     let (engine, mut scope) = open_engine(&db);
 
     let key_hex = hex::encode(b"key02___");
-    let expected = hex::encode(vec![2u8; 16]);
-
-    // Use the keyspace name "ks" instead of its integer ID.
     let result: Dynamic = engine
-        .eval_with_scope(&mut scope, &format!("get(\"ks\", \"{key_hex}\")"))
+        .eval_with_scope(&mut scope, &format!("get({ks_id}, \"{key_hex}\")"))
         .unwrap();
 
-    assert!(!result.is_unit());
-    assert_eq!(result.cast::<String>(), expected);
-}
-
-#[test]
-fn test_scan_by_ks_name() {
-    let db = setup_db();
-    let (engine, mut scope) = open_engine(&db);
-
-    // ks has 3 live records after 2 deletes.
-    let count: i64 = engine
-        .eval_with_scope(
-            &mut scope,
-            r#"let count = 0; scan("ks", |k, v| { count += 1; }); count"#,
-        )
-        .unwrap();
-
-    assert_eq!(count, 3);
+    assert!(!result.is_unit(), "integer ks ID should resolve correctly");
+    assert_eq!(result.cast::<String>(), hex::encode(vec![2u8; 16]));
 }
 
 #[test]
@@ -312,9 +286,5 @@ fn test_unknown_ks_name_returns_error() {
         result.is_err(),
         "unknown keyspace name should return an error"
     );
-    let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.contains("nonexistent"),
-        "error should mention the bad name"
-    );
+    assert!(result.unwrap_err().to_string().contains("nonexistent"));
 }

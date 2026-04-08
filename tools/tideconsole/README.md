@@ -80,7 +80,7 @@ Inside a `walk_wal` visitor the `entry` object exposes:
 
 **Look up a single key:**
 ```rhai
-let v = get(0, "deadbeef00000001");
+let v = get("objects", "deadbeef00000001");
 if v == () {
     print("not found");
 } else {
@@ -91,13 +91,13 @@ if v == () {
 **Count live records in a keyspace:**
 ```rhai
 let count = 0;
-scan(0, |key, value| { count += 1; });
+scan("objects", |key, value| { count += 1; });
 print("live records: " + count);
 ```
 
 **Find keys with large values:**
 ```rhai
-scan(0, |key, value| {
+scan("objects", |key, value| {
     if value.len() > 64 {
         print(key + " -> " + value.len() + " hex chars");
     }
@@ -108,18 +108,18 @@ scan(0, |key, value| {
 ```rhai
 let start = "0000000000000001";
 let end   = "0000000000001000";
-scan(0, start, end, |key, value| {
+scan("objects", start, end, |key, value| {
     print(key);
 });
 ```
 
 **Write and verify a record:**
 ```rhai
-put(0, "cafebabe00000001", "0102030405060708");
-print(exists(0, "cafebabe00000001"));   // true
-print(get(0, "cafebabe00000001"));      // 0102030405060708
-delete(0, "cafebabe00000001");
-print(exists(0, "cafebabe00000001"));   // false
+put("objects", "cafebabe00000001", "0102030405060708");
+print(exists("objects", "cafebabe00000001"));   // true
+print(get("objects", "cafebabe00000001"));      // 0102030405060708
+delete("objects", "cafebabe00000001");
+print(exists("objects", "cafebabe00000001"));   // false
 ```
 
 **Count records per keyspace:**
