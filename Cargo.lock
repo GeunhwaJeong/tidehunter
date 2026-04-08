@@ -2236,6 +2236,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "criterion",
  "hex",
  "parking_lot",
  "rhai",

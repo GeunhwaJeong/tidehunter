@@ -26,10 +26,7 @@ struct Cli {
     script: Option<PathBuf>,
 }
 
-mod engine;
-#[cfg(test)]
-mod tests;
-use engine::{ConsoleContext, create_engine, init_scope_with_db, is_complete};
+use tideconsole::engine::{ConsoleContext, create_engine, init_scope_with_db, is_complete};
 
 // ---------------------------------------------------------------------------
 // REPL
