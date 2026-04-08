@@ -284,6 +284,119 @@ fn test_walk_wal_from_position() {
 }
 
 // ---------------------------------------------------------------------------
+// list_wal_files — multi-file WAL
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_list_wal_files() {
+    // Build a DB with a tiny wal_file_size so writes spill across multiple files.
+    // frag_size must equal wal_file_size (one fragment per file) and be large enough
+    // for a single entry (~50 bytes), but small enough that ~100 records fill several files.
+    let wal_file_size: u64 = 1024;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("db");
+    std::fs::create_dir_all(&path).unwrap();
+
+    let mut builder = KeyShapeBuilder::new();
+    let ks = builder.add_key_space("ks", 8, 16, KeyType::uniform(8));
+    let key_shape = builder.build();
+
+    let config = Arc::new(Config {
+        frag_size: wal_file_size,
+        wal_file_size,
+        ..Config::default()
+    });
+    let metrics = Metrics::new();
+    let db = Db::open(&path, key_shape, config, metrics).unwrap();
+
+    // Write enough records to span several WAL files.
+    for i in 0..100u8 {
+        let mut batch = db.write_batch();
+        batch.write(ks, format!("key{i:02}__x").into_bytes(), vec![i; 8]);
+        batch.commit().unwrap();
+    }
+    drop(db);
+
+    let ctx = Arc::new(Mutex::new(ConsoleContext {
+        print_fn: Arc::new(|_| {}),
+        ..ConsoleContext::default()
+    }));
+    let engine = create_engine(ctx);
+    let mut scope = Scope::new();
+    let db_path = path.display().to_string();
+    let _: Dynamic = engine
+        .eval_with_scope::<Dynamic>(&mut scope, &format!("open(\"{db_path}\")"))
+        .unwrap();
+
+    let files: Array = engine
+        .eval_with_scope(&mut scope, "list_wal_files()")
+        .unwrap();
+
+    // Must have produced multiple WAL files.
+    assert!(
+        files.len() >= 2,
+        "expected multiple WAL files, got {}",
+        files.len()
+    );
+
+    for (i, entry) in files.iter().enumerate() {
+        let map = entry.clone().cast::<rhai::Map>();
+
+        // name field is present and looks like a WAL file
+        let name = map["name"].clone().cast::<String>();
+        assert!(name.starts_with("wal_"), "unexpected file name: {name}");
+
+        // start_pos for file i = i * wal_file_size
+        let expected_start = (i as i64) * (wal_file_size as i64);
+        assert_eq!(
+            map["start_pos"].clone().cast::<i64>(),
+            expected_start,
+            "file {i} start_pos mismatch"
+        );
+
+        // size is positive
+        assert!(
+            map["size"].clone().cast::<i64>() > 0,
+            "file {i} size should be positive"
+        );
+
+        // created timestamp is a plausible Unix epoch second (after year 2000)
+        let created = map["created"].clone().cast::<i64>();
+        assert!(
+            created > 946_684_800,
+            "file {i} created timestamp looks wrong: {created}"
+        );
+    }
+
+    // Verify start_pos can be fed into walk_wal: walking from the second file's
+    // start_pos must produce fewer entries than walking from position 0.
+    let second_start = files[1].clone().cast::<rhai::Map>()["start_pos"]
+        .clone()
+        .cast::<i64>();
+    let snippet = format!(
+        r#"
+        let full = 0;
+        let partial = 0;
+        walk_wal(|entry| {{ full += 1; }});
+        walk_wal({second_start}, |entry| {{ partial += 1; }});
+        [full, partial]
+        "#
+    );
+    let counts: Array = engine.eval_with_scope(&mut scope, &snippet).unwrap();
+    let full = counts[0].clone().cast::<i64>();
+    let partial = counts[1].clone().cast::<i64>();
+    assert!(
+        partial < full,
+        "walking from second file should yield fewer entries"
+    );
+    assert!(
+        partial > 0,
+        "walking from second file should still yield entries"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // wal_stats — output contains expected counts
 // ---------------------------------------------------------------------------
 

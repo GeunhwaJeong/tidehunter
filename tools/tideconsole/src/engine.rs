@@ -6,7 +6,7 @@ use tidehunter::WalKind;
 use tidehunter::config::Config;
 use tidehunter::db::Db;
 use tidehunter::key_shape::KeyShape;
-use tidehunter::test_utils::{Metrics, Wal, WalEntry, WalError};
+use tidehunter::test_utils::{Metrics, Wal, WalEntry, WalError, list_wal_files_with_sizes};
 
 // ---------------------------------------------------------------------------
 // Shared console state
@@ -333,15 +333,78 @@ pub fn create_engine(ctx: Arc<Mutex<ConsoleContext>>) -> Engine {
         });
     }
 
+    // --- list_wal_files() ---
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "list_wal_files",
+            move || -> Result<rhai::Array, Box<EvalAltResult>> {
+                let (db_path, config) = {
+                    let ctx = ctx.lock();
+                    match ctx.db_path.clone() {
+                        Some(p) => (p, ctx.config.clone()),
+                        None => {
+                            return Err(
+                                "No database opened. Call open(\"/path/to/db\") first.".into()
+                            );
+                        }
+                    }
+                };
+
+                let wal_file_size = config.wal_layout(WalKind::Replay).wal_file_size;
+
+                let files =
+                    list_wal_files_with_sizes(&db_path).map_err(|e| -> Box<EvalAltResult> {
+                        format!("Failed to list WAL files: {e:?}").into()
+                    })?;
+
+                let result = files
+                    .into_iter()
+                    .map(|(path, size)| {
+                        let file_name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        // File name: "wal_{id:016x}" — parse ID to derive start position.
+                        let id = file_name
+                            .strip_prefix("wal_")
+                            .and_then(|s| u64::from_str_radix(s, 16).ok())
+                            .unwrap_or(0);
+                        let start_pos = (id * wal_file_size) as i64;
+
+                        let created = std::fs::metadata(&path)
+                            .ok()
+                            .and_then(|m| m.created().ok().or_else(|| m.modified().ok()))
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(-1);
+
+                        let mut map = rhai::Map::new();
+                        map.insert("name".into(), Dynamic::from(file_name));
+                        map.insert("start_pos".into(), Dynamic::from(start_pos));
+                        map.insert("size".into(), Dynamic::from(size as i64));
+                        map.insert("created".into(), Dynamic::from(created));
+                        Dynamic::from(map)
+                    })
+                    .collect();
+
+                Ok(result)
+            },
+        );
+    }
+
     // --- help() ---
     engine.register_fn("help", || {
         println!("TideConsole — TideHunter Interactive Shell");
         println!();
         println!("Functions:");
         println!("  open(path)           Open a TideHunter database directory");
-        println!("  walk_wal(visitor)           Walk WAL from the start, calling visitor(entry)");
+        println!("  walk_wal(visitor)            Walk WAL from the start, calling visitor(entry)");
         println!("  walk_wal(start_pos, visitor) Walk WAL from start_pos byte offset");
-        println!("  wal_stats()          Print a WAL entry-type and keyspace summary");
+        println!("  list_wal_files()             List WAL files with start_pos, size, created");
+        println!("  wal_stats()                  Print a WAL entry-type and keyspace summary");
         println!("  help()               Show this message");
         println!();
         println!("Entry fields (available inside walk_wal visitor):");

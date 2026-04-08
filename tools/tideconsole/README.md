@@ -26,6 +26,7 @@ tideconsole
 | `open(path)` | Open a TideHunter database directory |
 | `walk_wal(visitor)` | Walk WAL from the start, calling `visitor(entry)` for each entry |
 | `walk_wal(start_pos, visitor)` | Walk WAL from `start_pos` byte offset |
+| `list_wal_files()` | List WAL files with `start_pos`, `size`, and `created` timestamp |
 | `wal_stats()` | Print entry-type counts and per-keyspace breakdown |
 | `help()` | Show this reference inside the shell |
 
