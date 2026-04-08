@@ -134,5 +134,38 @@ fn bench_wal_walk_read_key(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_wal_walk_count, bench_wal_walk_read_key);
+/// Same bare-count walk but using walk_wal_unchecked (CRC skipped).
+fn bench_wal_walk_skip_crc(c: &mut Criterion) {
+    let mut group = c.benchmark_group("wal_walk/skip_crc");
+
+    for &record_count in &[1_000usize, 10_000, 100_000] {
+        let db = build_bench_db(record_count);
+        let (engine, mut scope) = open_rhai(&db);
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(record_count),
+            &record_count,
+            |b, _| {
+                b.iter(|| {
+                    let count: i64 = engine
+                        .eval_with_scope(
+                            &mut scope,
+                            "let count = 0; walk_wal_unchecked(|entry| { count += 1; }); count",
+                        )
+                        .unwrap();
+                    assert!(count > 0);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_wal_walk_count,
+    bench_wal_walk_read_key,
+    bench_wal_walk_skip_crc
+);
 criterion_main!(benches);

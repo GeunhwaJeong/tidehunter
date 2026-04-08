@@ -40,6 +40,14 @@ impl CrcFrame {
         Ok(data)
     }
 
+    /// Read a frame without verifying the CRC checksum.
+    /// Suitable for offline inspection tools where performance matters more than integrity.
+    pub fn read_unchecked_from_bytes(b: &Bytes, pos: usize) -> Result<Bytes, CrcReadError> {
+        let len = Self::parse_header(b, pos)?;
+        let data = b.slice(Self::data_range(pos, len));
+        Ok(data)
+    }
+
     fn checked_read(b: &[u8], pos: usize) -> Result<usize, CrcReadError> {
         if b.len() < pos + Self::CRC_HEADER_LENGTH {
             return Err(CrcReadError::OutOfBoundsHeader);
@@ -60,6 +68,24 @@ impl CrcFrame {
         let actual_crc = Self::crc(data);
         if actual_crc != crc {
             return Err(CrcReadError::CrcMismatch);
+        }
+        Ok(len)
+    }
+
+    /// Parse length and bounds only — no CRC verification.
+    fn parse_header(b: &[u8], pos: usize) -> Result<usize, CrcReadError> {
+        if b.len() < pos + Self::CRC_HEADER_LENGTH {
+            return Err(CrcReadError::OutOfBoundsHeader);
+        }
+        let mut h = &b[pos..];
+        let len = h.get_u32();
+        let crc = h.get_u32();
+        if len == u32::MAX && crc == u32::MAX {
+            return Err(CrcReadError::SkipMarker);
+        }
+        let len = len as usize;
+        if b.len() < pos + Self::CRC_HEADER_LENGTH + len {
+            return Err(CrcReadError::OutOfBoundsBody(len));
         }
         Ok(len)
     }

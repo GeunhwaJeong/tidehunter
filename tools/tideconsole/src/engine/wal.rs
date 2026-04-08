@@ -15,6 +15,7 @@ pub(crate) fn do_walk_wal<F>(
     db_path: &Path,
     config: &Config,
     start_pos: u64,
+    skip_crc: bool,
     mut f: F,
 ) -> Result<(), Box<EvalAltResult>>
 where
@@ -29,6 +30,7 @@ where
         .map_err(|e| -> Box<EvalAltResult> {
             format!("Failed to create WAL iterator: {e:?}").into()
         })?;
+    iter.set_skip_crc(skip_crc);
 
     loop {
         match iter.next() {
@@ -72,7 +74,7 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
                         }
                     }
                 };
-                do_walk_wal(&db_path, &config, 0, |entry| {
+                do_walk_wal(&db_path, &config, 0, false, |entry| {
                     let _: Dynamic =
                         visitor.call_within_context::<Dynamic>(&native_ctx, (entry,))?;
                     Ok(())
@@ -105,7 +107,69 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
                 let start = u64::try_from(start_pos).map_err(|_| -> Box<EvalAltResult> {
                     "start_pos must be non-negative".into()
                 })?;
-                do_walk_wal(&db_path, &config, start, |entry| {
+                do_walk_wal(&db_path, &config, start, false, |entry| {
+                    let _: Dynamic =
+                        visitor.call_within_context::<Dynamic>(&native_ctx, (entry,))?;
+                    Ok(())
+                })?;
+                Ok(Dynamic::UNIT)
+            },
+        );
+    }
+
+    // --- walk_wal_unchecked(|entry| { ... }) — skips CRC verification ---
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "walk_wal_unchecked",
+            move |native_ctx: NativeCallContext,
+                  visitor: FnPtr|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                let (db_path, config) = {
+                    let ctx = ctx.lock();
+                    match ctx.db_path.clone() {
+                        Some(p) => (p, ctx.config.clone()),
+                        None => {
+                            return Err(
+                                "No database opened. Call open(\"/path/to/db\") first.".into()
+                            );
+                        }
+                    }
+                };
+                do_walk_wal(&db_path, &config, 0, true, |entry| {
+                    let _: Dynamic =
+                        visitor.call_within_context::<Dynamic>(&native_ctx, (entry,))?;
+                    Ok(())
+                })?;
+                Ok(Dynamic::UNIT)
+            },
+        );
+    }
+
+    // --- walk_wal_unchecked(start_pos, |entry| { ... }) ---
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "walk_wal_unchecked",
+            move |native_ctx: NativeCallContext,
+                  start_pos: i64,
+                  visitor: FnPtr|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                let (db_path, config) = {
+                    let ctx = ctx.lock();
+                    match ctx.db_path.clone() {
+                        Some(p) => (p, ctx.config.clone()),
+                        None => {
+                            return Err(
+                                "No database opened. Call open(\"/path/to/db\") first.".into()
+                            );
+                        }
+                    }
+                };
+                let start = u64::try_from(start_pos).map_err(|_| -> Box<EvalAltResult> {
+                    "start_pos must be non-negative".into()
+                })?;
+                do_walk_wal(&db_path, &config, start, true, |entry| {
                     let _: Dynamic =
                         visitor.call_within_context::<Dynamic>(&native_ctx, (entry,))?;
                     Ok(())
@@ -138,7 +202,7 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
             let mut total_bytes = 0usize;
             let mut ks_counts: std::collections::BTreeMap<u8, (usize, usize)> = Default::default(); // ks -> (records, removes)
 
-            do_walk_wal(&db_path, &config, 0, |e| {
+            do_walk_wal(&db_path, &config, 0, false, |e| {
                 total_bytes += e.raw_size as usize;
                 match e.entry_type.as_str() {
                     "record" => {

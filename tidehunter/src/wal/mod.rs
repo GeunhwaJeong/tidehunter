@@ -53,6 +53,7 @@ pub struct WalIterator {
     maps: WalMaps,
     map: Map,
     position: u64,
+    skip_crc: bool,
 }
 
 #[derive(Clone)]
@@ -385,6 +386,7 @@ impl WalIterator {
             wal,
             position,
             map,
+            skip_crc: false,
         })
     }
 
@@ -426,7 +428,21 @@ impl WalIterator {
             };
             self.map = map;
         }
-        Ok(CrcFrame::read_from_bytes(&self.map.data, offset as usize)?)
+        if self.skip_crc {
+            Ok(CrcFrame::read_unchecked_from_bytes(
+                &self.map.data,
+                offset as usize,
+            )?)
+        } else {
+            Ok(CrcFrame::read_from_bytes(&self.map.data, offset as usize)?)
+        }
+    }
+
+    /// Skip CRC verification when reading frames.
+    /// Useful for inspection tools that prioritise speed or need to read potentially
+    /// corrupted WAL files.
+    pub fn set_skip_crc(&mut self, skip_crc: bool) {
+        self.skip_crc = skip_crc;
     }
 
     fn make_map(

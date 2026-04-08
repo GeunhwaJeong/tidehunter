@@ -48,10 +48,10 @@ pub struct Entry {
     pub entry_type: String,
     /// Keyspace ID (u8 widened to i64 for Rhai)
     pub keyspace: i64,
-    /// Key bytes as a lowercase hex string
-    pub key: String,
-    /// Value bytes as a lowercase hex string (empty for non-records)
-    pub value: String,
+    /// Key bytes (hex-encoded lazily when accessed from Rhai)
+    pub key: Vec<u8>,
+    /// Value bytes (hex-encoded lazily when accessed from Rhai; empty for non-records)
+    pub value: Vec<u8>,
     /// Value length in bytes
     pub value_len: i64,
     /// Byte offset of this frame in the WAL
@@ -65,7 +65,11 @@ impl std::fmt::Display for Entry {
         write!(
             f,
             "Entry {{ type: {}, ks: {}, key: {}, value_len: {}, pos: {:#x} }}",
-            self.entry_type, self.keyspace, self.key, self.value_len, self.position
+            self.entry_type,
+            self.keyspace,
+            hex::encode(&self.key),
+            self.value_len,
+            self.position
         )
     }
 }
@@ -77,17 +81,17 @@ pub(crate) fn from_wal_entry(entry: WalEntry, offset: u64, raw_size: usize) -> E
         WalEntry::Record(ks, key, value, _relocated) => Entry {
             entry_type: "record".into(),
             keyspace: ks.as_u8() as i64,
-            key: hex::encode(&key),
             value_len: value.len() as i64,
-            value: hex::encode(&value),
+            key: key.to_vec(),
+            value: value.to_vec(),
             position,
             raw_size,
         },
         WalEntry::Remove(ks, key) => Entry {
             entry_type: "remove".into(),
             keyspace: ks.as_u8() as i64,
-            key: hex::encode(&key),
-            value: String::new(),
+            key: key.to_vec(),
+            value: vec![],
             value_len: 0,
             position,
             raw_size,
@@ -95,8 +99,8 @@ pub(crate) fn from_wal_entry(entry: WalEntry, offset: u64, raw_size: usize) -> E
         WalEntry::Index(ks, _data) => Entry {
             entry_type: "index".into(),
             keyspace: ks.as_u8() as i64,
-            key: String::new(),
-            value: String::new(),
+            key: vec![],
+            value: vec![],
             value_len: 0,
             position,
             raw_size,
@@ -104,8 +108,8 @@ pub(crate) fn from_wal_entry(entry: WalEntry, offset: u64, raw_size: usize) -> E
         WalEntry::BatchStart(size) => Entry {
             entry_type: "batch_start".into(),
             keyspace: 0,
-            key: String::new(),
-            value: String::new(),
+            key: vec![],
+            value: vec![],
             value_len: size as i64,
             position,
             raw_size,
@@ -113,8 +117,8 @@ pub(crate) fn from_wal_entry(entry: WalEntry, offset: u64, raw_size: usize) -> E
         WalEntry::DropCells(ks, _from, _to) => Entry {
             entry_type: "drop_cells".into(),
             keyspace: ks.as_u8() as i64,
-            key: String::new(),
-            value: String::new(),
+            key: vec![],
+            value: vec![],
             value_len: 0,
             position,
             raw_size,
@@ -149,8 +153,8 @@ pub fn create_engine(ctx: Arc<Mutex<ConsoleContext>>) -> Engine {
     engine.register_type_with_name::<Entry>("Entry");
     engine.register_get("entry_type", |e: &mut Entry| e.entry_type.clone());
     engine.register_get("keyspace", |e: &mut Entry| e.keyspace);
-    engine.register_get("key", |e: &mut Entry| e.key.clone());
-    engine.register_get("value", |e: &mut Entry| e.value.clone());
+    engine.register_get("key", |e: &mut Entry| hex::encode(&e.key));
+    engine.register_get("value", |e: &mut Entry| hex::encode(&e.value));
     engine.register_get("value_len", |e: &mut Entry| e.value_len);
     engine.register_get("position", |e: &mut Entry| e.position);
     engine.register_get("raw_size", |e: &mut Entry| e.raw_size);
