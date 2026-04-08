@@ -38,18 +38,20 @@ tideconsole --db /path/to/db --script analysis.rhai
 
 | Function | Description |
 |---|---|
-| `get(ks_id, key_hex)` | Look up a key; returns value as hex string, or `()` if not found |
-| `exists(ks_id, key_hex)` | Returns `true` if the key exists |
-| `scan(ks_id, visitor)` | Iterate all live keys; calls `visitor(key_hex, value_hex)` |
-| `scan(ks_id, lower_hex, visitor)` | Iterate from `lower_hex` bound (inclusive) |
-| `scan(ks_id, lower_hex, upper_hex, visitor)` | Iterate between bounds (upper exclusive) |
+| `get(ks, key_hex)` | Look up a key; returns value as hex string, or `()` if not found |
+| `exists(ks, key_hex)` | Returns `true` if the key exists |
+| `scan(ks, visitor)` | Iterate all live keys; calls `visitor(key_hex, value_hex)` |
+| `scan(ks, lower_hex, visitor)` | Iterate from `lower_hex` bound (inclusive) |
+| `scan(ks, lower_hex, upper_hex, visitor)` | Iterate between bounds (upper exclusive) |
 
 ### Manipulation functions
 
 | Function | Description |
 |---|---|
-| `put(ks_id, key_hex, value_hex)` | Write a key-value record |
-| `delete(ks_id, key_hex)` | Delete a key |
+| `put(ks, key_hex, value_hex)` | Write a key-value record |
+| `delete(ks, key_hex)` | Delete a key |
+
+`ks` accepts either an integer keyspace ID (`0`) or a keyspace name string (`"objects"`).
 
 ### WAL inspection
 

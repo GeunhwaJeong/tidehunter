@@ -44,14 +44,13 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
         );
     }
 
-    // --- get(ks_id, key_hex) → string | () ---
+    // --- get(ks, key_hex) → string | () ---
     {
         let ctx = ctx.clone();
         engine.register_fn(
             "get",
-            move |ks_id: i64, key_hex: &str| -> Result<Dynamic, Box<EvalAltResult>> {
-                let db = require_db(&ctx)?;
-                let ks = KeySpace::new(ks_id as u8);
+            move |ks: Dynamic, key_hex: &str| -> Result<Dynamic, Box<EvalAltResult>> {
+                let (db, ks) = require_db_and_ks(&ctx, ks)?;
                 let key = decode_hex(key_hex)?;
                 let result = db_err(db.get(ks, &key))?;
                 Ok(match result {
@@ -62,28 +61,26 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
         );
     }
 
-    // --- exists(ks_id, key_hex) → bool ---
+    // --- exists(ks, key_hex) → bool ---
     {
         let ctx = ctx.clone();
         engine.register_fn(
             "exists",
-            move |ks_id: i64, key_hex: &str| -> Result<bool, Box<EvalAltResult>> {
-                let db = require_db(&ctx)?;
-                let ks = KeySpace::new(ks_id as u8);
+            move |ks: Dynamic, key_hex: &str| -> Result<bool, Box<EvalAltResult>> {
+                let (db, ks) = require_db_and_ks(&ctx, ks)?;
                 let key = decode_hex(key_hex)?;
                 db_err(db.exists(ks, &key))
             },
         );
     }
 
-    // --- put(ks_id, key_hex, value_hex) ---
+    // --- put(ks, key_hex, value_hex) ---
     {
         let ctx = ctx.clone();
         engine.register_fn(
             "put",
-            move |ks_id: i64, key_hex: &str, value_hex: &str| -> Result<(), Box<EvalAltResult>> {
-                let db = require_db(&ctx)?;
-                let ks = KeySpace::new(ks_id as u8);
+            move |ks: Dynamic, key_hex: &str, value_hex: &str| -> Result<(), Box<EvalAltResult>> {
+                let (db, ks) = require_db_and_ks(&ctx, ks)?;
                 let key = decode_hex(key_hex)?;
                 let value = decode_hex(value_hex)?;
                 db_err(db.insert(ks, key, value))
@@ -91,31 +88,29 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
         );
     }
 
-    // --- delete(ks_id, key_hex) ---
+    // --- delete(ks, key_hex) ---
     {
         let ctx = ctx.clone();
         engine.register_fn(
             "delete",
-            move |ks_id: i64, key_hex: &str| -> Result<(), Box<EvalAltResult>> {
-                let db = require_db(&ctx)?;
-                let ks = KeySpace::new(ks_id as u8);
+            move |ks: Dynamic, key_hex: &str| -> Result<(), Box<EvalAltResult>> {
+                let (db, ks) = require_db_and_ks(&ctx, ks)?;
                 let key = decode_hex(key_hex)?;
                 db_err(db.remove(ks, key))
             },
         );
     }
 
-    // --- scan(ks_id, visitor) ---
+    // --- scan(ks, visitor) ---
     {
         let ctx = ctx.clone();
         engine.register_fn(
             "scan",
             move |native_ctx: NativeCallContext,
-                  ks_id: i64,
+                  ks: Dynamic,
                   visitor: FnPtr|
                   -> Result<Dynamic, Box<EvalAltResult>> {
-                let db = require_db(&ctx)?;
-                let ks = KeySpace::new(ks_id as u8);
+                let (db, ks) = require_db_and_ks(&ctx, ks)?;
                 let mut iter = db.iterator(ks);
                 run_scan_iter(&mut iter, &native_ctx, &visitor)?;
                 Ok(Dynamic::UNIT)
@@ -123,18 +118,17 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
         );
     }
 
-    // --- scan(ks_id, lower_bound_hex, visitor) ---
+    // --- scan(ks, lower_bound_hex, visitor) ---
     {
         let ctx = ctx.clone();
         engine.register_fn(
             "scan",
             move |native_ctx: NativeCallContext,
-                  ks_id: i64,
+                  ks: Dynamic,
                   lower_hex: &str,
                   visitor: FnPtr|
                   -> Result<Dynamic, Box<EvalAltResult>> {
-                let db = require_db(&ctx)?;
-                let ks = KeySpace::new(ks_id as u8);
+                let (db, ks) = require_db_and_ks(&ctx, ks)?;
                 let lower = decode_hex(lower_hex)?;
                 let mut iter = db.iterator(ks);
                 iter.set_lower_bound(lower);
@@ -144,19 +138,18 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
         );
     }
 
-    // --- scan(ks_id, lower_bound_hex, upper_bound_hex, visitor) ---
+    // --- scan(ks, lower_bound_hex, upper_bound_hex, visitor) ---
     {
         let ctx = ctx.clone();
         engine.register_fn(
             "scan",
             move |native_ctx: NativeCallContext,
-                  ks_id: i64,
+                  ks: Dynamic,
                   lower_hex: &str,
                   upper_hex: &str,
                   visitor: FnPtr|
                   -> Result<Dynamic, Box<EvalAltResult>> {
-                let db = require_db(&ctx)?;
-                let ks = KeySpace::new(ks_id as u8);
+                let (db, ks) = require_db_and_ks(&ctx, ks)?;
                 let lower = decode_hex(lower_hex)?;
                 let upper = decode_hex(upper_hex)?;
                 let mut iter = db.iterator(ks);
@@ -174,13 +167,13 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
         println!();
         println!("Functions:");
         println!("  open(path)                           Open a TideHunter database directory");
-        println!("  get(ks_id, key_hex)                  Look up a key; returns value hex or ()");
-        println!("  exists(ks_id, key_hex)               Check if a key exists");
-        println!("  put(ks_id, key_hex, value_hex)       Write a key-value record");
-        println!("  delete(ks_id, key_hex)               Delete a key");
-        println!("  scan(ks_id, visitor)                 Iterate all live keys in a keyspace");
-        println!("  scan(ks_id, lower, visitor)          Iterate from lower bound (inclusive)");
-        println!("  scan(ks_id, lower, upper, visitor)   Iterate between bounds");
+        println!("  get(ks, key_hex)                     Look up a key; returns value hex or ()");
+        println!("  exists(ks, key_hex)                  Check if a key exists");
+        println!("  put(ks, key_hex, value_hex)          Write a key-value record");
+        println!("  delete(ks, key_hex)                  Delete a key");
+        println!("  scan(ks, visitor)                    Iterate all live keys in a keyspace");
+        println!("  scan(ks, lower, visitor)             Iterate from lower bound (inclusive)");
+        println!("  scan(ks, lower, upper, visitor)      Iterate between bounds");
         println!("  walk_wal(visitor)                    Walk WAL from the start");
         println!("  walk_wal(start_pos, visitor)         Walk WAL from start_pos byte offset");
         println!(
@@ -191,12 +184,13 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
         );
         println!("  help()                               Show this message");
         println!();
+        println!("ks accepts an integer keyspace ID (e.g. 0) or a name string (e.g. \"objects\").");
         println!("scan visitor receives (key_hex, value_hex) as separate string arguments.");
         println!("walk_wal visitor receives an Entry object — use entry.key, entry.value, etc.");
         println!();
         println!("Example:");
         println!("  open(\"/data/mydb\");");
-        println!("  scan(0, |key, value| {{");
+        println!("  scan(\"objects\", |key, value| {{");
         println!("      print(key + \" -> \" + value.len() + \" bytes\");");
         println!("  }});");
     });
@@ -206,10 +200,41 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn require_db(ctx: &Arc<Mutex<ConsoleContext>>) -> Result<Arc<Db>, Box<EvalAltResult>> {
-    ctx.lock().db.clone().ok_or_else(|| -> Box<EvalAltResult> {
+/// Resolve a Rhai `Dynamic` value to a `KeySpace`.
+/// Accepts an integer keyspace ID (`i64`) or a keyspace name (`String`).
+fn resolve_ks(ctx: &ConsoleContext, ks: Dynamic) -> Result<KeySpace, Box<EvalAltResult>> {
+    if ks.is::<i64>() {
+        return Ok(KeySpace::new(ks.cast::<i64>() as u8));
+    }
+    if ks.is::<String>() {
+        let name = ks.cast::<String>();
+        let key_shape = ctx
+            .key_shape
+            .as_ref()
+            .ok_or_else(|| -> Box<EvalAltResult> {
+                "No database opened. Call open(\"/path/to/db\") first.".into()
+            })?;
+        return key_shape
+            .iter_ks()
+            .find(|ksd| ksd.name() == name)
+            .map(|ksd| ksd.id())
+            .ok_or_else(|| -> Box<EvalAltResult> {
+                format!("Unknown keyspace \"{name}\"").into()
+            });
+    }
+    Err("ks must be an integer ID or a name string".into())
+}
+
+fn require_db_and_ks(
+    ctx: &Arc<Mutex<ConsoleContext>>,
+    ks: Dynamic,
+) -> Result<(Arc<Db>, KeySpace), Box<EvalAltResult>> {
+    let ctx = ctx.lock();
+    let db = ctx.db.clone().ok_or_else(|| -> Box<EvalAltResult> {
         "No database opened. Call open(\"/path/to/db\") first.".into()
-    })
+    })?;
+    let ks = resolve_ks(&ctx, ks)?;
+    Ok((db, ks))
 }
 
 fn run_scan_iter(

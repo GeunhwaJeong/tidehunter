@@ -261,3 +261,60 @@ fn test_scan_with_lower_and_upper_bound() {
         "upper bound is exclusive"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ks name resolution
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_get_by_ks_name() {
+    let db = setup_db();
+    let (engine, mut scope) = open_engine(&db);
+
+    let key_hex = hex::encode(b"key02___");
+    let expected = hex::encode(vec![2u8; 16]);
+
+    // Use the keyspace name "ks" instead of its integer ID.
+    let result: Dynamic = engine
+        .eval_with_scope(&mut scope, &format!("get(\"ks\", \"{key_hex}\")"))
+        .unwrap();
+
+    assert!(!result.is_unit());
+    assert_eq!(result.cast::<String>(), expected);
+}
+
+#[test]
+fn test_scan_by_ks_name() {
+    let db = setup_db();
+    let (engine, mut scope) = open_engine(&db);
+
+    // ks has 3 live records after 2 deletes.
+    let count: i64 = engine
+        .eval_with_scope(
+            &mut scope,
+            r#"let count = 0; scan("ks", |k, v| { count += 1; }); count"#,
+        )
+        .unwrap();
+
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn test_unknown_ks_name_returns_error() {
+    let db = setup_db();
+    let (engine, mut scope) = open_engine(&db);
+
+    let key_hex = hex::encode(b"key02___");
+    let result = engine
+        .eval_with_scope::<Dynamic>(&mut scope, &format!("get(\"nonexistent\", \"{key_hex}\")"));
+
+    assert!(
+        result.is_err(),
+        "unknown keyspace name should return an error"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("nonexistent"),
+        "error should mention the bad name"
+    );
+}
