@@ -62,6 +62,37 @@ tideconsole --db /path/to/db --script analysis.rhai
 | `list_wal_files()` | List WAL files with `start_pos`, `size`, and `created` timestamp |
 | `wal_stats()` | Print entry-type counts and per-keyspace breakdown |
 
+### Control region inspection
+
+These functions read the `cr` file directly — no WAL replay or `Db::open` required.
+
+| Function | Description |
+|---|---|
+| `load_cr()` | Load the full control region into a Rhai map for scripted inspection |
+
+`load_cr()` returns:
+```
+{
+  "last_position": i64,       // WAL offset at which replay stopped
+  "keyspaces": [              // one entry per keyspace, in keyspace-ID order
+    {
+      "name":  string,
+      "id":    i64,
+      "cells": [              // every cell in the snapshot
+        {
+          "cell_id":        i64 | string,  // integer for Uniform KS, hex for PrefixedUniform
+          "offset":         i64,           // index WAL offset; -1 if no index yet
+          "len":            i64,           // index frame length; 0 if no index yet
+          "last_processed": i64,           // WAL offset up to which the index is current
+        },
+        ...
+      ]
+    },
+    ...
+  ]
+}
+```
+
 ## Entry fields
 
 Inside a `walk_wal` visitor the `entry` object exposes:
@@ -77,6 +108,19 @@ Inside a `walk_wal` visitor the `entry` object exposes:
 | `entry.raw_size` | int | Total frame size including CRC header |
 
 ## Examples
+
+**Inspect the control region:**
+```rhai
+let cr = load_cr();
+print("WAL replay starts at: " + cr.last_position);
+for ks in cr.keyspaces {
+    let valid = 0;
+    for c in ks.cells {
+        if c.offset >= 0 { valid += 1; }
+    }
+    print(ks.name + ": " + ks.cells.len() + " cells, " + valid + " with index");
+}
+```
 
 **Look up a single key:**
 ```rhai

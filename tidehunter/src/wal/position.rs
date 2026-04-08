@@ -132,7 +132,8 @@ impl LastProcessed {
         Self(0)
     }
 
-    pub(crate) fn as_u64(self) -> u64 {
+    #[doc(hidden)] // Used by tools/tideconsole for control region inspection
+    pub fn as_u64(self) -> u64 {
         self.0
     }
 

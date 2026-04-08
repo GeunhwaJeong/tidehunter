@@ -1,3 +1,4 @@
+pub(crate) mod control_region;
 pub(crate) mod db_fns;
 pub(crate) mod wal;
 
@@ -163,6 +164,7 @@ pub fn create_engine(ctx: Arc<Mutex<ConsoleContext>>) -> Engine {
 
     db_fns::register(&mut engine, ctx.clone());
     wal::register(&mut engine, ctx.clone());
+    control_region::register(&mut engine, ctx.clone());
 
     // Redirect Rhai's built-in print/debug through ctx.print_fn so tests can capture it.
     let ctx_print = ctx.clone();

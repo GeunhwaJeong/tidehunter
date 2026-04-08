@@ -176,6 +176,9 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
         println!(
             "  wal_stats()                          Print a WAL entry-type and keyspace summary"
         );
+        println!(
+            "  load_cr()                            Load control region into a Rhai map (no WAL replay)"
+        );
         println!("  help()                               Show this message");
         println!();
         println!("ks accepts an integer keyspace ID (e.g. 0) or a name string (e.g. \"objects\").");

@@ -37,9 +37,14 @@ pub use minibytes;
 pub use index::index_table::IndexWalPosition;
 pub use relocation::{Decision, RelocationStrategy, compute_target_position_from_ratio};
 
+#[doc(hidden)] // Used by tools/tideconsole for control region inspection
+pub use cell::CellId;
+
 // WAL re-exports
 #[doc(hidden)] // Used by tools and benchmarks
 pub use wal::layout::{WalKind, WalLayout};
+#[doc(hidden)] // Used by tools/tideconsole for control region inspection
+pub use wal::position::LastProcessed;
 pub use wal::position::WalPosition;
 #[doc(hidden)] // Used by benchmarks
 pub use wal::{PreparedWalWrite, Wal, WalWriter};

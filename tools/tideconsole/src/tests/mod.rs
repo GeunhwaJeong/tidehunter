@@ -1,3 +1,4 @@
+pub mod control_region_tests;
 pub mod db_tests;
 pub mod wal_tests;
 
