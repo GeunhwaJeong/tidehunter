@@ -57,6 +57,8 @@ pub mod wal_allocator {
 #[cfg(feature = "test-utils")]
 pub mod test_utils {
     pub use crate::db::WalEntry;
+    pub use crate::index::index_format::IndexFormat;
+    pub use crate::index::index_table::IndexTable;
     pub use crate::metrics::Metrics;
     pub use crate::wal::files::list_wal_files_with_sizes;
     pub use crate::wal::layout::WalLayout;

@@ -1,11 +1,14 @@
 use super::{ConsoleContext, Entry, from_wal_entry};
 use parking_lot::Mutex;
-use rhai::{Dynamic, Engine, EvalAltResult, FnPtr, NativeCallContext};
+use rhai::{Dynamic, Engine, EvalAltResult, FnPtr, Map, NativeCallContext};
 use std::path::Path;
 use std::sync::Arc;
 use tidehunter::WalKind;
 use tidehunter::config::Config;
-use tidehunter::test_utils::{Metrics, Wal, WalEntry, WalError, list_wal_files_with_sizes};
+use tidehunter::key_shape::KeySpace;
+use tidehunter::test_utils::{
+    IndexFormat, Metrics, Wal, WalEntry, WalError, list_wal_files_with_sizes,
+};
 
 // ---------------------------------------------------------------------------
 // WAL walking helper (shared by walk_wal and wal_stats)
@@ -253,6 +256,7 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
 
     // --- list_wal_files() ---
     {
+        let ctx = ctx.clone();
         engine.register_fn(
             "list_wal_files",
             move || -> Result<rhai::Array, Box<EvalAltResult>> {
@@ -304,6 +308,108 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
                         map.insert("size".into(), Dynamic::from(size as i64));
                         map.insert("created".into(), Dynamic::from(created));
                         Dynamic::from(map)
+                    })
+                    .collect();
+
+                Ok(result)
+            },
+        );
+    }
+
+    // --- load_index(offset) ---
+    //
+    // Reads the index entry stored in the INDEX WAL at the given byte offset
+    // (as returned by load_cr() cell.offset) and returns the key→data-WAL-position
+    // mapping stored in that on-disk index.
+    //
+    // Returns an array of maps:
+    //   [ { "key": "<hex>", "wal_position": <i64> }, ... ]
+    //
+    // Useful for verifying whether a specific write is reflected in the on-disk index
+    // without doing a full WAL replay.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "load_index",
+            move |offset: i64| -> Result<rhai::Array, Box<EvalAltResult>> {
+                let (db_path, config, key_shape) = {
+                    let ctx = ctx.lock();
+                    match ctx.db_path.clone() {
+                        Some(p) => (p, ctx.config.clone(), ctx.key_shape.clone()),
+                        None => {
+                            return Err(
+                                "No database opened. Call open(\"/path/to/db\") first.".into()
+                            );
+                        }
+                    }
+                };
+                let key_shape = key_shape.ok_or_else(|| -> Box<EvalAltResult> {
+                    "No key shape loaded. Call open(\"/path/to/db\") first.".into()
+                })?;
+
+                if offset < 0 {
+                    return Err(format!("Invalid index offset {offset}: negative offsets indicate no index has been written for this cell").into());
+                }
+                let offset = offset as u64;
+
+                let metrics = Metrics::new();
+                let index_wal = Wal::open(
+                    &db_path,
+                    config.wal_layout(WalKind::Index),
+                    metrics,
+                )
+                .map_err(|e| -> Box<EvalAltResult> {
+                    format!("Failed to open index WAL: {e:?}").into()
+                })?;
+
+                let mut iter = index_wal
+                    .wal_iterator(offset)
+                    .map_err(|e| -> Box<EvalAltResult> {
+                        format!("Failed to create index WAL iterator at offset {offset}: {e:?}")
+                            .into()
+                    })?;
+
+                let (position, raw_bytes) =
+                    iter.next().map_err(|e| -> Box<EvalAltResult> {
+                        format!("Failed to read index WAL entry at offset {offset}: {e:?}").into()
+                    })?;
+
+                if position.offset() != offset {
+                    return Err(format!(
+                        "Index WAL iterator landed at offset {} instead of requested {offset}; \
+                         the offset may not be frame-aligned",
+                        position.offset()
+                    )
+                    .into());
+                }
+
+                let entry = WalEntry::from_bytes(raw_bytes);
+                let (ks_id, bytes) = match entry {
+                    WalEntry::Index(ks, bytes) => (ks, bytes),
+                    other => {
+                        return Err(format!(
+                            "Expected an Index entry at offset {offset} but found {:?}",
+                            std::mem::discriminant(&other)
+                        )
+                        .into());
+                    }
+                };
+
+                let ks_desc = key_shape.ks(KeySpace::new(ks_id.as_u8()));
+                let index_table = ks_desc
+                    .index_format()
+                    .deserialize_index(ks_desc, bytes);
+
+                let result: rhai::Array = index_table
+                    .iter()
+                    .map(|(key, wal_pos)| {
+                        let mut m = Map::new();
+                        m.insert("key".into(), Dynamic::from(hex::encode(&key)));
+                        m.insert(
+                            "wal_position".into(),
+                            Dynamic::from(wal_pos.offset() as i64),
+                        );
+                        Dynamic::from(m)
                     })
                     .collect();
 

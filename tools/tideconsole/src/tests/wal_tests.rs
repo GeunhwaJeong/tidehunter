@@ -359,3 +359,103 @@ fn test_wal_stats_output() {
     assert!(lines.contains('8'), "output should contain record count 8");
     assert!(lines.contains('2'), "output should contain remove count 2");
 }
+
+// ---------------------------------------------------------------------------
+// load_index — reads the on-disk index from the index WAL
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_load_index_returns_entries() {
+    // Build a DB, force a snapshot so there is an on-disk index, then verify
+    // that load_index(offset) returns the expected key entries.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("db");
+    std::fs::create_dir_all(&path).unwrap();
+
+    let mut builder = KeyShapeBuilder::new();
+    let ks = builder.add_key_space("objects", 8, 16, KeyType::uniform(8));
+    let key_shape = builder.build();
+    let config = Arc::new(Config::default());
+    let db = Db::open(&path, key_shape, config, Metrics::new()).unwrap();
+
+    // Write a few records so the index is non-empty after a snapshot.
+    let mut batch = db.write_batch();
+    for i in 0..3u8 {
+        batch.write(ks, format!("key{i:02}___").into_bytes(), vec![i; 16]);
+    }
+    batch.commit().unwrap();
+    db.force_rebuild_control_region().unwrap();
+    drop(db);
+
+    let ctx = Arc::new(Mutex::new(ConsoleContext {
+        print_fn: Arc::new(|_| {}),
+        ..ConsoleContext::default()
+    }));
+    let engine = create_engine(ctx);
+    let mut scope = Scope::new();
+    let db_path = path.display().to_string();
+    let _: Dynamic = engine
+        .eval_with_scope::<Dynamic>(&mut scope, &format!("open(\"{db_path}\")"))
+        .unwrap();
+
+    // Use load_cr() to find a cell with a valid index offset, then call load_index().
+    let script = r#"
+        let cr = load_cr();
+        let idx_offset = -1;
+        for ks in cr.keyspaces {
+            if ks.name == "objects" {
+                for c in ks.cells {
+                    if c.offset >= 0 {
+                        idx_offset = c.offset;
+                        break;
+                    }
+                }
+            }
+        }
+        idx_offset
+    "#;
+    let idx_offset: i64 = engine.eval_with_scope(&mut scope, script).unwrap();
+    assert!(
+        idx_offset >= 0,
+        "expected at least one cell with a valid index offset after snapshot"
+    );
+
+    // load_index should return an array of maps with "key" and "wal_position" fields.
+    let entries: Array = engine
+        .eval_with_scope(&mut scope, &format!("load_index({idx_offset})"))
+        .unwrap();
+
+    // The snapshot was forced, so all 3 keys should appear across the cells.
+    // Here we just check the structure of one entry.
+    assert!(
+        !entries.is_empty(),
+        "expected at least one entry in the index at offset {idx_offset}"
+    );
+    let first = entries[0].clone().cast::<rhai::Map>();
+    assert!(
+        first.contains_key("key"),
+        "each entry should have a 'key' field"
+    );
+    assert!(
+        first.contains_key("wal_position"),
+        "each entry should have a 'wal_position' field"
+    );
+    let key_hex = first["key"].clone().cast::<String>();
+    assert!(!key_hex.is_empty(), "key hex string should be non-empty");
+    let wal_pos: i64 = first["wal_position"].clone().cast::<i64>();
+    assert!(wal_pos >= 0, "wal_position should be non-negative");
+}
+
+#[test]
+fn test_load_index_invalid_offset() {
+    let db = setup_db();
+    let (engine, mut scope) = open_engine(&db);
+
+    // -1 means "no index" — should return an error.
+    let result = engine.eval_with_scope::<Array>(&mut scope, "load_index(-1)");
+    assert!(result.is_err(), "load_index(-1) should fail");
+    assert!(
+        result.unwrap_err().to_string().contains("negative"),
+        "error should mention negative offset"
+    );
+}
