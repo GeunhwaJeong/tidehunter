@@ -54,7 +54,12 @@ fn setup_db() -> TestDb {
 
     drop(db);
 
-    TestDb { _dir: dir, path, ks, ks2 }
+    TestDb {
+        _dir: dir,
+        path,
+        ks,
+        ks2,
+    }
 }
 
 /// Build an engine+scope with the test DB already opened and stdout silenced.
@@ -108,15 +113,21 @@ fn test_walk_wal_total_entry_counts() {
             &mut scope,
             r#"
             let types = [];
-            walk_wal(|entry| { types.push(entry.enatry_type); });
+            walk_wal(|entry| { types.push(entry.entry_type); });
             types
             "#,
         )
         .unwrap();
 
     let type_strings: Vec<String> = result.into_iter().map(|d| d.cast::<String>()).collect();
-    let records = type_strings.iter().filter(|s| s.as_str() == "record").count();
-    let removes = type_strings.iter().filter(|s| s.as_str() == "remove").count();
+    let records = type_strings
+        .iter()
+        .filter(|s| s.as_str() == "record")
+        .count();
+    let removes = type_strings
+        .iter()
+        .filter(|s| s.as_str() == "remove")
+        .count();
 
     assert_eq!(records, 8, "5 ks records + 3 ks2 records");
     assert_eq!(removes, 2, "2 removes on ks");
@@ -224,6 +235,52 @@ fn test_walk_wal_remove_keys() {
     assert_eq!(keys.len(), 2);
     assert!(keys.contains(&hex::encode(b"key00___")));
     assert!(keys.contains(&hex::encode(b"key01___")));
+}
+
+// ---------------------------------------------------------------------------
+// walk_wal(start_pos, visitor) — resumes from a given WAL offset
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_walk_wal_from_position() {
+    let db = setup_db();
+    let (engine, mut scope) = open_engine(&db);
+
+    // First pass: collect all entry positions to get the offset after the first entry.
+    let all_positions: Array = engine
+        .eval_with_scope(
+            &mut scope,
+            r#"
+            let positions = [];
+            walk_wal(|entry| { positions.push(entry.position); });
+            positions
+            "#,
+        )
+        .unwrap();
+    assert!(
+        all_positions.len() >= 2,
+        "need at least 2 entries to test seeking"
+    );
+    let total = all_positions.len();
+
+    // The second entry's position is where we want to resume from.
+    let resume_pos = all_positions[1].clone().cast::<i64>();
+
+    // Second pass: walk from that position and count entries seen.
+    let snippet = format!(
+        r#"
+        let count = 0;
+        walk_wal({resume_pos}, |entry| {{ count += 1; }});
+        count
+        "#
+    );
+    let count_from_pos = engine.eval_with_scope::<i64>(&mut scope, &snippet).unwrap();
+
+    assert_eq!(
+        count_from_pos,
+        (total - 1) as i64,
+        "walking from the second entry's position should skip exactly one entry"
+    );
 }
 
 // ---------------------------------------------------------------------------

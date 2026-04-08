@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "tideconsole", about = "Interactive Rhai shell for TideHunter databases")]
+#[command(
+    name = "tideconsole",
+    about = "Interactive Rhai shell for TideHunter databases"
+)]
 struct Cli {
     /// Path to a TideHunter database directory to open on startup
     #[arg(short, long)]

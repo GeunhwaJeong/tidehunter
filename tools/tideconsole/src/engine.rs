@@ -121,7 +121,12 @@ fn from_wal_entry(entry: WalEntry, offset: u64, raw_size: usize) -> Entry {
 // WAL walking helper (shared by walk_wal and wal_stats)
 // ---------------------------------------------------------------------------
 
-fn do_walk_wal<F>(db_path: &Path, config: &Config, mut f: F) -> Result<(), Box<EvalAltResult>>
+fn do_walk_wal<F>(
+    db_path: &Path,
+    config: &Config,
+    start_pos: u64,
+    mut f: F,
+) -> Result<(), Box<EvalAltResult>>
 where
     F: FnMut(Entry) -> Result<(), Box<EvalAltResult>>,
 {
@@ -130,8 +135,10 @@ where
         .map_err(|e| -> Box<EvalAltResult> { format!("Failed to open WAL: {e:?}").into() })?;
 
     let mut iter = wal
-        .wal_iterator(0)
-        .map_err(|e| -> Box<EvalAltResult> { format!("Failed to create WAL iterator: {e:?}").into() })?;
+        .wal_iterator(start_pos)
+        .map_err(|e| -> Box<EvalAltResult> {
+            format!("Failed to create WAL iterator: {e:?}").into()
+        })?;
 
     loop {
         match iter.next() {
@@ -178,8 +185,8 @@ pub fn create_engine(ctx: Arc<Mutex<ConsoleContext>>) -> Engine {
             move |path: &str| -> Result<(), Box<EvalAltResult>> {
                 let db_path = PathBuf::from(path);
                 let config = Db::load_config(&db_path).unwrap_or_default();
-                let key_shape = Db::load_key_shape(&db_path)
-                    .map_err(|e| -> Box<EvalAltResult> {
+                let key_shape =
+                    Db::load_key_shape(&db_path).map_err(|e| -> Box<EvalAltResult> {
                         format!("Failed to load key shape: {e:?}").into()
                     })?;
                 let mut ctx = ctx.lock();
@@ -207,12 +214,46 @@ pub fn create_engine(ctx: Arc<Mutex<ConsoleContext>>) -> Engine {
                         None => {
                             return Err(
                                 "No database opened. Call open(\"/path/to/db\") first.".into()
-                            )
+                            );
                         }
                     }
                 };
-                do_walk_wal(&db_path, &config, |entry| {
-                    let _: Dynamic = visitor.call_within_context::<Dynamic>(&native_ctx, (entry,))?;
+                do_walk_wal(&db_path, &config, 0, |entry| {
+                    let _: Dynamic =
+                        visitor.call_within_context::<Dynamic>(&native_ctx, (entry,))?;
+                    Ok(())
+                })?;
+                Ok(Dynamic::UNIT)
+            },
+        );
+    }
+
+    // --- walk_wal(start_pos, |entry| { ... }) ---
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "walk_wal",
+            move |native_ctx: NativeCallContext,
+                  start_pos: i64,
+                  visitor: FnPtr|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                let (db_path, config) = {
+                    let ctx = ctx.lock();
+                    match ctx.db_path.clone() {
+                        Some(p) => (p, ctx.config.clone()),
+                        None => {
+                            return Err(
+                                "No database opened. Call open(\"/path/to/db\") first.".into()
+                            );
+                        }
+                    }
+                };
+                let start = u64::try_from(start_pos).map_err(|_| -> Box<EvalAltResult> {
+                    "start_pos must be non-negative".into()
+                })?;
+                do_walk_wal(&db_path, &config, start, |entry| {
+                    let _: Dynamic =
+                        visitor.call_within_context::<Dynamic>(&native_ctx, (entry,))?;
                     Ok(())
                 })?;
                 Ok(Dynamic::UNIT)
@@ -223,72 +264,73 @@ pub fn create_engine(ctx: Arc<Mutex<ConsoleContext>>) -> Engine {
     // --- wal_stats() ---
     {
         let ctx = ctx.clone();
-        engine.register_fn(
-            "wal_stats",
-            move || -> Result<(), Box<EvalAltResult>> {
-                let (db_path, config, key_shape, print) = {
-                    let ctx = ctx.lock();
-                    match ctx.db_path.clone() {
-                        Some(p) => (p, ctx.config.clone(), ctx.key_shape.clone(), ctx.print_fn.clone()),
-                        None => {
-                            return Err(
-                                "No database opened. Call open(\"/path/to/db\") first.".into()
-                            )
-                        }
-                    }
-                };
-
-                let mut counts = [0usize; 5]; // record, remove, index, batch_start, drop_cells
-                let mut total_bytes = 0usize;
-                let mut ks_counts: std::collections::BTreeMap<u8, (usize, usize)> =
-                    Default::default(); // ks -> (records, removes)
-
-                do_walk_wal(&db_path, &config, |e| {
-                    total_bytes += e.raw_size as usize;
-                    match e.entry_type.as_str() {
-                        "record" => {
-                            counts[0] += 1;
-                            ks_counts.entry(e.keyspace as u8).or_default().0 += 1;
-                        }
-                        "remove" => {
-                            counts[1] += 1;
-                            ks_counts.entry(e.keyspace as u8).or_default().1 += 1;
-                        }
-                        "index" => counts[2] += 1,
-                        "batch_start" => counts[3] += 1,
-                        "drop_cells" => counts[4] += 1,
-                        _ => {}
-                    }
-                    Ok(())
-                })?;
-
-                let total = counts.iter().sum::<usize>();
-                print("WAL Statistics");
-                print("==============");
-                print(&format!("  Total entries : {total}"));
-                print(&format!("  Total bytes   : {total_bytes}"));
-                print(&format!("  Records       : {}", counts[0]));
-                print(&format!("  Removes       : {}", counts[1]));
-                print(&format!("  Index         : {}", counts[2]));
-                print(&format!("  BatchStart    : {}", counts[3]));
-                print(&format!("  DropCells     : {}", counts[4]));
-
-                if !ks_counts.is_empty() {
-                    print("\nPer-keyspace (records / removes):");
-                    for (ks_id, (recs, rems)) in &ks_counts {
-                        let name = key_shape
-                            .as_ref()
-                            .map(|ks| {
-                                let space = tidehunter::key_shape::KeySpace::new(*ks_id);
-                                ks.ks(space).name().to_string()
-                            })
-                            .unwrap_or_else(|| format!("ks{ks_id}"));
-                        print(&format!("  {name:35} records={recs:>10}  removes={rems:>10}"));
+        engine.register_fn("wal_stats", move || -> Result<(), Box<EvalAltResult>> {
+            let (db_path, config, key_shape, print) = {
+                let ctx = ctx.lock();
+                match ctx.db_path.clone() {
+                    Some(p) => (
+                        p,
+                        ctx.config.clone(),
+                        ctx.key_shape.clone(),
+                        ctx.print_fn.clone(),
+                    ),
+                    None => {
+                        return Err("No database opened. Call open(\"/path/to/db\") first.".into());
                     }
                 }
+            };
+
+            let mut counts = [0usize; 5]; // record, remove, index, batch_start, drop_cells
+            let mut total_bytes = 0usize;
+            let mut ks_counts: std::collections::BTreeMap<u8, (usize, usize)> = Default::default(); // ks -> (records, removes)
+
+            do_walk_wal(&db_path, &config, 0, |e| {
+                total_bytes += e.raw_size as usize;
+                match e.entry_type.as_str() {
+                    "record" => {
+                        counts[0] += 1;
+                        ks_counts.entry(e.keyspace as u8).or_default().0 += 1;
+                    }
+                    "remove" => {
+                        counts[1] += 1;
+                        ks_counts.entry(e.keyspace as u8).or_default().1 += 1;
+                    }
+                    "index" => counts[2] += 1,
+                    "batch_start" => counts[3] += 1,
+                    "drop_cells" => counts[4] += 1,
+                    _ => {}
+                }
                 Ok(())
-            },
-        );
+            })?;
+
+            let total = counts.iter().sum::<usize>();
+            print("WAL Statistics");
+            print("==============");
+            print(&format!("  Total entries : {total}"));
+            print(&format!("  Total bytes   : {total_bytes}"));
+            print(&format!("  Records       : {}", counts[0]));
+            print(&format!("  Removes       : {}", counts[1]));
+            print(&format!("  Index         : {}", counts[2]));
+            print(&format!("  BatchStart    : {}", counts[3]));
+            print(&format!("  DropCells     : {}", counts[4]));
+
+            if !ks_counts.is_empty() {
+                print("\nPer-keyspace (records / removes):");
+                for (ks_id, (recs, rems)) in &ks_counts {
+                    let name = key_shape
+                        .as_ref()
+                        .map(|ks| {
+                            let space = tidehunter::key_shape::KeySpace::new(*ks_id);
+                            ks.ks(space).name().to_string()
+                        })
+                        .unwrap_or_else(|| format!("ks{ks_id}"));
+                    print(&format!(
+                        "  {name:35} records={recs:>10}  removes={rems:>10}"
+                    ));
+                }
+            }
+            Ok(())
+        });
     }
 
     // --- help() ---
@@ -297,7 +339,8 @@ pub fn create_engine(ctx: Arc<Mutex<ConsoleContext>>) -> Engine {
         println!();
         println!("Functions:");
         println!("  open(path)           Open a TideHunter database directory");
-        println!("  walk_wal(visitor)    Walk every WAL entry, calling visitor(entry)");
+        println!("  walk_wal(visitor)           Walk WAL from the start, calling visitor(entry)");
+        println!("  walk_wal(start_pos, visitor) Walk WAL from start_pos byte offset");
         println!("  wal_stats()          Print a WAL entry-type and keyspace summary");
         println!("  help()               Show this message");
         println!();
@@ -370,4 +413,3 @@ pub fn init_scope_with_db(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
-
