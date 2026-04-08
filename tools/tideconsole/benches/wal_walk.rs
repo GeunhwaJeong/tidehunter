@@ -118,7 +118,7 @@ fn bench_wal_walk_read_key(c: &mut Criterion) {
                             r#"
                             let count = 0;
                             walk_wal(|entry| {
-                                let _ = entry.key;
+                                let k = entry.key;
                                 count += 1;
                             });
                             count
