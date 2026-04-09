@@ -280,6 +280,36 @@ pub fn create_engine(ctx: Arc<Mutex<ConsoleContext>>) -> Engine {
     control_region::register(&mut engine);
     verify::register(&mut engine);
 
+    // --- Scripting helpers (useful in test scripts and interactive sessions) ---
+    engine.register_fn(
+        "assert",
+        |condition: bool, msg: &str| -> Result<(), Box<EvalAltResult>> {
+            if !condition {
+                Err(format!("Assertion failed: {msg}").into())
+            } else {
+                Ok(())
+            }
+        },
+    );
+    engine.register_fn(
+        "assert_eq",
+        |lhs: Dynamic, rhs: Dynamic, msg: &str| -> Result<(), Box<EvalAltResult>> {
+            let l = lhs.to_string();
+            let r = rhs.to_string();
+            if l != r {
+                Err(format!("Assertion failed ({msg}): {l:?} != {r:?}").into())
+            } else {
+                Ok(())
+            }
+        },
+    );
+    // to_hex("key02___") → hex string of the UTF-8 bytes
+    engine.register_fn("to_hex", |s: &str| hex::encode(s.as_bytes()));
+    // bytes_hex(16, 2) → hex string of 16 bytes all equal to 2
+    engine.register_fn("bytes_hex", |count: i64, byte_val: i64| {
+        hex::encode(vec![byte_val as u8; count as usize])
+    });
+
     // Redirect Rhai's built-in print/debug through ctx.print_fn so tests can capture it.
     let ctx_print = ctx.clone();
     engine.on_print(move |s| (ctx_print.lock().print_fn)(s));

@@ -1,4 +1,4 @@
-use super::{open_engine, setup_db};
+use super::{run_rhai_test, setup_db};
 use crate::engine::{ConsoleContext, create_engine, is_complete};
 use parking_lot::Mutex;
 use rhai::{Array, Dynamic, Scope};
@@ -32,191 +32,41 @@ fn test_is_complete_multiline_complete() {
 }
 
 // ---------------------------------------------------------------------------
-// walk_wal — entry counts
+// walk_wal — rhai-file tests
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_walk_wal_total_entry_counts() {
-    let db = setup_db();
-    let (engine, mut scope) = open_engine(&db);
-
-    let result: Array = engine
-        .eval_with_scope(
-            &mut scope,
-            r#"
-            let types = [];
-            db.walk_wal(|entry| { types.push(entry.entry_type); });
-            types
-            "#,
-        )
-        .unwrap();
-
-    let type_strings: Vec<String> = result.into_iter().map(|d| d.cast::<String>()).collect();
-    let records = type_strings
-        .iter()
-        .filter(|s| s.as_str() == "record")
-        .count();
-    let removes = type_strings
-        .iter()
-        .filter(|s| s.as_str() == "remove")
-        .count();
-
-    assert_eq!(records, 8, "5 ks records + 3 ks2 records");
-    assert_eq!(removes, 2, "2 removes on ks");
+    run_rhai_test(&setup_db(), "walk_wal_entry_counts.rhai");
 }
-
-// ---------------------------------------------------------------------------
-// walk_wal — filtering by keyspace
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_walk_wal_filter_by_keyspace() {
-    let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
-    let ks2_id = db.ks2.as_u8() as i64;
-    let (engine, mut scope) = open_engine(&db);
-
-    let snippet = format!(
-        r#"
-        let ks_records = 0;
-        let ks2_records = 0;
-        db.walk_wal(|entry| {{
-            if entry.entry_type == "record" {{
-                if entry.keyspace == {ks_id} {{ ks_records += 1; }}
-                if entry.keyspace == {ks2_id} {{ ks2_records += 1; }}
-            }}
-        }});
-        [ks_records, ks2_records]
-        "#
-    );
-
-    let result: Array = engine.eval_with_scope(&mut scope, &snippet).unwrap();
-    let counts: Vec<i64> = result.into_iter().map(|d| d.cast::<i64>()).collect();
-
-    assert_eq!(counts[0], 5, "5 records in ks");
-    assert_eq!(counts[1], 3, "3 records in ks2");
+    run_rhai_test(&setup_db(), "walk_wal_filter_by_keyspace.rhai");
 }
-
-// ---------------------------------------------------------------------------
-// walk_wal — entry field values for a known record
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_walk_wal_record_fields() {
-    let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
-    let (engine, mut scope) = open_engine(&db);
-
-    let snippet = format!(
-        r#"
-        let found = #{{}};
-        db.walk_wal(|entry| {{
-            if entry.entry_type == "record" && entry.keyspace == {ks_id} && found.is_empty() {{
-                found = #{{
-                    "key_len": entry.key.len(),
-                    "value_len": entry.value_len,
-                    "value_hex_len": entry.value.len(),
-                    "raw_size_positive": entry.raw_size > 0,
-                    "position_non_neg": entry.position >= 0,
-                }};
-            }}
-        }});
-        found
-        "#
-    );
-
-    let result = engine
-        .eval_with_scope::<Dynamic>(&mut scope, &snippet)
-        .unwrap();
-    let map = result.cast::<rhai::Map>();
-
-    // key "key00___" = 8 bytes → 16 hex chars
-    assert_eq!(map["key_len"].clone().cast::<i64>(), 16);
-    // value is vec![0u8; 16] → 16 bytes → 32 hex chars
-    assert_eq!(map["value_len"].clone().cast::<i64>(), 16);
-    assert_eq!(map["value_hex_len"].clone().cast::<i64>(), 32);
-    assert!(map["raw_size_positive"].clone().cast::<bool>());
-    assert!(map["position_non_neg"].clone().cast::<bool>());
+    run_rhai_test(&setup_db(), "walk_wal_record_fields.rhai");
 }
-
-// ---------------------------------------------------------------------------
-// walk_wal — remove entry key round-trip
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_walk_wal_remove_keys() {
-    let db = setup_db();
-    let ks_id = db.ks.as_u8() as i64;
-    let (engine, mut scope) = open_engine(&db);
-
-    let snippet = format!(
-        r#"
-        let remove_keys = [];
-        db.walk_wal(|entry| {{
-            if entry.entry_type == "remove" && entry.keyspace == {ks_id} {{
-                remove_keys.push(entry.key);
-            }}
-        }});
-        remove_keys
-        "#
-    );
-
-    let result: Array = engine.eval_with_scope(&mut scope, &snippet).unwrap();
-    let keys: Vec<String> = result.into_iter().map(|d| d.cast::<String>()).collect();
-
-    assert_eq!(keys.len(), 2);
-    assert!(keys.contains(&hex::encode(b"key00___")));
-    assert!(keys.contains(&hex::encode(b"key01___")));
+    run_rhai_test(&setup_db(), "walk_wal_remove_keys.rhai");
 }
-
-// ---------------------------------------------------------------------------
-// walk_wal(start_pos, visitor) — resumes from a given WAL offset
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_walk_wal_from_position() {
-    let db = setup_db();
-    let (engine, mut scope) = open_engine(&db);
+    run_rhai_test(&setup_db(), "walk_wal_from_position.rhai");
+}
 
-    // First pass: collect all entry positions to get the offset after the first entry.
-    let all_positions: Array = engine
-        .eval_with_scope(
-            &mut scope,
-            r#"
-            let positions = [];
-            db.walk_wal(|entry| { positions.push(entry.position); });
-            positions
-            "#,
-        )
-        .unwrap();
-    assert!(
-        all_positions.len() >= 2,
-        "need at least 2 entries to test seeking"
-    );
-    let total = all_positions.len();
-
-    // The second entry's position is where we want to resume from.
-    let resume_pos = all_positions[1].clone().cast::<i64>();
-
-    // Second pass: walk from that position and count entries seen.
-    let snippet = format!(
-        r#"
-        let count = 0;
-        db.walk_wal({resume_pos}, |entry| {{ count += 1; }});
-        count
-        "#
-    );
-    let count_from_pos = engine.eval_with_scope::<i64>(&mut scope, &snippet).unwrap();
-
-    assert_eq!(
-        count_from_pos,
-        (total - 1) as i64,
-        "walking from the second entry's position should skip exactly one entry"
-    );
+#[test]
+fn test_load_index_invalid_offset() {
+    run_rhai_test(&setup_db(), "load_index_invalid_offset.rhai");
 }
 
 // ---------------------------------------------------------------------------
-// list_wal_files — multi-file WAL
+// list_wal_files — custom DB setup (tiny wal_file_size)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -272,11 +122,9 @@ fn test_list_wal_files() {
     for (i, entry) in files.iter().enumerate() {
         let map = entry.clone().cast::<rhai::Map>();
 
-        // name field is present and looks like a WAL file
         let name = map["name"].clone().cast::<String>();
         assert!(name.starts_with("wal_"), "unexpected file name: {name}");
 
-        // start_pos for file i = i * wal_file_size
         let expected_start = (i as i64) * (wal_file_size as i64);
         assert_eq!(
             map["start_pos"].clone().cast::<i64>(),
@@ -284,13 +132,11 @@ fn test_list_wal_files() {
             "file {i} start_pos mismatch"
         );
 
-        // size is positive
         assert!(
             map["size"].clone().cast::<i64>() > 0,
             "file {i} size should be positive"
         );
 
-        // created timestamp is a plausible Unix epoch second (after year 2000)
         let created = map["created"].clone().cast::<i64>();
         assert!(
             created > 946_684_800,
@@ -298,8 +144,6 @@ fn test_list_wal_files() {
         );
     }
 
-    // Verify start_pos can be fed into db.walk_wal: walking from the second file's
-    // start_pos must produce fewer entries than walking from position 0.
     let second_start = files[1].clone().cast::<rhai::Map>()["start_pos"]
         .clone()
         .cast::<i64>();
@@ -326,7 +170,7 @@ fn test_list_wal_files() {
 }
 
 // ---------------------------------------------------------------------------
-// wal_stats — output contains expected counts
+// wal_stats — output capture test
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -349,7 +193,6 @@ fn test_wal_stats_output() {
         .unwrap();
 
     let lines = output.lock().join("\n");
-    // Entry type breakdown
     assert!(
         lines.contains("Record"),
         "output should mention Record type"
@@ -358,10 +201,8 @@ fn test_wal_stats_output() {
         lines.contains("Remove"),
         "output should mention Remove type"
     );
-    // Counts: 8 records total (5 ks + 3 ks2), 2 removes
     assert!(lines.contains('8'), "output should contain record count 8");
     assert!(lines.contains('2'), "output should contain remove count 2");
-    // New sections
     assert!(
         lines.contains("Key Statistics"),
         "output should include Key Statistics section"
@@ -373,13 +214,11 @@ fn test_wal_stats_output() {
 }
 
 // ---------------------------------------------------------------------------
-// load_index — reads the on-disk index from the index WAL
+// load_index — custom DB setup (requires force_rebuild_control_region)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_load_index_returns_entries() {
-    // Build a DB, force a snapshot so there is an on-disk index, then verify
-    // that db.load_index(offset) returns the expected key entries.
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("db");
     std::fs::create_dir_all(&path).unwrap();
@@ -390,7 +229,6 @@ fn test_load_index_returns_entries() {
     let config = Arc::new(Config::default());
     let db = Db::open(&path, key_shape, config, Metrics::new()).unwrap();
 
-    // Write a few records so the index is non-empty after a snapshot.
     let mut batch = db.write_batch();
     for i in 0..3u8 {
         batch.write(ks, format!("key{i:02}___").into_bytes(), vec![i; 16]);
@@ -409,7 +247,6 @@ fn test_load_index_returns_entries() {
         .eval_with_scope::<Dynamic>(&mut scope, &format!("let db = open(\"{db_path}\")"))
         .unwrap();
 
-    // Use db.load_cr() to find a cell with a valid index offset, then call db.load_index().
     let script = r#"
         let cr = db.load_cr();
         let idx_offset = -1;
@@ -431,13 +268,10 @@ fn test_load_index_returns_entries() {
         "expected at least one cell with a valid index offset after snapshot"
     );
 
-    // db.load_index should return an array of maps with "key" and "wal_position" fields.
     let entries: Array = engine
         .eval_with_scope(&mut scope, &format!("db.load_index({idx_offset})"))
         .unwrap();
 
-    // The snapshot was forced, so all 3 keys should appear across the cells.
-    // Here we just check the structure of one entry.
     assert!(
         !entries.is_empty(),
         "expected at least one entry in the index at offset {idx_offset}"
@@ -461,18 +295,4 @@ fn test_load_index_returns_entries() {
     assert!(wal_pos >= 0, "wal_position should be non-negative");
     let payload_len: i64 = first["payload_len"].clone().cast::<i64>();
     assert!(payload_len >= 0, "payload_len should be non-negative");
-}
-
-#[test]
-fn test_load_index_invalid_offset() {
-    let db = setup_db();
-    let (engine, mut scope) = open_engine(&db);
-
-    // -1 means "no index" — should return an error.
-    let result = engine.eval_with_scope::<Array>(&mut scope, "db.load_index(-1)");
-    assert!(result.is_err(), "db.load_index(-1) should fail");
-    assert!(
-        result.unwrap_err().to_string().contains("negative"),
-        "error should mention negative offset"
-    );
 }
