@@ -94,8 +94,13 @@ fn count_open_file_descriptors(db_path: &Path) -> usize {
 }
 
 /// Opens a database with the given configuration and starts periodic snapshots.
-fn open_db_with_snapshots(db_path: &Path, key_shape: KeyShape, config: Arc<Config>) -> Arc<Db> {
-    let db = Db::open(db_path, key_shape, config, Metrics::new()).unwrap();
+fn open_db_with_snapshots(
+    db_path: &Path,
+    key_shape: KeyShape,
+    config: Arc<Config>,
+    metrics: Arc<Metrics>,
+) -> Arc<Db> {
+    let db = Db::open(db_path, key_shape, config, metrics).unwrap();
     db.start_periodic_snapshot();
     db
 }
@@ -125,14 +130,20 @@ fn main() {
     let mut config = Config::small();
     config.max_dirty_keys = 4;
     config.snapshot_unload_threshold = 1024;
+    config.snapshot_written_bytes = 4 * 1024 * 1024; // 4 MB — trigger snapshots frequently
     let config = Arc::new(config);
+
     let (key_shape, key_space) = KeyShape::new_single(1, 8, KeyType::uniform(1));
+
+    // Shared metrics across restarts so relocation counters accumulate
+    let shared_metrics = Metrics::new();
 
     // Wrap database in RwLock with Option to allow safe restarts
     let db = Arc::new(RwLock::new(Some(open_db_with_snapshots(
         temp_dir.path(),
         key_shape.clone(),
         config.clone(),
+        shared_metrics.clone(),
     ))));
 
     // Track number of database restarts and rebuilds for debugging
@@ -191,6 +202,7 @@ fn main() {
         let db_path = db_path.clone();
         let key_shape = key_shape.clone();
         let config = config.clone();
+        let shared_metrics = shared_metrics.clone();
 
         // Create progress bar for this thread
         let thread_pb = multi_progress.add(ProgressBar::new(operations_per_thread as u64));
@@ -269,12 +281,20 @@ fn main() {
                             &db_path,
                             key_shape.clone(),
                             config.clone(),
+                            shared_metrics.clone(),
                         ));
 
                         restart_count.fetch_add(1, Ordering::Relaxed);
                     }
                     // Lock is automatically released when db_write goes out of scope
                 }
+                // 0.1% chance to trigger explicit WAL-based relocation
+                if rng.gen_range(0..1000u32) < 1 {
+                    let db_read = db.read();
+                    let db_instance = db_read.as_ref().unwrap();
+                    db_instance.start_relocation().unwrap();
+                }
+
                 // Pick a random key from our fixed set to ensure overlapping access
                 let key_index = rng.gen_range(0..keys.len());
                 let key = keys[key_index].clone();
@@ -480,13 +500,12 @@ fn main() {
         rebuild_count.load(Ordering::Relaxed)
     );
 
-    // Print snapshot_force_unload metric to see impact of config changes
+    // Print metrics
     let db_read = db.read();
     let db_instance = db_read.as_ref().unwrap();
-    let metrics = db_instance.test_get_metrics();
     println!(
         "  Wal size: {}",
-        human_readable_bytes(metrics.wal_written_bytes.get() as u64)
+        human_readable_bytes(shared_metrics.wal_written_bytes.get() as u64)
     );
     let replay_from = db_instance.test_get_replay_from();
     println!(
@@ -494,11 +513,42 @@ fn main() {
         replay_from,
         human_readable_bytes(replay_from)
     );
-    let force_unload_count = metrics
+    let force_unload = shared_metrics
         .snapshot_force_unload
-        .with_label_values(&[db_instance.ks_name(key_space)])
+        .with_label_values(&["main"])
         .get();
-    println!("  snapshot_force_unload metric: {force_unload_count}");
+    println!("  snapshot_force_unload: {force_unload}");
+
+    let forced_relocation = shared_metrics
+        .snapshot_forced_relocation
+        .with_label_values(&["main"])
+        .get();
+    println!("  snapshot_forced_relocation: {forced_relocation}");
+
+    let relocation_cells = shared_metrics
+        .relocation_cells_processed
+        .with_label_values(&["main"])
+        .get();
+    println!("  relocation_cells_processed: {relocation_cells}");
+
+    let relocation_kept = shared_metrics
+        .relocation_kept
+        .with_label_values(&["main"])
+        .get();
+    println!("  relocation_kept: {relocation_kept}");
+    let relocation_removed = shared_metrics
+        .relocation_removed
+        .with_label_values(&["main"])
+        .get();
+    println!("  relocation_removed: {relocation_removed}");
+    let wal_gc_position = shared_metrics.gc_position.with_label_values(&["wal"]).get();
+    println!("  wal_gc_position: {wal_gc_position}");
+    let index_gc_position = shared_metrics
+        .gc_position
+        .with_label_values(&["index"])
+        .get();
+    println!("  index_gc_position: {index_gc_position}");
+    drop(db_read);
 
     println!("\nTest passed successfully!");
 }
