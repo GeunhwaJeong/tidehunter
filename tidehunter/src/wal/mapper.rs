@@ -214,9 +214,10 @@ impl WalMapperThread {
             self.files.store(Arc::new(new_wal_files));
             files = self.files.load();
         }
-        Wal::extend_to_map_id(&self.layout, &files, map_id).expect("Failed to extend wal file");
+        let file = files.get(file_id);
+        Wal::extend_to_map_id(&self.layout, file, map_id).expect("Failed to extend wal file");
         self.maps.map(
-            files.get(file_id),
+            file,
             &self.layout,
             map_id,
             self.metrics.wal_mmap_bytes.clone(),

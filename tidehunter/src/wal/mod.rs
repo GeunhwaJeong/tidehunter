@@ -302,8 +302,7 @@ impl Wal {
     }
 
     /// Resize file to fit the specified map id
-    fn extend_to_map_id(layout: &WalLayout, files: &WalFiles, map_id: MapId) -> io::Result<()> {
-        let file = files.get(layout.file_for_map(map_id));
+    fn extend_to_map_id(layout: &WalLayout, file: &File, map_id: MapId) -> io::Result<()> {
         let mut end = layout.offset_in_wal_file(layout.map_range(map_id).end);
         if end == 0 {
             // If the map range end equals wal_file_size, set the end explicitly instead of using 0
@@ -452,10 +451,13 @@ impl WalIterator {
         maps: &mut WalMaps,
         wal_mmap_bytes: MetricIntGauge,
     ) -> Result<Option<Map>, WalError> {
-        Wal::extend_to_map_id(layout, files, map_id)?;
+        // Check if the file still exists before trying to extend it.
+        // GC may have removed the file asynchronously (via the mapper thread)
+        // between iterator steps.
         let Some(file) = files.get_checked(layout.file_for_map(map_id)) else {
             return Ok(None);
         };
+        Wal::extend_to_map_id(layout, file, map_id)?;
         Ok(Some(maps.map(file, layout, map_id, wal_mmap_bytes).clone()))
     }
 
