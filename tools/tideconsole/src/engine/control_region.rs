@@ -10,6 +10,24 @@ use tidehunter::key_shape::KeySpace;
 // ---------------------------------------------------------------------------
 
 pub(crate) fn register(engine: &mut Engine) {
+    // --- db.force_snapshot() → i64 ---
+    //
+    // Opens the database (triggering WAL replay if needed), flushes all dirty
+    // entries, and rebuilds the control region.  Returns the WAL position at
+    // which the snapshot was taken.
+    engine.register_fn(
+        "force_snapshot",
+        |h: &mut DbHandle| -> Result<i64, Box<EvalAltResult>> {
+            let db = h.require_db()?;
+            let pos = db
+                .force_rebuild_control_region()
+                .map_err(|e| -> Box<EvalAltResult> {
+                    format!("force_snapshot failed: {e:?}").into()
+                })?;
+            Ok(pos as i64)
+        },
+    );
+
     // --- db.load_cr() → map ---
     //
     // Reads the control region file without opening the database (no WAL replay).

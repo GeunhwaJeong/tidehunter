@@ -1,5 +1,6 @@
 pub(crate) mod control_region;
 pub(crate) mod db_fns;
+pub(crate) mod verify;
 pub(crate) mod wal;
 
 use parking_lot::Mutex;
@@ -68,12 +69,8 @@ impl std::fmt::Display for DbHandle {
 }
 
 impl DbHandle {
-    /// Ensure the database is open (triggering WAL replay if needed) and
-    /// resolve `ks` to a `KeySpace`.  Returns `(db_arc, key_space)`.
-    pub(crate) fn require_db_and_ks(
-        &self,
-        ks: Dynamic,
-    ) -> Result<(Arc<Db>, KeySpace), Box<EvalAltResult>> {
+    /// Ensure the database is open (triggering WAL replay if needed) and return the `Arc<Db>`.
+    pub(crate) fn require_db(&self) -> Result<Arc<Db>, Box<EvalAltResult>> {
         let mut state = self.0.lock();
         if state.db.is_none() {
             let db_path = state.db_path.clone();
@@ -85,7 +82,17 @@ impl DbHandle {
             )?;
             state.db = Some(db);
         }
-        let db = state.db.clone().unwrap();
+        Ok(state.db.clone().unwrap())
+    }
+
+    /// Ensure the database is open (triggering WAL replay if needed) and
+    /// resolve `ks` to a `KeySpace`.  Returns `(db_arc, key_space)`.
+    pub(crate) fn require_db_and_ks(
+        &self,
+        ks: Dynamic,
+    ) -> Result<(Arc<Db>, KeySpace), Box<EvalAltResult>> {
+        let db = self.require_db()?;
+        let state = self.0.lock();
         let ks = resolve_ks(&state, ks)?;
         Ok((db, ks))
     }
@@ -270,6 +277,7 @@ pub fn create_engine(ctx: Arc<Mutex<ConsoleContext>>) -> Engine {
     db_fns::register(&mut engine);
     wal::register(&mut engine);
     control_region::register(&mut engine);
+    verify::register(&mut engine);
 
     // Redirect Rhai's built-in print/debug through ctx.print_fn so tests can capture it.
     let ctx_print = ctx.clone();

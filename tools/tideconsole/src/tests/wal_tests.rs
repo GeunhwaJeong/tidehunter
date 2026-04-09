@@ -435,10 +435,16 @@ fn test_load_index_returns_entries() {
         first.contains_key("wal_position"),
         "each entry should have a 'wal_position' field"
     );
+    assert!(
+        first.contains_key("payload_len"),
+        "each entry should have a 'payload_len' field"
+    );
     let key_hex = first["key"].clone().cast::<String>();
     assert!(!key_hex.is_empty(), "key hex string should be non-empty");
     let wal_pos: i64 = first["wal_position"].clone().cast::<i64>();
     assert!(wal_pos >= 0, "wal_position should be non-negative");
+    let payload_len: i64 = first["payload_len"].clone().cast::<i64>();
+    assert!(payload_len >= 0, "payload_len should be non-negative");
 }
 
 #[test]

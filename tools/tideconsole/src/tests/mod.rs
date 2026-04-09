@@ -1,5 +1,6 @@
 pub mod control_region_tests;
 pub mod db_tests;
+pub mod verify_tests;
 pub mod wal_tests;
 
 use crate::engine::{ConsoleContext, create_engine};

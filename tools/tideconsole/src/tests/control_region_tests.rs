@@ -138,6 +138,24 @@ fn test_load_cr_valid_cells_after_snapshot() {
 }
 
 #[test]
+fn test_force_snapshot_returns_position() {
+    let (_dir, path) = setup_db_with_cr();
+    let (engine, mut scope) = open_cr_engine(&path);
+
+    let pos: i64 = engine
+        .eval_with_scope(&mut scope, "db.force_snapshot()")
+        .unwrap();
+    assert!(
+        pos >= 0,
+        "force_snapshot should return a non-negative WAL position, got {pos}"
+    );
+
+    // CR is still readable after the snapshot
+    let cr: rhai::Map = engine.eval_with_scope(&mut scope, "db.load_cr()").unwrap();
+    assert!(cr["last_position"].clone().cast::<i64>() >= 0);
+}
+
+#[test]
 fn test_open_multiple_dbs() {
     // Verify that two db handles can be opened and queried independently.
     let (dir1, path1) = setup_db_with_cr();

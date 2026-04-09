@@ -332,6 +332,10 @@ pub(crate) fn register(engine: &mut Engine) {
                         "wal_position".into(),
                         Dynamic::from(wal_pos.offset() as i64),
                     );
+                    m.insert(
+                        "payload_len".into(),
+                        Dynamic::from(wal_pos.payload_len() as i64),
+                    );
                     Dynamic::from(m)
                 })
                 .collect();

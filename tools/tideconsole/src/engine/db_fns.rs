@@ -131,6 +131,8 @@ pub(crate) fn register(engine: &mut Engine) {
         println!("  db.wal_stats()                       Print a WAL entry-type and keyspace summary");
         println!("  db.load_cr()                         Load control region into a Rhai map (no WAL replay)");
         println!("  db.load_index(offset)                Inspect on-disk index at given offset");
+        println!("  db.force_snapshot()                  Flush dirty entries and rebuild CR; returns WAL position");
+        println!("  db.verify()                          Check all live WAL keys are accessible; returns result map");
         println!();
         println!("  help()                               Show this message");
         println!();
