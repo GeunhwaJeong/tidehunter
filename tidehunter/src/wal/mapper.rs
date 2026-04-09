@@ -14,7 +14,7 @@ use std::time::Instant;
 
 pub(crate) enum WalMapperMessage {
     MapFinalized(MapId),
-    MinWalPositionUpdated(u64),
+    MinWalPositionUpdated(u64, mpsc::SyncSender<()>),
 }
 
 pub(crate) struct WalMapper {
@@ -100,11 +100,16 @@ impl WalMapper {
     }
 
     pub fn min_wal_position_updated(&self, watermark: u64) {
+        let (tx, rx) = mpsc::sync_channel(1);
         self.sender
             .as_ref()
             .expect("Wal mapper dropped")
-            .send(WalMapperMessage::MinWalPositionUpdated(watermark))
+            .send(WalMapperMessage::MinWalPositionUpdated(watermark, tx))
             .ok();
+        // Block until the mapper thread finishes deleting files and updating the file set.
+        // This prevents a race where the next relocation run iterates WAL files
+        // that are being deleted by a concurrent GC from the previous run.
+        rx.recv().ok();
     }
 }
 
@@ -149,8 +154,9 @@ impl WalMapperThread {
                     map_id = map_id.next_map();
                     self.make_map(map_id);
                 }
-                WalMapperMessage::MinWalPositionUpdated(watermark) => {
+                WalMapperMessage::MinWalPositionUpdated(watermark, _cb) => {
                     self.min_wal_position_updated(watermark);
+                    // dropping _cb to release receiver
                 }
             }
             self.metrics
