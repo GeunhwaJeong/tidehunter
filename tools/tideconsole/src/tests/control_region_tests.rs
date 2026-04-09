@@ -1,32 +1,8 @@
-use super::{run_rhai_test, setup_db_with_cr};
+use super::setup_db_with_cr;
 use crate::engine::{ConsoleContext, create_engine};
 use parking_lot::Mutex;
 use rhai::{Dynamic, Scope};
 use std::sync::Arc;
-
-// ---------------------------------------------------------------------------
-// Rhai-file tests — setup happens inside the .rhai scripts via setup_cr_db()
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_load_cr_structure() {
-    run_rhai_test("load_cr_structure.rhai");
-}
-
-#[test]
-fn test_load_cr_valid_cells_after_snapshot() {
-    run_rhai_test("load_cr_valid_cells.rhai");
-}
-
-#[test]
-fn test_force_snapshot_returns_position() {
-    run_rhai_test("force_snapshot_returns_position.rhai");
-}
-
-#[test]
-fn test_analyze_ks_returns_expected_fields() {
-    run_rhai_test("analyze_ks_fields.rhai");
-}
 
 // ---------------------------------------------------------------------------
 // Tests that stay in Rust

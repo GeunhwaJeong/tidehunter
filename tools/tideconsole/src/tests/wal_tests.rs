@@ -1,4 +1,4 @@
-use super::{run_rhai_test, setup_db};
+use super::setup_db;
 use crate::engine::{ConsoleContext, create_engine, is_complete};
 use parking_lot::Mutex;
 use rhai::{Array, Dynamic, Scope};
@@ -29,40 +29,6 @@ fn test_is_complete_incomplete() {
 fn test_is_complete_multiline_complete() {
     let input = "db.walk_wal(|entry| {\n    print(entry.key);\n});";
     assert!(is_complete(input));
-}
-
-// ---------------------------------------------------------------------------
-// walk_wal — rhai-file tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_walk_wal_total_entry_counts() {
-    run_rhai_test("walk_wal_entry_counts.rhai");
-}
-
-#[test]
-fn test_walk_wal_filter_by_keyspace() {
-    run_rhai_test("walk_wal_filter_by_keyspace.rhai");
-}
-
-#[test]
-fn test_walk_wal_record_fields() {
-    run_rhai_test("walk_wal_record_fields.rhai");
-}
-
-#[test]
-fn test_walk_wal_remove_keys() {
-    run_rhai_test("walk_wal_remove_keys.rhai");
-}
-
-#[test]
-fn test_walk_wal_from_position() {
-    run_rhai_test("walk_wal_from_position.rhai");
-}
-
-#[test]
-fn test_load_index_invalid_offset() {
-    run_rhai_test("load_index_invalid_offset.rhai");
 }
 
 // ---------------------------------------------------------------------------

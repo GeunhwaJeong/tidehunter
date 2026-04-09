@@ -1,6 +1,5 @@
 pub mod control_region_tests;
-pub mod db_tests;
-pub mod verify_tests;
+pub mod rhai_generated_tests;
 pub mod wal_tests;
 
 use crate::engine::{ConsoleContext, create_engine};
@@ -11,7 +10,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tidehunter::config::Config;
 use tidehunter::db::Db;
-use tidehunter::key_shape::{KeyShapeBuilder, KeySpace, KeyType};
+use tidehunter::key_shape::{KeyShapeBuilder, KeyType};
 use tidehunter::test_utils::Metrics;
 
 // ---------------------------------------------------------------------------
@@ -51,8 +50,6 @@ pub fn run_rhai_test(filename: &str) {
 pub struct TestDb {
     pub _dir: TempDir,
     pub path: PathBuf,
-    pub ks: KeySpace,
-    pub ks2: KeySpace,
 }
 
 /// Standard two-keyspace database for Rust-only tests (e.g. output-capture tests).
@@ -89,12 +86,7 @@ pub fn setup_db() -> TestDb {
     batch.commit().unwrap();
 
     drop(db);
-    TestDb {
-        _dir: dir,
-        path,
-        ks,
-        ks2,
-    }
+    TestDb { _dir: dir, path }
 }
 
 /// CR database for Rust-only tests (e.g. output-capture, multi-db tests).
