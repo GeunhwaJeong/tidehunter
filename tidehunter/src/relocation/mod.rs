@@ -320,7 +320,7 @@ impl RelocationDriver {
         let mut terminal_position = 0;
         loop {
             let entry = wal_iterator.next();
-            if matches!(entry, Err(WalError::Crc(_))) {
+            if matches!(entry, Err(WalError::Crc(_) | WalError::EndOfWal)) {
                 break;
             }
             let (position, raw_entry) = entry?;

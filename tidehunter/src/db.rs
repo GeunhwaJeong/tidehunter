@@ -807,7 +807,7 @@ impl Db {
                 batch.pop_front().expect("invariant checked")
             } else {
                 let entry = wal_iterator.next();
-                if matches!(entry, Err(WalError::Crc(_))) {
+                if matches!(entry, Err(WalError::Crc(_) | WalError::EndOfWal)) {
                     break Ok(wal_iterator.into_writer(batch_start_position));
                 }
                 let (position, raw_entry) = entry?;
