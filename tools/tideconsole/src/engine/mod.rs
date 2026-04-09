@@ -1,5 +1,6 @@
 pub(crate) mod control_region;
 pub(crate) mod db_fns;
+pub(crate) mod util;
 pub(crate) mod verify;
 pub(crate) mod wal;
 

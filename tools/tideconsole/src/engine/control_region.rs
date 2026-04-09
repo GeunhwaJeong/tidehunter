@@ -1,9 +1,12 @@
-use super::DbHandle;
+use super::util::format_bytes;
+use super::{DbHandle, resolve_ks};
 use rhai::{Dynamic, Engine, EvalAltResult, Map};
 use tidehunter::CellId;
+use tidehunter::WalKind;
 use tidehunter::control::ControlRegion;
 use tidehunter::db::CONTROL_REGION_FILE;
 use tidehunter::key_shape::KeySpace;
+use tidehunter::test_utils::{IndexFormat, Metrics, Wal, WalEntry, WalError};
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -115,4 +118,276 @@ pub(crate) fn register(engine: &mut Engine) {
             Ok(Dynamic::from(map))
         },
     );
+
+    // --- db.cr_stats() / db.cr_stats(n) ---
+    //
+    // Prints a summary of the control region without opening the database:
+    //   - Last WAL position
+    //   - Valid cells count
+    //   - Index WAL total file size vs. space used by live positions → usage %
+    //   - WAL position percentiles (P50 / P90 / P99)
+    //   - Lowest N cells by position (default n = 10)
+    engine.register_fn(
+        "cr_stats",
+        |h: &mut DbHandle| -> Result<(), Box<EvalAltResult>> { cr_stats_impl(h, 10) },
+    );
+    engine.register_fn(
+        "cr_stats",
+        |h: &mut DbHandle, n: i64| -> Result<(), Box<EvalAltResult>> {
+            cr_stats_impl(h, n.max(0) as usize)
+        },
+    );
+
+    // --- db.analyze_ks(ks) → map ---
+    //
+    // Reads every index entry for the given keyspace from the on-disk index WAL
+    // and returns a payload-size distribution map (no WAL replay required):
+    //
+    //   {
+    //     "total_index_entries": i64,   // cells with a valid index position in CR
+    //     "total_keys":          i64,   // total key count across all index entries
+    //     "total_payload_bytes": i64,
+    //     "avg_payload_bytes":   i64,
+    //     "min_payload_bytes":   i64,
+    //     "max_payload_bytes":   i64,
+    //     "p10": i64, "p25": i64, "p50": i64, "p75": i64,
+    //     "p90": i64, "p95": i64, "p99": i64,
+    //   }
+    engine.register_fn(
+        "analyze_ks",
+        |h: &mut DbHandle, ks: Dynamic| -> Result<rhai::Map, Box<EvalAltResult>> {
+            let (db_path, key_shape, config) = {
+                let state = h.0.lock();
+                (
+                    state.db_path.clone(),
+                    state.key_shape.clone(),
+                    state.config.clone(),
+                )
+            };
+
+            // Resolve keyspace
+            let ks_id = {
+                let state = h.0.lock();
+                resolve_ks(&state, ks)?.as_u8()
+            };
+            let ks_space = KeySpace::new(ks_id);
+            let ks_desc = key_shape.ks(ks_space);
+
+            // Load CR and collect valid index positions for this keyspace
+            let control_path = db_path.join(CONTROL_REGION_FILE);
+            let cr = ControlRegion::read(&control_path, &key_shape).map_err(
+                |e| -> Box<EvalAltResult> { format!("Failed to read control region: {e}").into() },
+            )?;
+            let snapshot = cr.snapshot();
+            let ks_idx = ks_id as usize;
+            if ks_idx >= snapshot.data.len() {
+                return Err(format!(
+                    "Keyspace id {ks_id} out of range (snapshot has {} keyspaces)",
+                    snapshot.data.len()
+                )
+                .into());
+            }
+
+            let mut valid_offsets: Vec<u64> = Vec::new();
+            for entry in snapshot.data[ks_idx].values() {
+                if entry.position.is_valid() {
+                    valid_offsets.push(entry.position.offset());
+                }
+            }
+            let total_index_entries = valid_offsets.len();
+
+            // Open index WAL and read each index entry
+            let metrics = Metrics::new();
+            let index_wal = Wal::open(&db_path, config.wal_layout(WalKind::Index), metrics)
+                .map_err(|e| -> Box<EvalAltResult> {
+                    format!("Failed to open index WAL: {e:?}").into()
+                })?;
+
+            let mut payload_sizes: Vec<usize> = Vec::new();
+
+            for offset in &valid_offsets {
+                let mut iter =
+                    index_wal
+                        .wal_iterator(*offset)
+                        .map_err(|e| -> Box<EvalAltResult> {
+                            format!("Failed to seek index WAL to {offset:#x}: {e:?}").into()
+                        })?;
+
+                match iter.next() {
+                    Ok((_pos, raw_bytes)) => {
+                        let entry = WalEntry::from_bytes(raw_bytes);
+                        if let WalEntry::Index(_, index_bytes) = entry {
+                            let index_table = ks_desc
+                                .index_format()
+                                .deserialize_index(ks_desc, index_bytes);
+                            for (_, wal_pos) in index_table.iter() {
+                                payload_sizes.push(wal_pos.payload_len());
+                            }
+                        }
+                    }
+                    Err(WalError::EndOfWal) | Err(WalError::Crc(_)) => {}
+                    Err(WalError::Io(e)) => {
+                        return Err(format!("I/O error reading index at {offset:#x}: {e}").into());
+                    }
+                }
+            }
+
+            // Compute distribution
+            payload_sizes.sort_unstable();
+            let total_keys = payload_sizes.len();
+            let total_payload_bytes: usize = payload_sizes.iter().sum();
+            let avg = if total_keys > 0 {
+                total_payload_bytes / total_keys
+            } else {
+                0
+            };
+            let min = payload_sizes.first().copied().unwrap_or(0);
+            let max = payload_sizes.last().copied().unwrap_or(0);
+
+            let pct = |p: usize| -> i64 {
+                if payload_sizes.is_empty() {
+                    return 0;
+                }
+                let idx = (payload_sizes.len() * p / 100).min(payload_sizes.len() - 1);
+                payload_sizes[idx] as i64
+            };
+
+            let mut m = Map::new();
+            m.insert(
+                "total_index_entries".into(),
+                Dynamic::from(total_index_entries as i64),
+            );
+            m.insert("total_keys".into(), Dynamic::from(total_keys as i64));
+            m.insert(
+                "total_payload_bytes".into(),
+                Dynamic::from(total_payload_bytes as i64),
+            );
+            m.insert("avg_payload_bytes".into(), Dynamic::from(avg as i64));
+            m.insert("min_payload_bytes".into(), Dynamic::from(min as i64));
+            m.insert("max_payload_bytes".into(), Dynamic::from(max as i64));
+            m.insert("p10".into(), Dynamic::from(pct(10)));
+            m.insert("p25".into(), Dynamic::from(pct(25)));
+            m.insert("p50".into(), Dynamic::from(pct(50)));
+            m.insert("p75".into(), Dynamic::from(pct(75)));
+            m.insert("p90".into(), Dynamic::from(pct(90)));
+            m.insert("p95".into(), Dynamic::from(pct(95)));
+            m.insert("p99".into(), Dynamic::from(pct(99)));
+            Ok(m)
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn cr_stats_impl(h: &mut DbHandle, lowest_n: usize) -> Result<(), Box<EvalAltResult>> {
+    let (db_path, key_shape, print) = {
+        let state = h.0.lock();
+        (
+            state.db_path.clone(),
+            state.key_shape.clone(),
+            state.print_fn.clone(),
+        )
+    };
+
+    let control_path = db_path.join(CONTROL_REGION_FILE);
+    let cr = ControlRegion::read(&control_path, &key_shape).map_err(|e| -> Box<EvalAltResult> {
+        format!("Failed to read control region: {e}").into()
+    })?;
+    let snapshot = cr.snapshot();
+
+    // Collect all valid positions: (offset, frame_len, ks_idx)
+    let mut all_positions: Vec<(u64, usize, usize)> = Vec::new();
+    let mut total_position_size = 0u64;
+    for (ks_idx, ks_data) in snapshot.data.iter().enumerate() {
+        for entry in ks_data.values() {
+            if entry.position.is_valid() {
+                let off = entry.position.offset();
+                let len = entry.position.frame_len();
+                all_positions.push((off, len, ks_idx));
+                total_position_size += len as u64;
+            }
+        }
+    }
+    all_positions.sort_by_key(|(off, _, _)| *off);
+
+    // Sum index WAL files on disk
+    let index_prefix = format!("{}_", WalKind::Index.name());
+    let mut total_index_wal_size = 0u64;
+    if let Ok(entries) = std::fs::read_dir(&db_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let id_str = match name.strip_prefix(&index_prefix) {
+                Some(s) => s,
+                None => continue,
+            };
+            if u64::from_str_radix(id_str, 16).is_err() {
+                continue;
+            }
+            if let Ok(meta) = std::fs::metadata(&path) {
+                total_index_wal_size += meta.len();
+            }
+        }
+    }
+
+    print("Control Region Stats");
+    print("====================");
+    print(&format!("  Last WAL position : {:#x}", cr.last_position()));
+    print(&format!("  Valid cells       : {}", all_positions.len()));
+
+    print("");
+    print("Index WAL Space:");
+    print(&format!(
+        "  Total files size  : {}",
+        format_bytes(total_index_wal_size as usize)
+    ));
+    print(&format!(
+        "  Used by positions : {}",
+        format_bytes(total_position_size as usize)
+    ));
+    if total_index_wal_size > 0 {
+        let pct = total_position_size as f64 / total_index_wal_size as f64 * 100.0;
+        print(&format!("  Usage             : {pct:.1}%"));
+    }
+
+    // Position percentiles (computed from sorted positions)
+    if !all_positions.is_empty() {
+        let offsets: Vec<u64> = all_positions.iter().map(|(off, _, _)| *off).collect();
+        let pct = |p: usize| -> u64 {
+            let idx = (offsets.len() * p / 100).min(offsets.len() - 1);
+            offsets[idx]
+        };
+        print("");
+        print("WAL Position Percentiles:");
+        print(&format!("  P50 : {:#x}", pct(50)));
+        print(&format!("  P90 : {:#x}", pct(90)));
+        print(&format!("  P99 : {:#x}", pct(99)));
+    }
+
+    // Lowest N positions
+    if !all_positions.is_empty() && lowest_n > 0 {
+        let n = lowest_n.min(all_positions.len());
+        print("");
+        print(&format!("Lowest {n} cells by WAL position:"));
+        for (i, (offset, _len, ks_idx)) in all_positions.iter().take(n).enumerate() {
+            let ks_name = key_shape
+                .ks(KeySpace::new(*ks_idx as u8))
+                .name()
+                .to_string();
+            print(&format!(
+                "  {:2}. offset={offset:#010x}  ks={ks_name}",
+                i + 1
+            ));
+        }
+    }
+
+    Ok(())
 }

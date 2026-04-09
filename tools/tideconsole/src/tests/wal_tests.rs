@@ -349,11 +349,27 @@ fn test_wal_stats_output() {
         .unwrap();
 
     let lines = output.lock().join("\n");
-    assert!(lines.contains("Records"), "output should mention Records");
-    assert!(lines.contains("Removes"), "output should mention Removes");
-    // 8 records total, 2 removes
+    // Entry type breakdown
+    assert!(
+        lines.contains("Record"),
+        "output should mention Record type"
+    );
+    assert!(
+        lines.contains("Remove"),
+        "output should mention Remove type"
+    );
+    // Counts: 8 records total (5 ks + 3 ks2), 2 removes
     assert!(lines.contains('8'), "output should contain record count 8");
     assert!(lines.contains('2'), "output should contain remove count 2");
+    // New sections
+    assert!(
+        lines.contains("Key Statistics"),
+        "output should include Key Statistics section"
+    );
+    assert!(
+        lines.contains("Per-keyspace"),
+        "output should include Per-keyspace section"
+    );
 }
 
 // ---------------------------------------------------------------------------

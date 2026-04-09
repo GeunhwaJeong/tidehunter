@@ -133,6 +133,9 @@ pub(crate) fn register(engine: &mut Engine) {
         println!("  db.load_index(offset)                Inspect on-disk index at given offset");
         println!("  db.force_snapshot()                  Flush dirty entries and rebuild CR; returns WAL position");
         println!("  db.verify()                          Check all live WAL keys are accessible; returns result map");
+        println!("  db.cr_stats()                        Print CR summary: index WAL usage, percentiles, lowest cells");
+        println!("  db.cr_stats(n)                       Same but show n lowest cells (default 10)");
+        println!("  db.analyze_ks(ks)                    Return payload size distribution map for a keyspace");
         println!();
         println!("  help()                               Show this message");
         println!();

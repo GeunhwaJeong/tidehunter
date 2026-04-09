@@ -1,5 +1,7 @@
+use super::util::{format_bytes, format_count};
 use super::{DbHandle, Entry, from_wal_entry};
 use rhai::{Dynamic, Engine, EvalAltResult, FnPtr, Map, NativeCallContext};
+use std::collections::BTreeMap;
 use std::path::Path;
 use tidehunter::WalKind;
 use tidehunter::config::Config;
@@ -152,24 +154,66 @@ pub(crate) fn register(engine: &mut Engine) {
                 )
             };
 
-            let mut counts = [0usize; 5]; // record, remove, index, batch_start, drop_cells
+            // Counters indexed by type: [record, remove, index, batch_start, drop_cells]
+            let mut counts = [0usize; 5];
+            let mut type_bytes = [0usize; 5];
             let mut total_bytes = 0usize;
-            let mut ks_counts: std::collections::BTreeMap<u8, (usize, usize)> = Default::default(); // ks -> (records, removes)
+            // Key size stats (record + remove entries)
+            let mut min_key = usize::MAX;
+            let mut max_key = 0usize;
+            let mut total_key_bytes = 0usize;
+            let mut key_entry_count = 0usize;
+            // Value size stats (record entries only)
+            let mut min_val = usize::MAX;
+            let mut max_val = 0usize;
+            let mut total_val_bytes = 0usize;
+            // Per-KS: (records, removes, bytes)
+            let mut ks_counts: BTreeMap<u8, (usize, usize, usize)> = BTreeMap::new();
 
             do_walk_wal(&db_path, &config, 0, false, |e| {
-                total_bytes += e.raw_size as usize;
+                let raw = e.raw_size as usize;
+                total_bytes += raw;
                 match e.entry_type.as_str() {
                     "record" => {
                         counts[0] += 1;
-                        ks_counts.entry(e.keyspace as u8).or_default().0 += 1;
+                        type_bytes[0] += raw;
+                        let kl = e.key.len();
+                        let vl = e.value_len as usize;
+                        min_key = min_key.min(kl);
+                        max_key = max_key.max(kl);
+                        total_key_bytes += kl;
+                        key_entry_count += 1;
+                        min_val = min_val.min(vl);
+                        max_val = max_val.max(vl);
+                        total_val_bytes += vl;
+                        let s = ks_counts.entry(e.keyspace as u8).or_default();
+                        s.0 += 1;
+                        s.2 += raw;
                     }
                     "remove" => {
                         counts[1] += 1;
-                        ks_counts.entry(e.keyspace as u8).or_default().1 += 1;
+                        type_bytes[1] += raw;
+                        let kl = e.key.len();
+                        min_key = min_key.min(kl);
+                        max_key = max_key.max(kl);
+                        total_key_bytes += kl;
+                        key_entry_count += 1;
+                        let s = ks_counts.entry(e.keyspace as u8).or_default();
+                        s.1 += 1;
+                        s.2 += raw;
                     }
-                    "index" => counts[2] += 1,
-                    "batch_start" => counts[3] += 1,
-                    "drop_cells" => counts[4] += 1,
+                    "index" => {
+                        counts[2] += 1;
+                        type_bytes[2] += raw;
+                    }
+                    "batch_start" => {
+                        counts[3] += 1;
+                        type_bytes[3] += raw;
+                    }
+                    "drop_cells" => {
+                        counts[4] += 1;
+                        type_bytes[4] += raw;
+                    }
                     _ => {}
                 }
                 Ok(())
@@ -178,23 +222,80 @@ pub(crate) fn register(engine: &mut Engine) {
             let total = counts.iter().sum::<usize>();
             print("WAL Statistics");
             print("==============");
-            print(&format!("  Total entries : {total}"));
-            print(&format!("  Total bytes   : {total_bytes}"));
-            print(&format!("  Records       : {}", counts[0]));
-            print(&format!("  Removes       : {}", counts[1]));
-            print(&format!("  Index         : {}", counts[2]));
-            print(&format!("  BatchStart    : {}", counts[3]));
-            print(&format!("  DropCells     : {}", counts[4]));
+            print(&format!("  Total entries : {}", format_count(total)));
+            print(&format!("  Total bytes   : {}", format_bytes(total_bytes)));
 
+            // Per-type breakdown table
+            const TYPE_NAMES: [&str; 5] = ["Record", "Remove", "Index", "BatchStart", "DropCells"];
+            print("");
+            print(&format!(
+                "  {:<14} {:>10} {:>12} {:>10} {:>8}",
+                "Type", "Count", "Size", "Avg Size", "% Space"
+            ));
+            print(&format!("  {}", "-".repeat(58)));
+            for (i, name) in TYPE_NAMES.iter().enumerate() {
+                if counts[i] == 0 {
+                    continue;
+                }
+                let avg = type_bytes[i] / counts[i];
+                let pct = if total_bytes > 0 {
+                    type_bytes[i] as f64 / total_bytes as f64 * 100.0
+                } else {
+                    0.0
+                };
+                print(&format!(
+                    "  {:<14} {:>10} {:>12} {:>10} {:>7.1}%",
+                    name,
+                    format_count(counts[i]),
+                    format_bytes(type_bytes[i]),
+                    format_bytes(avg),
+                    pct,
+                ));
+            }
+
+            // Key size stats
+            if key_entry_count > 0 && min_key != usize::MAX {
+                let avg_key = total_key_bytes / key_entry_count;
+                print("");
+                print("Key Statistics:");
+                print(&format!(
+                    "  Min : {:>10}   Max : {:>10}   Avg : {:>10}",
+                    format_bytes(min_key),
+                    format_bytes(max_key),
+                    format_bytes(avg_key),
+                ));
+            }
+
+            // Value size stats
+            if counts[0] > 0 && min_val != usize::MAX {
+                let avg_val = total_val_bytes / counts[0];
+                print("");
+                print("Value Statistics:");
+                print(&format!(
+                    "  Min : {:>10}   Max : {:>10}   Avg : {:>10}",
+                    format_bytes(min_val),
+                    format_bytes(max_val),
+                    format_bytes(avg_val),
+                ));
+            }
+
+            // Per-keyspace breakdown
             if !ks_counts.is_empty() {
-                print("\nPer-keyspace (records / removes):");
-                for (ks_id, (recs, rems)) in &ks_counts {
-                    let name = {
-                        let space = KeySpace::new(*ks_id);
-                        key_shape.ks(space).name().to_string()
-                    };
+                print("");
+                print("Per-keyspace:");
+                print(&format!(
+                    "  {:<35} {:>10} {:>10} {:>12}",
+                    "Keyspace", "Records", "Removes", "Size"
+                ));
+                print(&format!("  {}", "-".repeat(72)));
+                for (ks_id, (recs, rems, bytes)) in &ks_counts {
+                    let name = key_shape.ks(KeySpace::new(*ks_id)).name().to_string();
                     print(&format!(
-                        "  {name:35} records={recs:>10}  removes={rems:>10}"
+                        "  {:<35} {:>10} {:>10} {:>12}",
+                        name,
+                        format_count(*recs),
+                        format_count(*rems),
+                        format_bytes(*bytes),
                     ));
                 }
             }
