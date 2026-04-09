@@ -66,17 +66,16 @@ pub fn setup_db() -> TestDb {
     }
 }
 
-/// Build an engine+scope with the test DB already opened and stdout silenced.
+/// Build an engine+scope with the test DB already opened as `db` and stdout silenced.
 pub fn open_engine(db: &TestDb) -> (rhai::Engine, Scope<'static>) {
     let ctx = Arc::new(Mutex::new(ConsoleContext {
         print_fn: Arc::new(|_| {}), // silence output in tests
-        ..ConsoleContext::default()
     }));
     let engine = create_engine(ctx);
     let mut scope = Scope::new();
     let path = db.path.display().to_string();
     let _: Dynamic = engine
-        .eval_with_scope::<Dynamic>(&mut scope, &format!("open(\"{path}\")"))
+        .eval_with_scope::<Dynamic>(&mut scope, &format!("let db = open(\"{path}\")"))
         .unwrap();
     (engine, scope)
 }

@@ -16,18 +16,18 @@ use tidehunter::test_utils::Metrics;
 #[test]
 fn test_is_complete_single_line() {
     assert!(is_complete("1 + 2"));
-    assert!(is_complete("walk_wal(|e| { print(e.key); });"));
+    assert!(is_complete("db.walk_wal(|e| { print(e.key); });"));
 }
 
 #[test]
 fn test_is_complete_incomplete() {
-    assert!(!is_complete("walk_wal(|entry| {"));
+    assert!(!is_complete("db.walk_wal(|entry| {"));
     assert!(!is_complete("let x = (1 +"));
 }
 
 #[test]
 fn test_is_complete_multiline_complete() {
-    let input = "walk_wal(|entry| {\n    print(entry.key);\n});";
+    let input = "db.walk_wal(|entry| {\n    print(entry.key);\n});";
     assert!(is_complete(input));
 }
 
@@ -45,7 +45,7 @@ fn test_walk_wal_total_entry_counts() {
             &mut scope,
             r#"
             let types = [];
-            walk_wal(|entry| { types.push(entry.entry_type); });
+            db.walk_wal(|entry| { types.push(entry.entry_type); });
             types
             "#,
         )
@@ -80,7 +80,7 @@ fn test_walk_wal_filter_by_keyspace() {
         r#"
         let ks_records = 0;
         let ks2_records = 0;
-        walk_wal(|entry| {{
+        db.walk_wal(|entry| {{
             if entry.entry_type == "record" {{
                 if entry.keyspace == {ks_id} {{ ks_records += 1; }}
                 if entry.keyspace == {ks2_id} {{ ks2_records += 1; }}
@@ -110,7 +110,7 @@ fn test_walk_wal_record_fields() {
     let snippet = format!(
         r#"
         let found = #{{}};
-        walk_wal(|entry| {{
+        db.walk_wal(|entry| {{
             if entry.entry_type == "record" && entry.keyspace == {ks_id} && found.is_empty() {{
                 found = #{{
                     "key_len": entry.key.len(),
@@ -152,7 +152,7 @@ fn test_walk_wal_remove_keys() {
     let snippet = format!(
         r#"
         let remove_keys = [];
-        walk_wal(|entry| {{
+        db.walk_wal(|entry| {{
             if entry.entry_type == "remove" && entry.keyspace == {ks_id} {{
                 remove_keys.push(entry.key);
             }}
@@ -184,7 +184,7 @@ fn test_walk_wal_from_position() {
             &mut scope,
             r#"
             let positions = [];
-            walk_wal(|entry| { positions.push(entry.position); });
+            db.walk_wal(|entry| { positions.push(entry.position); });
             positions
             "#,
         )
@@ -202,7 +202,7 @@ fn test_walk_wal_from_position() {
     let snippet = format!(
         r#"
         let count = 0;
-        walk_wal({resume_pos}, |entry| {{ count += 1; }});
+        db.walk_wal({resume_pos}, |entry| {{ count += 1; }});
         count
         "#
     );
@@ -222,8 +222,6 @@ fn test_walk_wal_from_position() {
 #[test]
 fn test_list_wal_files() {
     // Build a DB with a tiny wal_file_size so writes spill across multiple files.
-    // frag_size must equal wal_file_size (one fragment per file) and be large enough
-    // for a single entry (~50 bytes), but small enough that ~100 records fill several files.
     let wal_file_size: u64 = 1024;
 
     let dir = TempDir::new().unwrap();
@@ -252,17 +250,16 @@ fn test_list_wal_files() {
 
     let ctx = Arc::new(Mutex::new(ConsoleContext {
         print_fn: Arc::new(|_| {}),
-        ..ConsoleContext::default()
     }));
     let engine = create_engine(ctx);
     let mut scope = Scope::new();
     let db_path = path.display().to_string();
     let _: Dynamic = engine
-        .eval_with_scope::<Dynamic>(&mut scope, &format!("open(\"{db_path}\")"))
+        .eval_with_scope::<Dynamic>(&mut scope, &format!("let db = open(\"{db_path}\")"))
         .unwrap();
 
     let files: Array = engine
-        .eval_with_scope(&mut scope, "list_wal_files()")
+        .eval_with_scope(&mut scope, "db.list_wal_files()")
         .unwrap();
 
     // Must have produced multiple WAL files.
@@ -301,7 +298,7 @@ fn test_list_wal_files() {
         );
     }
 
-    // Verify start_pos can be fed into walk_wal: walking from the second file's
+    // Verify start_pos can be fed into db.walk_wal: walking from the second file's
     // start_pos must produce fewer entries than walking from position 0.
     let second_start = files[1].clone().cast::<rhai::Map>()["start_pos"]
         .clone()
@@ -310,8 +307,8 @@ fn test_list_wal_files() {
         r#"
         let full = 0;
         let partial = 0;
-        walk_wal(|entry| {{ full += 1; }});
-        walk_wal({second_start}, |entry| {{ partial += 1; }});
+        db.walk_wal(|entry| {{ full += 1; }});
+        db.walk_wal({second_start}, |entry| {{ partial += 1; }});
         [full, partial]
         "#
     );
@@ -339,17 +336,16 @@ fn test_wal_stats_output() {
     let output_clone = output.clone();
     let ctx = Arc::new(Mutex::new(ConsoleContext {
         print_fn: Arc::new(move |s| output_clone.lock().push(s.to_string())),
-        ..ConsoleContext::default()
     }));
     let engine = create_engine(ctx);
     let mut scope = Scope::new();
 
     let path = db.path.display().to_string();
     let _: Dynamic = engine
-        .eval_with_scope::<Dynamic>(&mut scope, &format!("open(\"{path}\")"))
+        .eval_with_scope::<Dynamic>(&mut scope, &format!("let db = open(\"{path}\")"))
         .unwrap();
     let _: Dynamic = engine
-        .eval_with_scope::<Dynamic>(&mut scope, "wal_stats()")
+        .eval_with_scope::<Dynamic>(&mut scope, "db.wal_stats()")
         .unwrap();
 
     let lines = output.lock().join("\n");
@@ -367,7 +363,7 @@ fn test_wal_stats_output() {
 #[test]
 fn test_load_index_returns_entries() {
     // Build a DB, force a snapshot so there is an on-disk index, then verify
-    // that load_index(offset) returns the expected key entries.
+    // that db.load_index(offset) returns the expected key entries.
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("db");
     std::fs::create_dir_all(&path).unwrap();
@@ -389,18 +385,17 @@ fn test_load_index_returns_entries() {
 
     let ctx = Arc::new(Mutex::new(ConsoleContext {
         print_fn: Arc::new(|_| {}),
-        ..ConsoleContext::default()
     }));
     let engine = create_engine(ctx);
     let mut scope = Scope::new();
     let db_path = path.display().to_string();
     let _: Dynamic = engine
-        .eval_with_scope::<Dynamic>(&mut scope, &format!("open(\"{db_path}\")"))
+        .eval_with_scope::<Dynamic>(&mut scope, &format!("let db = open(\"{db_path}\")"))
         .unwrap();
 
-    // Use load_cr() to find a cell with a valid index offset, then call load_index().
+    // Use db.load_cr() to find a cell with a valid index offset, then call db.load_index().
     let script = r#"
-        let cr = load_cr();
+        let cr = db.load_cr();
         let idx_offset = -1;
         for ks in cr.keyspaces {
             if ks.name == "objects" {
@@ -420,9 +415,9 @@ fn test_load_index_returns_entries() {
         "expected at least one cell with a valid index offset after snapshot"
     );
 
-    // load_index should return an array of maps with "key" and "wal_position" fields.
+    // db.load_index should return an array of maps with "key" and "wal_position" fields.
     let entries: Array = engine
-        .eval_with_scope(&mut scope, &format!("load_index({idx_offset})"))
+        .eval_with_scope(&mut scope, &format!("db.load_index({idx_offset})"))
         .unwrap();
 
     // The snapshot was forced, so all 3 keys should appear across the cells.
@@ -452,8 +447,8 @@ fn test_load_index_invalid_offset() {
     let (engine, mut scope) = open_engine(&db);
 
     // -1 means "no index" — should return an error.
-    let result = engine.eval_with_scope::<Array>(&mut scope, "load_index(-1)");
-    assert!(result.is_err(), "load_index(-1) should fail");
+    let result = engine.eval_with_scope::<Array>(&mut scope, "db.load_index(-1)");
+    assert!(result.is_err(), "db.load_index(-1) should fail");
     assert!(
         result.unwrap_err().to_string().contains("negative"),
         "error should mention negative offset"

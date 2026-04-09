@@ -50,17 +50,16 @@ fn build_bench_db(record_count: usize) -> BenchDb {
     BenchDb { _dir: dir, path }
 }
 
-/// Build a Rhai engine+scope with the DB already opened.
+/// Build a Rhai engine+scope with the DB already opened as `db`.
 fn open_rhai(db: &BenchDb) -> (rhai::Engine, Scope<'static>) {
     let ctx = Arc::new(Mutex::new(ConsoleContext {
         print_fn: Arc::new(|_| {}),
-        ..ConsoleContext::default()
     }));
     let engine = create_engine(ctx);
     let mut scope = Scope::new();
     let path = db.path.display().to_string();
     let _: Dynamic = engine
-        .eval_with_scope::<Dynamic>(&mut scope, &format!("open(\"{path}\")"))
+        .eval_with_scope::<Dynamic>(&mut scope, &format!("let db = open(\"{path}\")"))
         .unwrap();
     (engine, scope)
 }
@@ -69,7 +68,7 @@ fn open_rhai(db: &BenchDb) -> (rhai::Engine, Scope<'static>) {
 // Benchmarks
 // ---------------------------------------------------------------------------
 
-/// Measures the time to walk the entire WAL via the Rhai `walk_wal` function,
+/// Measures the time to walk the entire WAL via the Rhai `db.walk_wal` method,
 /// counting every entry.  Parameterised by total record count.
 fn bench_wal_walk_count(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal_walk/count_entries");
@@ -86,7 +85,7 @@ fn bench_wal_walk_count(c: &mut Criterion) {
                     let count: i64 = engine
                         .eval_with_scope(
                             &mut scope,
-                            "let count = 0; walk_wal(|entry| { count += 1; }); count",
+                            "let count = 0; db.walk_wal(|entry| { count += 1; }); count",
                         )
                         .unwrap();
                     assert!(count > 0);
@@ -117,7 +116,7 @@ fn bench_wal_walk_read_key(c: &mut Criterion) {
                             &mut scope,
                             r#"
                             let count = 0;
-                            walk_wal(|entry| {
+                            db.walk_wal(|entry| {
                                 let k = entry.key;
                                 count += 1;
                             });
@@ -134,7 +133,7 @@ fn bench_wal_walk_read_key(c: &mut Criterion) {
     group.finish();
 }
 
-/// Same bare-count walk but using walk_wal_unchecked (CRC skipped).
+/// Same bare-count walk but using db.walk_wal_unchecked (CRC skipped).
 fn bench_wal_walk_skip_crc(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal_walk/skip_crc");
 
@@ -150,7 +149,7 @@ fn bench_wal_walk_skip_crc(c: &mut Criterion) {
                     let count: i64 = engine
                         .eval_with_scope(
                             &mut scope,
-                            "let count = 0; walk_wal_unchecked(|entry| { count += 1; }); count",
+                            "let count = 0; db.walk_wal_unchecked(|entry| { count += 1; }); count",
                         )
                         .unwrap();
                     assert!(count > 0);

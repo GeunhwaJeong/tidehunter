@@ -3,25 +3,20 @@ pub(crate) mod db_fns;
 pub(crate) mod wal;
 
 use parking_lot::Mutex;
-use rhai::{Dynamic, Engine, Scope};
+use rhai::{Dynamic, Engine, EvalAltResult, Scope};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tidehunter::config::Config;
 use tidehunter::db::{Db, DbResult};
-use tidehunter::key_shape::KeyShape;
-use tidehunter::test_utils::WalEntry;
+use tidehunter::key_shape::{KeyShape, KeySpace};
+use tidehunter::test_utils::{Metrics, WalEntry};
 
 // ---------------------------------------------------------------------------
-// Shared console state
+// Shared console state (engine-level)
 // ---------------------------------------------------------------------------
 
 pub struct ConsoleContext {
-    pub db_path: Option<PathBuf>,
-    pub config: Config,
-    pub key_shape: Option<KeyShape>,
-    /// Live database handle used by query/manipulation functions.
-    pub db: Option<Arc<Db>>,
-    /// Output sink used by all registered functions (open, wal_stats, etc.).
+    /// Output sink used by the engine's print/debug hooks.
     /// Defaults to `println!`; override in tests to capture output.
     pub print_fn: Arc<dyn Fn(&str) + Send + Sync>,
 }
@@ -29,12 +24,70 @@ pub struct ConsoleContext {
 impl Default for ConsoleContext {
     fn default() -> Self {
         Self {
-            db_path: None,
-            config: Config::default(),
-            key_shape: None,
-            db: None,
             print_fn: Arc::new(|s| println!("{s}")),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DbState — per-database state held inside a DbHandle
+// ---------------------------------------------------------------------------
+
+pub struct DbState {
+    pub db_path: PathBuf,
+    pub config: Config,
+    pub key_shape: KeyShape,
+    /// Live database handle; `None` until the first CRUD operation triggers WAL replay.
+    pub db: Option<Arc<Db>>,
+    /// Output sink captured from `ConsoleContext` at `open()` time.
+    pub print_fn: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+// ---------------------------------------------------------------------------
+// DbHandle — Rhai-visible type returned by open()
+// ---------------------------------------------------------------------------
+
+/// A handle to an open TideHunter database returned by `open()`.
+/// All query and inspection methods are called on this handle.
+/// Multiple handles can coexist in the same session.
+///
+/// Example:
+/// ```rhai
+/// let db  = open("/data/db1");
+/// let db2 = open("/data/db2");
+/// db.scan("objects", |k, v| { print(k); });
+/// ```
+#[derive(Clone)]
+pub struct DbHandle(pub Arc<Mutex<DbState>>);
+
+impl std::fmt::Display for DbHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.0.lock();
+        write!(f, "DbHandle({})", state.db_path.display())
+    }
+}
+
+impl DbHandle {
+    /// Ensure the database is open (triggering WAL replay if needed) and
+    /// resolve `ks` to a `KeySpace`.  Returns `(db_arc, key_space)`.
+    pub(crate) fn require_db_and_ks(
+        &self,
+        ks: Dynamic,
+    ) -> Result<(Arc<Db>, KeySpace), Box<EvalAltResult>> {
+        let mut state = self.0.lock();
+        if state.db.is_none() {
+            let db_path = state.db_path.clone();
+            (state.print_fn)("Opening database (replaying WAL, this may take a while)...");
+            let key_shape = state.key_shape.clone();
+            let config = state.config.clone();
+            let db = Db::open(&db_path, key_shape, Arc::new(config), Metrics::new()).map_err(
+                |e| -> Box<EvalAltResult> { format!("Failed to open database: {e:?}").into() },
+            )?;
+            state.db = Some(db);
+        }
+        let db = state.db.clone().unwrap();
+        let ks = resolve_ks(&state, ks)?;
+        Ok((db, ks))
     }
 }
 
@@ -128,7 +181,7 @@ pub(crate) fn from_wal_entry(entry: WalEntry, offset: u64, raw_size: usize) -> E
 }
 
 // ---------------------------------------------------------------------------
-// Helpers used by db_fns
+// Helpers used by db_fns / wal / control_region
 // ---------------------------------------------------------------------------
 
 /// Decode a hex string to bytes, returning an EvalAltResult on failure.
@@ -141,6 +194,26 @@ pub(crate) fn decode_hex(s: &str) -> Result<Vec<u8>, Box<rhai::EvalAltResult>> {
 /// Map a DbResult to an EvalAltResult.
 pub(crate) fn db_err<T>(r: DbResult<T>) -> Result<T, Box<rhai::EvalAltResult>> {
     r.map_err(|e| -> Box<rhai::EvalAltResult> { format!("Database error: {e:?}").into() })
+}
+
+/// Resolve a Rhai `Dynamic` value to a `KeySpace` using the given `DbState`.
+/// Accepts an integer keyspace ID (`i64`) or a keyspace name (`String`).
+pub(crate) fn resolve_ks(state: &DbState, ks: Dynamic) -> Result<KeySpace, Box<EvalAltResult>> {
+    if ks.is::<i64>() {
+        return Ok(KeySpace::new(ks.cast::<i64>() as u8));
+    }
+    if ks.is::<String>() {
+        let name = ks.cast::<String>();
+        return state
+            .key_shape
+            .iter_ks()
+            .find(|ksd| ksd.name() == name)
+            .map(|ksd| ksd.id())
+            .ok_or_else(|| -> Box<EvalAltResult> {
+                format!("Unknown keyspace \"{name}\"").into()
+            });
+    }
+    Err("ks must be an integer ID or a name string".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -162,9 +235,41 @@ pub fn create_engine(ctx: Arc<Mutex<ConsoleContext>>) -> Engine {
     engine.register_fn("to_string", |e: &mut Entry| e.to_string());
     engine.register_fn("to_debug", |e: &mut Entry| format!("{e:?}"));
 
-    db_fns::register(&mut engine, ctx.clone());
-    wal::register(&mut engine, ctx.clone());
-    control_region::register(&mut engine, ctx.clone());
+    // --- Register DbHandle type ---
+    engine.register_type_with_name::<DbHandle>("DbHandle");
+    engine.register_fn("to_string", |h: &mut DbHandle| h.to_string());
+
+    // --- open(path) → DbHandle ---
+    // Loads config and key shape only; WAL replay is deferred until the first CRUD operation.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "open",
+            move |path: &str| -> Result<DbHandle, Box<EvalAltResult>> {
+                let db_path = PathBuf::from(path);
+                let config = Db::load_config(&db_path).unwrap_or_default();
+                let key_shape =
+                    Db::load_key_shape(&db_path).map_err(|e| -> Box<EvalAltResult> {
+                        format!("Failed to load key shape: {e:?}").into()
+                    })?;
+                let print_fn = ctx.lock().print_fn.clone();
+                (print_fn)(&format!(
+                    "Loaded {path} (WAL replay deferred until first query)"
+                ));
+                Ok(DbHandle(Arc::new(Mutex::new(DbState {
+                    db_path,
+                    config,
+                    key_shape,
+                    db: None,
+                    print_fn,
+                }))))
+            },
+        );
+    }
+
+    db_fns::register(&mut engine);
+    wal::register(&mut engine);
+    control_region::register(&mut engine);
 
     // Redirect Rhai's built-in print/debug through ctx.print_fn so tests can capture it.
     let ctx_print = ctx.clone();
@@ -205,7 +310,8 @@ pub fn is_complete(input: &str) -> bool {
     depth <= 0
 }
 
-/// Initialise an engine and pre-open a database path without entering the REPL.
+/// Open a database and bind it to the variable `db` in the given scope.
+/// This is used when `--db` is passed on the command line.
 pub fn init_scope_with_db(
     engine: &Engine,
     scope: &mut Scope,
@@ -213,7 +319,7 @@ pub fn init_scope_with_db(
     db_path: &str,
 ) -> Result<(), anyhow::Error> {
     let _: Dynamic = engine
-        .eval_with_scope::<Dynamic>(scope, &format!("open(\"{db_path}\")"))
+        .eval_with_scope::<Dynamic>(scope, &format!("let db = open(\"{db_path}\")"))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }

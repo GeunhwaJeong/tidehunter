@@ -45,13 +45,12 @@ fn setup_db_with_cr() -> (TempDir, PathBuf) {
 fn open_cr_engine(path: &PathBuf) -> (rhai::Engine, Scope<'static>) {
     let ctx = Arc::new(Mutex::new(ConsoleContext {
         print_fn: Arc::new(|_| {}),
-        ..ConsoleContext::default()
     }));
     let engine = create_engine(ctx);
     let mut scope = Scope::new();
     let path_str = path.display().to_string();
     let _: Dynamic = engine
-        .eval_with_scope::<Dynamic>(&mut scope, &format!("open(\"{path_str}\")"))
+        .eval_with_scope::<Dynamic>(&mut scope, &format!("let db = open(\"{path_str}\")"))
         .unwrap();
     (engine, scope)
 }
@@ -61,21 +60,18 @@ fn open_cr_engine(path: &PathBuf) -> (rhai::Engine, Scope<'static>) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_load_cr_without_open() {
+fn test_open_invalid_path_returns_error() {
+    // Opening a nonexistent path should fail at key_shape loading.
     let ctx = Arc::new(Mutex::new(ConsoleContext {
         print_fn: Arc::new(|_| {}),
-        ..ConsoleContext::default()
     }));
     let engine = create_engine(ctx);
     let mut scope = Scope::new();
-    let result = engine.eval_with_scope::<Dynamic>(&mut scope, "load_cr()");
-    assert!(result.is_err());
+    let result = engine.eval_with_scope::<Dynamic>(&mut scope, "open(\"/nonexistent/path/to/db\")");
+    assert!(result.is_err(), "open() on a nonexistent path should fail");
     assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("No database opened"),
-        "Error should mention 'No database opened'"
+        result.unwrap_err().to_string().contains("key shape"),
+        "Error should mention 'key shape'"
     );
 }
 
@@ -84,7 +80,7 @@ fn test_load_cr_structure() {
     let (_dir, path) = setup_db_with_cr();
     let (engine, mut scope) = open_cr_engine(&path);
 
-    let cr: rhai::Map = engine.eval_with_scope(&mut scope, "load_cr()").unwrap();
+    let cr: rhai::Map = engine.eval_with_scope(&mut scope, "db.load_cr()").unwrap();
 
     // last_position is present
     assert!(cr["last_position"].clone().cast::<i64>() >= 0);
@@ -124,7 +120,7 @@ fn test_load_cr_valid_cells_after_snapshot() {
         .eval_with_scope(
             &mut scope,
             r#"
-            let cr = load_cr();
+            let cr = db.load_cr();
             let valid = 0;
             for ks in cr.keyspaces {
                 for c in ks.cells {
@@ -139,4 +135,42 @@ fn test_load_cr_valid_cells_after_snapshot() {
         result.cast::<i64>() > 0,
         "Expected some valid cells after snapshot"
     );
+}
+
+#[test]
+fn test_open_multiple_dbs() {
+    // Verify that two db handles can be opened and queried independently.
+    let (dir1, path1) = setup_db_with_cr();
+    let (dir2, path2) = setup_db_with_cr();
+
+    let ctx = Arc::new(Mutex::new(ConsoleContext {
+        print_fn: Arc::new(|_| {}),
+    }));
+    let engine = create_engine(ctx);
+    let mut scope = Scope::new();
+
+    let p1 = path1.display().to_string();
+    let p2 = path2.display().to_string();
+    let script = format!(
+        r#"
+        let db1 = open("{p1}");
+        let db2 = open("{p2}");
+        let cr1 = db1.load_cr();
+        let cr2 = db2.load_cr();
+        [cr1.keyspaces.len(), cr2.keyspaces.len()]
+        "#
+    );
+    let result: rhai::Array = engine.eval_with_scope(&mut scope, &script).unwrap();
+    assert_eq!(
+        result[0].clone().cast::<i64>(),
+        2,
+        "db1 should have 2 keyspaces"
+    );
+    assert_eq!(
+        result[1].clone().cast::<i64>(),
+        2,
+        "db2 should have 2 keyspaces"
+    );
+
+    drop((dir1, dir2));
 }

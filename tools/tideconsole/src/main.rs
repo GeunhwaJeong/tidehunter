@@ -13,7 +13,7 @@ use std::sync::Arc;
     about = "Interactive Rhai shell for TideHunter databases"
 )]
 struct Cli {
-    /// Path to a TideHunter database directory to open on startup
+    /// Path to a TideHunter database directory to open on startup (bound to variable 'db')
     #[arg(short, long)]
     db: Option<PathBuf>,
 
@@ -49,7 +49,8 @@ fn repl(engine: &Engine, scope: &mut Scope) -> Result<()> {
     }
 
     println!("TideConsole — TideHunter Interactive Shell");
-    println!("Type help() for available functions, Ctrl+D to exit.\n");
+    println!("Type help() for available methods, Ctrl+D to exit.");
+    println!("Use `let db = open(\"/path/to/db\")` to open a database.\n");
 
     let mut buf = String::new();
 

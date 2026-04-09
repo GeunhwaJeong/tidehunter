@@ -1,7 +1,5 @@
-use super::ConsoleContext;
-use parking_lot::Mutex;
+use super::DbHandle;
 use rhai::{Dynamic, Engine, EvalAltResult, Map};
-use std::sync::Arc;
 use tidehunter::CellId;
 use tidehunter::control::ControlRegion;
 use tidehunter::db::CONTROL_REGION_FILE;
@@ -11,8 +9,8 @@ use tidehunter::key_shape::KeySpace;
 // Registration
 // ---------------------------------------------------------------------------
 
-pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
-    // --- load_cr() → map ---
+pub(crate) fn register(engine: &mut Engine) {
+    // --- db.load_cr() → map ---
     //
     // Reads the control region file without opening the database (no WAL replay).
     // Returns a Rhai map with the full raw contents of the ControlRegion struct:
@@ -36,21 +34,13 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
     //       ...
     //     ]
     //   }
-    {
-        let ctx = ctx.clone();
-        engine.register_fn("load_cr", move || -> Result<Dynamic, Box<EvalAltResult>> {
+    engine.register_fn(
+        "load_cr",
+        |h: &mut DbHandle| -> Result<Dynamic, Box<EvalAltResult>> {
             let (db_path, key_shape) = {
-                let ctx = ctx.lock();
-                match ctx.db_path.clone() {
-                    Some(p) => (p, ctx.key_shape.clone()),
-                    None => {
-                        return Err("No database opened. Call open(\"/path/to/db\") first.".into());
-                    }
-                }
+                let state = h.0.lock();
+                (state.db_path.clone(), state.key_shape.clone())
             };
-            let key_shape = key_shape.ok_or_else(|| -> Box<EvalAltResult> {
-                "No key shape loaded. Call open(\"/path/to/db\") first.".into()
-            })?;
 
             let control_path = db_path.join(CONTROL_REGION_FILE);
             let cr = ControlRegion::read(&control_path, &key_shape).map_err(
@@ -105,6 +95,6 @@ pub(crate) fn register(engine: &mut Engine, ctx: Arc<Mutex<ConsoleContext>>) {
             );
             map.insert("keyspaces".into(), Dynamic::from(ks_array));
             Ok(Dynamic::from(map))
-        });
-    }
+        },
+    );
 }
