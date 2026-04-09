@@ -139,6 +139,15 @@ impl MetricIntGaugeVec {
             None => DUMMY_GAUGE.clone(),
         }
     }
+
+    #[cfg(test)]
+    pub fn label_count(&self) -> usize {
+        use prometheus::core::Collector;
+        match &self.inner {
+            Some(vec) => vec.collect().first().map_or(0, |f| f.get_metric().len()),
+            None => 0,
+        }
+    }
 }
 
 pub struct Metrics {

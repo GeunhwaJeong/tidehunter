@@ -25,7 +25,7 @@ use rand::rngs::ThreadRng;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -36,6 +36,10 @@ pub struct LargeTable {
     pub(crate) flusher: IndexFlusher,
     metrics: Arc<Metrics>,
     pub(crate) fp: LargeTableFailPoints,
+    /// Tracks the (ks, state) label pairs reported in the previous call to
+    /// [`report_entries_state`]. Used to zero out stale combinations that no
+    /// longer have any entries, without resetting the entire gauge vec.
+    reported_entry_state_keys: parking_lot::Mutex<HashSet<(String, &'static str)>>,
 }
 
 pub struct LargeTableEntry {
@@ -253,6 +257,7 @@ impl LargeTable {
             flusher,
             metrics,
             fp: Default::default(),
+            reported_entry_state_keys: parking_lot::Mutex::new(HashSet::new()),
         }
     }
 
@@ -999,7 +1004,7 @@ impl LargeTable {
     }
 
     pub fn report_entries_state(&self) {
-        let mut states: HashMap<_, i64> = HashMap::new();
+        let mut states: HashMap<(String, &'static str), i64> = HashMap::new();
         for ks_table in &self.table {
             for mutex in ks_table.rows.mutexes() {
                 let lock = mutex.lock();
@@ -1010,12 +1015,22 @@ impl LargeTable {
                 }
             }
         }
-        for ((ks, state), value) in states {
+        let mut prev_keys = self.reported_entry_state_keys.lock();
+        for (ks, state) in prev_keys.iter() {
+            if !states.contains_key(&(ks.clone(), *state)) {
+                self.metrics
+                    .entry_state
+                    .with_label_values(&[ks, state])
+                    .set(0);
+            }
+        }
+        for ((ks, state), value) in &states {
             self.metrics
                 .entry_state
-                .with_label_values(&[&ks, state])
-                .set(value);
+                .with_label_values(&[ks, state])
+                .set(*value);
         }
+        *prev_keys = states.into_keys().collect();
     }
 
     pub fn update_flushed_index(
@@ -2689,6 +2704,71 @@ mod tests {
             prev.assume_bytes_id().as_slice(),
             &[0u8, 0, 1],
             "Previous cell before [0,0,2] should be [0,0,1]"
+        );
+    }
+
+    #[test]
+    fn test_report_entries_state() {
+        let config = Arc::new(Config::small());
+        let metrics = Arc::new(Metrics::new());
+        let mut ks_builder = KeyShapeBuilder::new();
+        // Single-cell KS: 1-byte key, 1 mutex
+        let ks_id = ks_builder.add_key_space("test", 1, 1, KeyType::uniform(1));
+        let shape = ks_builder.build();
+        let tmp_dir = tempdir::TempDir::new("test_report_entries_state").unwrap();
+        let wal = Wal::open(
+            tmp_dir.path(),
+            config.wal_layout(WalKind::Replay),
+            Metrics::new(),
+        )
+        .unwrap();
+        let table = LargeTable::from_unloaded(
+            &shape,
+            &LargeTableContainer::new_from_key_shape(&shape, SnapshotEntryData::empty()),
+            config.clone(),
+            IndexFlusher::new_unstarted_for_test(),
+            Arc::clone(&metrics),
+            wal.as_ref(),
+        );
+
+        let entry_state = |state: &str| {
+            metrics
+                .entry_state
+                .with_label_values(&["test", state])
+                .get()
+        };
+
+        // Before any report: all label combinations are absent (metrics return 0 by default)
+        table.report_entries_state();
+        assert_eq!(entry_state("empty"), 1, "one cell should be in empty state");
+        assert_eq!(
+            metrics.entry_state.label_count(),
+            1,
+            "only one label after first report"
+        );
+
+        // Manually set the single entry to DirtyLoaded to simulate a write
+        let context = table.ks_context(ks_id);
+        let (mut row, cell) = table.row(&context, &[0u8]);
+        let (entry, _) = row.entry_mut(&cell);
+        entry
+            .data
+            .make_mut()
+            .insert(Bytes::from(vec![0u8]), WalPosition::test_value(1));
+        entry.state = LargeTableEntryState::DirtyLoaded(WalPosition::test_value(1));
+        drop(row);
+
+        table.report_entries_state();
+        assert_eq!(entry_state("empty"), 0, "empty should be 0 after insert");
+        assert_eq!(
+            entry_state("dirty_loaded"),
+            1,
+            "one cell should be dirty_loaded"
+        );
+        assert_eq!(
+            metrics.entry_state.label_count(),
+            2,
+            "empty + dirty_loaded after second report"
         );
     }
 }
