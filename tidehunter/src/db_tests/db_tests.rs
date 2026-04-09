@@ -2566,6 +2566,169 @@ fn db_test_snapshot_unload_threshold() {
     assert_eq!(replay_position, wal_position_before);
 }
 
+/// Reproduces the bug where ForceRelocate on a dirty entry loses the dirty overlay.
+///
+/// Scenario:
+/// 1. Write to a rarely-updated entry + many bulk entries, snapshot to flush all.
+/// 2. Write more bulk data to advance WAL, run several snapshots so the
+///    rarely-updated entry's `last_processed` advances while its on-disk position stays old.
+/// 3. Write to the rarely-updated entry (becomes dirty).
+/// 4. Snapshot — the old on-disk position falls below `force_relocate_below`.
+///    The buggy code uses ForceRelocate which copies the stale on-disk index
+///    (missing the dirty write) and advances `last_processed` past the dirty write.
+/// 5. Simulate crash recovery (drop + reopen). The dirty write should be present.
+#[test]
+fn test_force_relocate_dirty_entry_preserves_data() {
+    let dir = tempdir::TempDir::new("test_force_relocate_dirty").unwrap();
+    let mut config = Config::small();
+    // Use a small threshold so that entries flush eagerly during snapshots
+    config.snapshot_unload_threshold = 0;
+    // Prevent automatic inline flushing due to dirty key limits
+    config.max_dirty_keys = 100_000;
+    let config = Arc::new(config);
+
+    // "rare" keyspace: 1 cell — the rarely-updated entry
+    // "bulk" keyspace: 128 cells — used to advance WAL and establish high positions
+    let mut builder = KeyShapeBuilder::new();
+    let ks_rare = builder.add_key_space("rare", 8, 1, KeyType::uniform(1));
+    let ks_bulk = builder.add_key_space("bulk", 8, 16, KeyType::uniform(8));
+    let key_shape = builder.build();
+
+    let rare_key = 0u64.to_be_bytes().to_vec();
+    let initial_value: Vec<u8> = vec![0x01; 128];
+    let updated_value: Vec<u8> = vec![0x02; 128];
+    let bulk_value: Vec<u8> = vec![0xBB; 512];
+
+    // Helper: generate bulk keys that spread across all cells.
+    // Keys are 8 bytes; the cell is determined by the first 4 bytes (starting_u32).
+    // Use the upper 32 bits to distribute evenly across cells.
+    let bulk_key = |i: u32| -> Vec<u8> {
+        let mut key = [0u8; 8];
+        key[..4].copy_from_slice(&i.to_be_bytes());
+        key.to_vec()
+    };
+
+    // --- Phase 1: Write initial data and flush everything ---
+    {
+        let metrics = Metrics::new();
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            metrics.clone(),
+        )
+        .expect("open failed");
+
+        // Write to rare entry
+        db.insert(ks_rare, rare_key.clone(), initial_value.clone())
+            .expect("insert failed");
+
+        // Write to many bulk cells so they establish on-disk positions.
+        // Use keys that spread evenly across all 128 cells.
+        let num_bulk_keys: u32 = 256;
+        let step = u32::MAX / num_bulk_keys;
+        for i in 0..num_bulk_keys {
+            db.insert(ks_bulk, bulk_key(i * step), bulk_value.clone())
+                .expect("insert failed");
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        // Snapshot 1: flush everything (threshold=0 means all dirty entries get flushed)
+        db.force_rebuild_control_region()
+            .expect("snapshot 1 failed");
+
+        // Verify initial value is readable
+        let val = db.get(ks_rare, &rare_key).expect("get failed");
+        assert_eq!(
+            val,
+            Some(Bytes::from(initial_value.clone())),
+            "initial value should be readable"
+        );
+
+        // --- Phase 2: Advance WAL far past the rare entry, run snapshots to advance last_processed ---
+        // Write bulk data in several rounds with snapshots in between.
+        // This advances the rare entry's last_processed (it's clean) while its
+        // on-disk position stays at the original low WAL offset.
+        for round in 0..5 {
+            for i in 0..num_bulk_keys {
+                let v = vec![(round + 2) as u8; 512];
+                db.insert(ks_bulk, bulk_key(i * step), v)
+                    .expect("insert failed");
+            }
+            thread::sleep(Duration::from_millis(50));
+
+            // Each snapshot: bulk entries get flushed at new high positions,
+            // rare entry stays clean → last_processed advanced to current WAL frontier.
+            db.force_rebuild_control_region().expect("snapshot failed");
+        }
+
+        // --- Phase 3: Write to the rare entry (becomes dirty) ---
+        db.insert(ks_rare, rare_key.clone(), updated_value.clone())
+            .expect("insert failed");
+        thread::sleep(Duration::from_millis(50));
+
+        // Verify updated value is readable in memory
+        let val = db.get(ks_rare, &rare_key).expect("get failed");
+        assert_eq!(
+            val,
+            Some(Bytes::from(updated_value.clone())),
+            "updated value should be readable before snapshot"
+        );
+
+        let forced_relocation_before = metrics
+            .snapshot_forced_relocation
+            .with_label_values(&["rare"])
+            .get();
+
+        // --- Phase 4: Snapshot — triggers forced relocation ---
+        // The rare entry's on-disk position is always the lowest in the snapshot
+        // (flushed first), so it falls below force_relocate_below (99th percentile).
+        // With the bug, ForceRelocate copies the stale on-disk index and advances
+        // last_processed past the dirty write's WAL position.
+        db.force_rebuild_control_region()
+            .expect("final snapshot failed");
+
+        let forced_relocation_after = metrics
+            .snapshot_forced_relocation
+            .with_label_values(&["rare"])
+            .get();
+
+        // Verify forced relocation actually happened for the rare entry
+        assert!(
+            forced_relocation_after > forced_relocation_before,
+            "forced relocation should have been triggered for the rare entry"
+        );
+
+        // Verify value is still correct in memory after snapshot
+        let val = db.get(ks_rare, &rare_key).expect("get failed");
+        assert_eq!(
+            val,
+            Some(Bytes::from(updated_value.clone())),
+            "updated value should still be readable after snapshot"
+        );
+    }
+
+    // --- Phase 5: Crash recovery — reopen DB and verify dirty write survived ---
+    {
+        let metrics = Metrics::new();
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            metrics.clone(),
+        )
+        .expect("reopen failed");
+
+        let val = db.get(ks_rare, &rare_key).expect("get failed");
+        assert_eq!(
+            val,
+            Some(Bytes::from(updated_value.clone())),
+            "updated value must survive crash recovery — \
+             if this fails, ForceRelocate dropped the dirty overlay"
+        );
+    }
+}
+
 #[test]
 // This test simulates a situation
 // where index wal file is deleted while index is being read by another thread.

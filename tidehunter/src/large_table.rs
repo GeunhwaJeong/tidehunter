@@ -1524,13 +1524,13 @@ impl LargeTableEntry {
 
         self.pending_last_processed = Some(loader_last_processed);
 
-        if forced_relocation {
-            self.context
-                .metrics
-                .snapshot_force_unload
-                .with_label_values(&[self.context.name()])
-                .inc();
-            // For forced relocation: use ForceRelocate — flusher loads from disk at old position
+        self.context
+            .metrics
+            .snapshot_force_unload
+            .with_label_values(&[self.context.name()])
+            .inc();
+        if forced_relocation && !self.state.is_dirty() {
+            // Clean entry needing relocation: re-read from old position and re-write
             let old_position = self
                 .state
                 .wal_position()
@@ -1542,11 +1542,9 @@ impl LargeTableEntry {
                 FlushKind::ForceRelocate(old_position),
             );
         } else {
-            self.context
-                .metrics
-                .snapshot_force_unload
-                .with_label_values(&[self.context.name()])
-                .inc();
+            // Dirty entry (with or without forced relocation): normal flush merges
+            // the dirty overlay. For forced relocation of dirty entries, the new flush
+            // position will naturally be past force_relocate_below, achieving relocation.
             let flush_kind = self
                 .flush_kind()
                 .expect("entry must be dirty for non-relocation async snapshot flush");
