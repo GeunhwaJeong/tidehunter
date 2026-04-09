@@ -1,3 +1,4 @@
+let db = setup_db();
 // ks has 5 records written, 2 removed → 3 live
 let count = 0;
 db.scan("ks", |key, value| { count += 1; });

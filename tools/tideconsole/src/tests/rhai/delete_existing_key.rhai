@@ -1,3 +1,4 @@
+let db = setup_db();
 let key = to_hex("key04___");
 let before = db.exists("ks", key);
 db.delete("ks", key);

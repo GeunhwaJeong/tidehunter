@@ -1,39 +1,31 @@
-use super::{run_cr_rhai_test, setup_db_with_cr};
+use super::{run_rhai_test, setup_db_with_cr};
 use crate::engine::{ConsoleContext, create_engine};
 use parking_lot::Mutex;
 use rhai::{Dynamic, Scope};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
-// CR setup helper — shared with tests/mod.rs via setup_db_with_cr
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Rhai-file tests (standard CR setup)
+// Rhai-file tests — setup happens inside the .rhai scripts via setup_cr_db()
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_load_cr_structure() {
-    let (_dir, path) = setup_db_with_cr();
-    run_cr_rhai_test(&path, "load_cr_structure.rhai");
+    run_rhai_test("load_cr_structure.rhai");
 }
 
 #[test]
 fn test_load_cr_valid_cells_after_snapshot() {
-    let (_dir, path) = setup_db_with_cr();
-    run_cr_rhai_test(&path, "load_cr_valid_cells.rhai");
+    run_rhai_test("load_cr_valid_cells.rhai");
 }
 
 #[test]
 fn test_force_snapshot_returns_position() {
-    let (_dir, path) = setup_db_with_cr();
-    run_cr_rhai_test(&path, "force_snapshot_returns_position.rhai");
+    run_rhai_test("force_snapshot_returns_position.rhai");
 }
 
 #[test]
 fn test_analyze_ks_returns_expected_fields() {
-    let (_dir, path) = setup_db_with_cr();
-    run_cr_rhai_test(&path, "analyze_ks_fields.rhai");
+    run_rhai_test("analyze_ks_fields.rhai");
 }
 
 // ---------------------------------------------------------------------------

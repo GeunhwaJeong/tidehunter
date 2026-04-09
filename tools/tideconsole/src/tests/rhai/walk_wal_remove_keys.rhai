@@ -1,5 +1,6 @@
-// ks_id is injected into scope by the test runner
-// key00___ and key01___ were deleted from ks
+let db = setup_db();
+// "ks" is added first → id=0; key00___ and key01___ were deleted
+let ks_id = 0;
 let remove_keys = [];
 db.walk_wal(|entry| {
     if entry.entry_type == "remove" && entry.keyspace == ks_id {

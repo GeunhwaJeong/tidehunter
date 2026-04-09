@@ -1,2 +1,2 @@
-let key = to_hex("key03___");
-assert(db.exists("ks", key), "key03 should exist");
+let db = setup_db();
+assert(db.exists("ks", to_hex("key03___")), "key03 should exist");

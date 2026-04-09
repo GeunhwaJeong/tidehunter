@@ -1,3 +1,4 @@
+let db = setup_db();
 // ks2 has 3 records with 8-byte values → 16 hex chars each
 let lens = [];
 db.scan("ks2", |key, value| { lens.push(value.len()); });

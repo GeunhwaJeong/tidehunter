@@ -1,3 +1,4 @@
+let db = setup_db();
 let key = to_hex("newkey__");
 let value = to_hex("helloworld______"); // 16 bytes
 db.put("ks", key, value);

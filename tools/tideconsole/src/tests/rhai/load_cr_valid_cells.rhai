@@ -1,7 +1,7 @@
-// After force_rebuild_control_region, at least some cells should have valid offsets
-let cr = db.load_cr();
+let db = setup_cr_db();
+// After force_snapshot, at least some cells should have valid offsets
 let valid = 0;
-for ks in cr["keyspaces"] {
+for ks in db.load_cr()["keyspaces"] {
     for c in ks["cells"] {
         if c["offset"] >= 0 { valid += 1; }
     }

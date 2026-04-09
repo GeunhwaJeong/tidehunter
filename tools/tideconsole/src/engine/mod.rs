@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tidehunter::config::Config;
 use tidehunter::db::{Db, DbResult};
-use tidehunter::key_shape::{KeyShape, KeySpace};
+use tidehunter::key_shape::{KeyShape, KeyShapeBuilder, KeySpace, KeyType};
 use tidehunter::test_utils::{Metrics, WalEntry};
 
 // ---------------------------------------------------------------------------
@@ -269,6 +269,66 @@ pub fn create_engine(ctx: Arc<Mutex<ConsoleContext>>) -> Engine {
                     config,
                     key_shape,
                     db: None,
+                    print_fn,
+                }))))
+            },
+        );
+    }
+
+    // --- create_db(path, [{name, key_size}, ...]) → DbHandle ---
+    // Creates a new database with the given keyspaces and returns an open handle.
+    // Unlike open(), WAL replay is not needed because the database is freshly created.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "create_db",
+            move |path: &str, ks_specs: rhai::Array| -> Result<DbHandle, Box<EvalAltResult>> {
+                let db_path = PathBuf::from(path);
+                std::fs::create_dir_all(&db_path).map_err(|e| -> Box<EvalAltResult> {
+                    format!("Failed to create directory \"{path}\": {e}").into()
+                })?;
+
+                let mut builder = KeyShapeBuilder::new();
+                for spec in &ks_specs {
+                    let map = spec.clone().try_cast::<rhai::Map>().ok_or_else(
+                        || -> Box<EvalAltResult> {
+                            "each keyspace spec must be a map #{name, key_size}".into()
+                        },
+                    )?;
+                    let name = map
+                        .get("name")
+                        .ok_or_else(|| -> Box<EvalAltResult> {
+                            "keyspace spec missing 'name'".into()
+                        })?
+                        .clone()
+                        .cast::<String>();
+                    let key_size = map
+                        .get("key_size")
+                        .ok_or_else(|| -> Box<EvalAltResult> {
+                            "keyspace spec missing 'key_size'".into()
+                        })?
+                        .clone()
+                        .cast::<i64>() as usize;
+                    let _: KeySpace =
+                        builder.add_key_space(&name, key_size, 16, KeyType::uniform(key_size));
+                }
+                let key_shape = builder.build();
+                let config = Config::default();
+                let db = Db::open(
+                    &db_path,
+                    key_shape.clone(),
+                    Arc::new(config.clone()),
+                    Metrics::new(),
+                )
+                .map_err(|e| -> Box<EvalAltResult> {
+                    format!("Failed to create database: {e:?}").into()
+                })?;
+                let print_fn = ctx.lock().print_fn.clone();
+                Ok(DbHandle(Arc::new(Mutex::new(DbState {
+                    db_path,
+                    config,
+                    key_shape,
+                    db: Some(db),
                     print_fn,
                 }))))
             },

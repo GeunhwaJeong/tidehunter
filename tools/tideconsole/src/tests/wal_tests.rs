@@ -37,32 +37,32 @@ fn test_is_complete_multiline_complete() {
 
 #[test]
 fn test_walk_wal_total_entry_counts() {
-    run_rhai_test(&setup_db(), "walk_wal_entry_counts.rhai");
+    run_rhai_test("walk_wal_entry_counts.rhai");
 }
 
 #[test]
 fn test_walk_wal_filter_by_keyspace() {
-    run_rhai_test(&setup_db(), "walk_wal_filter_by_keyspace.rhai");
+    run_rhai_test("walk_wal_filter_by_keyspace.rhai");
 }
 
 #[test]
 fn test_walk_wal_record_fields() {
-    run_rhai_test(&setup_db(), "walk_wal_record_fields.rhai");
+    run_rhai_test("walk_wal_record_fields.rhai");
 }
 
 #[test]
 fn test_walk_wal_remove_keys() {
-    run_rhai_test(&setup_db(), "walk_wal_remove_keys.rhai");
+    run_rhai_test("walk_wal_remove_keys.rhai");
 }
 
 #[test]
 fn test_walk_wal_from_position() {
-    run_rhai_test(&setup_db(), "walk_wal_from_position.rhai");
+    run_rhai_test("walk_wal_from_position.rhai");
 }
 
 #[test]
 fn test_load_index_invalid_offset() {
-    run_rhai_test(&setup_db(), "load_index_invalid_offset.rhai");
+    run_rhai_test("load_index_invalid_offset.rhai");
 }
 
 // ---------------------------------------------------------------------------

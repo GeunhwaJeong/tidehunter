@@ -1,3 +1,4 @@
+let db = setup_db();
 // db.load_index(-1) should fail because -1 means "no index"
 let threw = false;
 try {

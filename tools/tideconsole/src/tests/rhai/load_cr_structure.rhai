@@ -1,3 +1,4 @@
+let db = setup_cr_db();
 let cr = db.load_cr();
 assert(cr["last_position"] >= 0, "last_position should be non-negative");
 

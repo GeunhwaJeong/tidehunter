@@ -1,2 +1,2 @@
-let key = to_hex("key00___");
-assert(!db.exists("ks", key), "deleted key should not exist");
+let db = setup_db();
+assert(!db.exists("ks", to_hex("key00___")), "deleted key should not exist");

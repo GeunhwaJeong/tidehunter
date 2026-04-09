@@ -1,2 +1,2 @@
-let key = to_hex("nokey___");
-assert(!db.exists("ks", key), "missing key should not exist");
+let db = setup_db();
+assert(!db.exists("ks", to_hex("nokey___")), "missing key should not exist");
