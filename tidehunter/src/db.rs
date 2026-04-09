@@ -1156,12 +1156,14 @@ impl Drop for Db {
                 t.unpark();
             }
         }
-        let (sender, recv) = mpsc::channel();
-        self.relocator
-            .0
-            .send(RelocationCommand::Cancel(sender))
-            .ok();
-        recv.recv().ok();
+        // Note: we intentionally do NOT send Cancel to the relocation driver here.
+        // When this drop runs, the Relocator (Sender) field will be dropped as part
+        // of automatic field destruction, disconnecting the channel. The driver's
+        // `receiver.recv()` will return Err and the run loop exits cleanly.
+        //
+        // Sending Cancel and blocking on the ack would deadlock if the relocation
+        // driver held the last Arc<Db>: Db::drop would fire inside the driver thread,
+        // which is also the channel reader — so nobody would process the Cancel.
     }
 }
 
