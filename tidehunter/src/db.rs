@@ -182,7 +182,7 @@ impl Db {
     }
 
     /// Load key shape from database directory
-    #[doc(hidden)] // Used by tools/wal_inspector for loading database schema
+    #[doc(hidden)] // Used by tools/tideconsole for loading database schema
     pub fn load_key_shape(path: &Path) -> DbResult<KeyShape> {
         let shape_file_path = Self::shape_file_path(path);
         if !shape_file_path.exists() {
@@ -218,7 +218,7 @@ impl Db {
     }
 
     /// Load config from database directory
-    #[doc(hidden)] // Used by tools/wal_inspector for loading database config
+    #[doc(hidden)] // Used by tools/tideconsole for loading database config
     pub fn load_config(path: &Path) -> DbResult<Config> {
         let config_file_path = Self::config_file_path(path);
         if !config_file_path.exists() {
@@ -1249,7 +1249,7 @@ impl Loader for Db {
     }
 }
 
-#[doc(hidden)] // Used by tools/wal_inspector for WAL inspection
+#[doc(hidden)] // Used by tools/tideconsole for WAL inspection
 #[derive(Debug)]
 pub enum WalEntry {
     Record(

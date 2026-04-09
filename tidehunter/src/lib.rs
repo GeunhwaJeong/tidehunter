@@ -2,7 +2,7 @@ pub mod batch;
 mod cell;
 pub mod config;
 mod context;
-#[doc(hidden)] // Used by tools/wal_inspector for control region inspection
+#[doc(hidden)] // Used by tools/tideconsole for control region inspection
 pub mod control;
 #[doc(hidden)] // Used by benchmarks and tools for WAL writes
 pub mod crc;
@@ -14,7 +14,7 @@ mod flusher;
 pub mod index;
 pub mod iterators;
 pub mod key_shape;
-#[doc(hidden)] // Used by tools/wal_inspector for control region inspection
+#[doc(hidden)] // Used by tools/tideconsole for control region inspection
 pub mod large_table;
 mod lock;
 pub mod lookup;

@@ -425,7 +425,7 @@ impl KeySpaceDesc {
         self.config.unloaded_iterator
     }
 
-    #[doc(hidden)] // Used by tools/wal_inspector to display keyspace names
+    #[doc(hidden)] // Used by tools/tideconsole to display keyspace names
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -434,7 +434,7 @@ impl KeySpaceDesc {
         self.id
     }
 
-    #[doc(hidden)] // Used by tools/wal_inspector for analyzing keyspace indices
+    #[doc(hidden)] // Used by tools/tideconsole for analyzing keyspace indices
     pub fn index_format(&self) -> &IndexFormatType {
         &self.config.index_format
     }
@@ -626,7 +626,7 @@ impl KeyShape {
         (this, KeySpace(0))
     }
 
-    #[doc(hidden)] // Used by tools/wal_inspector for iterating over keyspaces
+    #[doc(hidden)] // Used by tools/tideconsole for iterating over keyspaces
     pub fn iter_ks(&self) -> impl Iterator<Item = &KeySpaceDesc> + '_ {
         self.key_spaces.iter()
     }
@@ -662,13 +662,13 @@ impl KeySpace {
         Self(v)
     }
 
-    #[doc(hidden)] // Used by tools/wal_inspector for keyspace handling
+    #[doc(hidden)] // Used by tools/tideconsole for keyspace handling
     #[cfg(feature = "test-utils")]
     pub fn new(v: u8) -> Self {
         Self(v)
     }
 
-    #[doc(hidden)] // Used by tools/wal_inspector for keyspace handling
+    #[doc(hidden)] // Used by tools/tideconsole for keyspace handling
     #[cfg(feature = "test-utils")]
     pub fn as_u8(&self) -> u8 {
         self.0

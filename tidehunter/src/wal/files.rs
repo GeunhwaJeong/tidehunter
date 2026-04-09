@@ -93,7 +93,7 @@ impl WalFiles {
 }
 
 #[allow(dead_code)]
-#[doc(hidden)] // Used by tools/wal_inspector for progress tracking
+#[doc(hidden)] // Used by tools/tideconsole for listing WAL files
 #[cfg(any(test, feature = "test-utils"))]
 pub fn list_wal_files_with_sizes(base_path: &Path) -> io::Result<Vec<(PathBuf, u64)>> {
     let prefix = format!("{}_", WalKind::Replay.name());

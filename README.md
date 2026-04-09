@@ -109,14 +109,6 @@ Tidehunter has a couple of tricks up its sleeve that can provide very high speed
 
 Tidehunter includes tools for inspecting and debugging databases.
 
-## wal_inspector
-
-A CLI for offline analysis of WAL files. Commands: `stat`, `verify`, `force-snapshot`, `control-region`, `analyze-ks`.
-
-```bash
-cargo run -p wal_inspector -- stat --db /path/to/db
-```
-
 ## tideconsole
 
 An interactive [Rhai](https://rhai.rs/) shell for exploring a live database.

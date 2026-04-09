@@ -124,7 +124,7 @@ impl Config {
         self.frag_size
     }
 
-    #[doc(hidden)] // Used by tools/wal_inspector to get WAL configuration
+    #[doc(hidden)] // Used by tools/tideconsole to get WAL configuration
     pub fn wal_layout(&self, kind: WalKind) -> WalLayout {
         let max_maps = match kind {
             WalKind::Index => self.max_index_maps.unwrap_or(self.max_maps),

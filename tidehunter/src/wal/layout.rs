@@ -10,7 +10,7 @@ pub enum WalKind {
     Index,
 }
 
-#[doc(hidden)] // Used by tools/wal_inspector for WAL configuration
+#[doc(hidden)] // Used by tools/tideconsole for WAL configuration
 #[derive(Clone)]
 pub struct WalLayout {
     pub frag_size: u64,
@@ -99,7 +99,7 @@ impl WalLayout {
         start..end
     }
 
-    #[doc(hidden)] // Used by tools/wal_inspector for control region inspection
+    #[doc(hidden)] // Used by tools/tideconsole for control region inspection
     #[inline]
     pub fn locate_file(&self, offset: u64) -> WalFileId {
         WalFileId(offset / self.wal_file_size)

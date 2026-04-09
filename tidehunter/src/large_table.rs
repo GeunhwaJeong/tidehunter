@@ -104,7 +104,7 @@ enum Entries {
 
 /// Snapshot data for a single entry containing both WAL position and last processed position
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-#[doc(hidden)] // Used by tools/wal_inspector for control region inspection
+#[doc(hidden)] // Used by tools/tideconsole for control region inspection
 pub struct SnapshotEntryData {
     pub position: WalPosition,
     pub last_processed: LastProcessed,
@@ -124,7 +124,7 @@ impl SnapshotEntryData {
 /// Vec index corresponds to keyspace (same as keyspace_names Vec)
 /// CellId is scoped within each keyspace
 #[derive(Serialize, Deserialize, Debug)]
-#[doc(hidden)] // Used by tools/wal_inspector for control region inspection
+#[doc(hidden)] // Used by tools/tideconsole for control region inspection
 pub struct LargeTableContainer<T> {
     // Vec[ks_idx] = BTreeMap of all cells in that keyspace
     pub data: Vec<BTreeMap<CellId, T>>,

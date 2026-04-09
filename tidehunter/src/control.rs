@@ -8,7 +8,7 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Debug)]
-#[doc(hidden)] // Used by tools/wal_inspector for control region inspection
+#[doc(hidden)] // Used by tools/tideconsole for control region inspection
 pub struct ControlRegion {
     /// 0 when wal is empty or nothing has been processed
     last_position: u64,
@@ -66,7 +66,7 @@ impl ControlRegion {
         }
     }
 
-    #[doc(hidden)] // Used by tools/wal_inspector for control region inspection
+    #[doc(hidden)] // Used by tools/tideconsole for control region inspection
     pub fn read(path: &Path, key_shape: &KeyShape) -> io::Result<Self> {
         let bytes = fs::read(path)?;
         let mut control_region: ControlRegion =

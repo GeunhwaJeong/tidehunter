@@ -2446,18 +2446,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wal_inspector"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "hex",
- "indicatif",
- "tempfile",
- "tidehunter",
-]
-
-[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -177,7 +177,7 @@ impl WalWriter {
 }
 
 impl Wal {
-    #[doc(hidden)] // Used by tools/wal_inspector to open WAL files directly
+    #[doc(hidden)] // Used by tools/tideconsole to open WAL files directly
     pub fn open(
         base_path: &Path,
         layout: WalLayout,
