@@ -657,6 +657,22 @@ impl IndexTable {
     // lookup_header.rs can use without touching IndexWalPosition internals.
     // -------------------------------------------------------------------------
 
+    /// Returns the number of entries in a variable-length flat section.
+    pub(super) fn flat_varlen_count(buffer: &[u8]) -> usize {
+        flat_count(buffer, None)
+    }
+
+    /// Returns the key slice and WAL position for the entry at `idx`. O(1) via the offset table.
+    pub(super) fn flat_varlen_entry_at(buffer: &[u8], idx: usize) -> (&[u8], WalPosition) {
+        let (key, iwp) = flat_entry_at(buffer, None, idx);
+        (key, iwp.into_update_position())
+    }
+
+    /// Lower bound: smallest index `i` where `buffer[i].key >= key`.
+    pub(super) fn flat_varlen_lower_bound(buffer: &[u8], key: &[u8]) -> usize {
+        flat_lower_bound(buffer, None, key)
+    }
+
     /// Binary-search a variable-length flat section for `key`.
     /// Returns the WAL position if found, None otherwise.
     pub(super) fn flat_varlen_lookup(buffer: &[u8], key: &[u8]) -> Option<WalPosition> {

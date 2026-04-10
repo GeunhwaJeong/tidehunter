@@ -49,7 +49,7 @@ pub struct KeySpaceDescInner {
     config: KeySpaceConfig,
 }
 
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct KeySpaceConfig {
     #[serde(skip)]
     compactor: Option<Arc<Compactor>>,
@@ -58,9 +58,25 @@ pub struct KeySpaceConfig {
     bloom_filter: Option<BloomFilterParams>,
     value_cache_size: usize,
     index_format: IndexFormatType,
+    #[serde(default = "KeySpaceConfig::default_unloaded_iterator")]
     unloaded_iterator: bool,
     #[serde(skip)]
     relocation_filter: Option<Arc<Box<dyn RelocationFilter>>>,
+}
+
+impl Default for KeySpaceConfig {
+    fn default() -> Self {
+        Self {
+            compactor: None,
+            disable_unload: false,
+            max_dirty_keys: None,
+            bloom_filter: None,
+            value_cache_size: 0,
+            index_format: IndexFormatType::default(),
+            unloaded_iterator: true,
+            relocation_filter: None,
+        }
+    }
 }
 
 /// This enum allows customizing the key used in the index.
@@ -573,6 +589,15 @@ impl KeySpaceConfig {
     pub fn with_unloaded_iterator(mut self, enabled: bool) -> Self {
         self.unloaded_iterator = enabled;
         self
+    }
+
+    pub fn with_unloaded_iterator_disabled(mut self) -> Self {
+        self.unloaded_iterator = false;
+        self
+    }
+
+    fn default_unloaded_iterator() -> bool {
+        true
     }
 }
 

@@ -136,6 +136,164 @@ impl LookupHeaderIndex {
 
         Some((key, pos, start_pos))
     }
+
+    /// Same as `search_in_micro_cell_buffer` but for variable-length key sections.
+    /// Uses the flat-buffer offset table for O(1) entry access and O(log n) binary search.
+    fn search_in_varlen_micro_cell_buffer(
+        buffer: &Bytes,
+        prev: Option<&[u8]>,
+        direction: Direction,
+        metrics: &Metrics,
+    ) -> Option<(Bytes, WalPosition, usize)> {
+        let _timer = metrics.lookup_scan_mcs.clone().mcs_timer();
+        let count = IndexTable::flat_varlen_count(buffer);
+        if count == 0 {
+            return None;
+        }
+
+        let start_pos = if let Some(prev_key) = prev {
+            let lb = IndexTable::flat_varlen_lower_bound(buffer, prev_key);
+            match direction {
+                Direction::Forward => {
+                    // If prev_key exists at lb, skip past it; otherwise lb is the insertion point.
+                    let exact =
+                        lb < count && IndexTable::flat_varlen_entry_at(buffer, lb).0 == prev_key;
+                    if exact { lb + 1 } else { lb }
+                }
+                Direction::Backward => {
+                    // Whether or not prev_key exists, entries before lb are all < prev_key.
+                    lb.checked_sub(1)?
+                }
+            }
+        } else {
+            direction.first_in_range(0..count)
+        };
+
+        if start_pos >= count {
+            return None;
+        }
+
+        let (key_slice, pos) = IndexTable::flat_varlen_entry_at(buffer, start_pos);
+        let key = Self::varlen_key_to_bytes(buffer, key_slice);
+        Some((key, pos, start_pos))
+    }
+
+    /// Convert a `key_slice` that borrows from `buffer` into a zero-copy `Bytes` sub-slice.
+    fn varlen_key_to_bytes(buffer: &Bytes, key_slice: &[u8]) -> Bytes {
+        let b_ptr = buffer.as_ptr() as usize;
+        let key_abs = key_slice.as_ptr() as usize - b_ptr;
+        buffer.slice(key_abs..key_abs + key_slice.len())
+    }
+
+    /// `next_entry_unloaded` implementation for variable-length key spaces.
+    #[allow(clippy::too_many_arguments)]
+    fn next_entry_unloaded_varlen(
+        &self,
+        reader: &impl RandomRead,
+        prev: Option<&[u8]>,
+        direction: Direction,
+        metrics: &Metrics,
+        position: WalPosition,
+        cache: &mut Option<IndexIterCache>,
+        start_micro_cell: usize,
+    ) -> Option<(Bytes, WalPosition)> {
+        let mut current_micro_cell = start_micro_cell;
+
+        loop {
+            let cache_hit: Option<(Bytes, usize)> = if let Some(IndexIterCache::LookupHeader {
+                micro_cell: cached_mc,
+                buffer,
+                last_returned_pos,
+                ..
+            }) = cache.as_ref()
+            {
+                if *cached_mc == current_micro_cell {
+                    Some((buffer.clone(), *last_returned_pos))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let result: Option<(Bytes, WalPosition, usize)> = if let Some((buffer, last_pos)) =
+                cache_hit
+            {
+                let count = IndexTable::flat_varlen_count(&buffer);
+
+                if let Some(prev_key) = prev {
+                    let (key_at_last, _) = IndexTable::flat_varlen_entry_at(&buffer, last_pos);
+                    if key_at_last == prev_key {
+                        // O(1) sequential path: prev is exactly the last entry we cached.
+                        let next_pos = match direction {
+                            Direction::Forward => {
+                                let p = last_pos + 1;
+                                if p < count { Some(p) } else { None }
+                            }
+                            Direction::Backward => last_pos.checked_sub(1),
+                        };
+                        if let Some(next_pos) = next_pos {
+                            let (key_slice, val) =
+                                IndexTable::flat_varlen_entry_at(&buffer, next_pos);
+                            let key = Self::varlen_key_to_bytes(&buffer, key_slice);
+                            Some((key, val, next_pos))
+                        } else {
+                            *cache = None;
+                            current_micro_cell = next_bounded(
+                                current_micro_cell,
+                                HEADER_ELEMENTS,
+                                direction == Direction::Backward,
+                            )?;
+                            continue;
+                        }
+                    } else {
+                        Self::search_in_varlen_micro_cell_buffer(&buffer, prev, direction, metrics)
+                    }
+                } else {
+                    Self::search_in_varlen_micro_cell_buffer(&buffer, prev, direction, metrics)
+                }
+            } else {
+                let Some(buffer) =
+                    self.read_micro_cell_section(reader, current_micro_cell, metrics)
+                else {
+                    *cache = None;
+                    current_micro_cell = next_bounded(
+                        current_micro_cell,
+                        HEADER_ELEMENTS,
+                        direction == Direction::Backward,
+                    )?;
+                    continue;
+                };
+
+                let result =
+                    Self::search_in_varlen_micro_cell_buffer(&buffer, prev, direction, metrics);
+                *cache = Some(IndexIterCache::LookupHeader {
+                    position,
+                    micro_cell: current_micro_cell,
+                    buffer,
+                    last_returned_pos: 0,
+                });
+                result
+            };
+
+            if let Some((key, val, entry_pos)) = result {
+                if let Some(IndexIterCache::LookupHeader {
+                    last_returned_pos, ..
+                }) = cache.as_mut()
+                {
+                    *last_returned_pos = entry_pos;
+                }
+                return Some((key, val));
+            }
+
+            *cache = None;
+            current_micro_cell = next_bounded(
+                current_micro_cell,
+                HEADER_ELEMENTS,
+                direction == Direction::Backward,
+            )?;
+        }
+    }
 }
 
 impl IndexFormat for LookupHeaderIndex {
@@ -241,13 +399,18 @@ impl IndexFormat for LookupHeaderIndex {
             direction.first_in_range(0..HEADER_ELEMENTS)
         };
 
-        let Some((key_size, element_size)) = ks.index_key_element_size() else {
-            unimplemented!(
-                "unloaded forward/backward iteration is not yet supported for \
-                 variable-length key spaces (ks={})",
-                ks.name()
+        if ks.index_key_element_size().is_none() {
+            return self.next_entry_unloaded_varlen(
+                reader,
+                prev,
+                direction,
+                metrics,
+                position,
+                cache,
+                start_micro_cell,
             );
-        };
+        }
+        let (key_size, element_size) = ks.index_key_element_size().unwrap();
         let mut current_micro_cell = start_micro_cell;
 
         loop {
