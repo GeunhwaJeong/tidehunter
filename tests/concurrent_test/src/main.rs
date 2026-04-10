@@ -1,6 +1,6 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Instant;
 use tidehunter::config::Config;
 use tidehunter::db::Db;
-use tidehunter::key_shape::{KeyShape, KeyType};
+use tidehunter::key_shape::{KeyShape, KeyShapeBuilder, KeyType};
 use tidehunter::metrics::Metrics;
 use tidehunter::minibytes::Bytes;
 
@@ -133,7 +133,10 @@ fn main() {
     config.snapshot_written_bytes = 4 * 1024 * 1024; // 4 MB — trigger snapshots frequently
     let config = Arc::new(config);
 
-    let (key_shape, key_space) = KeyShape::new_single(1, 8, KeyType::uniform(1));
+    let mut key_shape_builder = KeyShapeBuilder::new();
+    let key_space = key_shape_builder.add_key_space("main", 1, 8, KeyType::uniform(1));
+    let key_space2 = key_shape_builder.add_key_space("secondary", 4, 8, KeyType::uniform(1));
+    let key_shape = key_shape_builder.build();
 
     // Shared metrics across restarts so relocation counters accumulate
     let shared_metrics = Metrics::new();
@@ -149,6 +152,11 @@ fn main() {
     // Track number of database restarts and rebuilds for debugging
     let restart_count = Arc::new(AtomicU64::new(0));
     let rebuild_count = Arc::new(AtomicU64::new(0));
+
+    // Secondary key space state - tracks expected contents for correctness checking
+    let secondary_state: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
+    let next_secondary_key = Arc::new(AtomicU64::new(0));
 
     // Path for database restarts
     let db_path = temp_dir.path().to_path_buf();
@@ -203,6 +211,8 @@ fn main() {
         let key_shape = key_shape.clone();
         let config = config.clone();
         let shared_metrics = shared_metrics.clone();
+        let secondary_state = secondary_state.clone();
+        let next_secondary_key = next_secondary_key.clone();
 
         // Create progress bar for this thread
         let thread_pb = multi_progress.add(ProgressBar::new(operations_per_thread as u64));
@@ -293,6 +303,46 @@ fn main() {
                     let db_read = db.read();
                     let db_instance = db_read.as_ref().unwrap();
                     db_instance.start_relocation().unwrap();
+                }
+
+                // 1% chance to operate on secondary key space
+                if rng.gen_range(0..100) < 1 {
+                    let mut state = secondary_state.lock();
+                    let roll = rng.gen_range(0..100u32);
+                    let db_read = db.read();
+                    let db_instance = db_read.as_ref().unwrap();
+
+                    if roll < 10 && state.len() > 2 {
+                        // Overwrite existing value
+                        let idx = rng.gen_range(state.len() / 2..state.len());
+                        let key = state.keys().nth(idx).unwrap().clone();
+                        let mut value = vec![0u8; 16];
+                        value[0..4].copy_from_slice(&(thread_id as u32).to_be_bytes());
+                        value[4..8].copy_from_slice(&(op_num as u32).to_be_bytes());
+                        value[8..16].copy_from_slice(b"KS2OVRWR");
+                        db_instance
+                            .insert(key_space2, key.clone(), value.clone())
+                            .unwrap();
+                        state.insert(key, value);
+                    } else if roll < 20 && state.len() > 2 {
+                        // Remove existing value
+                        let idx = rng.gen_range(state.len() / 2..state.len());
+                        let key = state.keys().nth(idx).unwrap().clone();
+                        db_instance.remove(key_space2, key.clone()).unwrap();
+                        state.remove(&key);
+                    } else {
+                        // Insert new value
+                        let next = next_secondary_key.fetch_add(1, Ordering::Relaxed);
+                        let key = (next as u32).to_be_bytes().to_vec();
+                        let mut value = vec![0u8; 16];
+                        value[0..4].copy_from_slice(&(thread_id as u32).to_be_bytes());
+                        value[4..8].copy_from_slice(&(op_num as u32).to_be_bytes());
+                        value[8..16].copy_from_slice(b"KS2NEWKV");
+                        db_instance
+                            .insert(key_space2, key.clone(), value.clone())
+                            .unwrap();
+                        state.insert(key, value);
+                    }
                 }
 
                 // Pick a random key from our fixed set to ensure overlapping access
@@ -486,6 +536,59 @@ fn main() {
     }
 
     println!("✓ Database state matches in-memory state perfectly!");
+
+    // Verify secondary key space
+    println!("Verifying secondary key space consistency...");
+    let secondary_data = secondary_state.lock().clone();
+    for (key, expected_value) in &secondary_data {
+        let db_value = {
+            let db_read = db.read();
+            let db_instance = db_read.as_ref().unwrap();
+            db_instance.get(key_space2, key).unwrap()
+        };
+        match db_value {
+            Some(actual_value) => {
+                if actual_value.as_ref() != expected_value.as_slice() {
+                    eprintln!(
+                        "ERROR: Secondary KS: Value mismatch for key {:?}: database has {:?}, expected {:?}",
+                        key,
+                        actual_value.as_ref(),
+                        expected_value.as_slice()
+                    );
+                    std::process::exit(1);
+                }
+            }
+            None => {
+                eprintln!(
+                    "ERROR: Secondary KS: Key {key:?} exists in expected state but not in database"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+    // Check no extra keys in secondary ks
+    let mut db_ks2_keys = vec![];
+    {
+        let db_read = db.read();
+        let db_instance = db_read.as_ref().unwrap();
+        let iterator = db_instance.iterator(key_space2);
+        for result in iterator {
+            let (key, _) = result.unwrap();
+            db_ks2_keys.push(key.to_vec());
+        }
+    }
+    for db_key in &db_ks2_keys {
+        if !secondary_data.contains_key(db_key) {
+            eprintln!(
+                "ERROR: Secondary KS: Key {:?} exists in database but not in expected state",
+                db_key
+            );
+            std::process::exit(1);
+        }
+    }
+    println!("✓ Secondary key space state matches perfectly!");
+    println!("  Keys in secondary key space: {}", secondary_data.len());
+
     println!(
         "  Total operations performed: {}",
         num_threads * operations_per_thread
@@ -533,12 +636,12 @@ fn main() {
 
     let relocation_kept = shared_metrics
         .relocation_kept
-        .with_label_values(&["main"])
+        .with_label_values(&["secondary"])
         .get();
     println!("  relocation_kept: {relocation_kept}");
     let relocation_removed = shared_metrics
         .relocation_removed
-        .with_label_values(&["main"])
+        .with_label_values(&["secondary"])
         .get();
     println!("  relocation_removed: {relocation_removed}");
     let wal_gc_position = shared_metrics.gc_position.with_label_values(&["wal"]).get();
