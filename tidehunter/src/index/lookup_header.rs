@@ -889,4 +889,85 @@ mod tests {
             "cache={cached_reads} should be less than no-cache={uncached_reads}"
         );
     }
+
+    /// Mirrors `test_next_entry_micro_cell_boundary` for variable-length key spaces.
+    /// Uses 256 single-byte keys to guarantee multiple micro-cells are populated,
+    /// then verifies forward and backward iteration visits every key in order.
+    #[test]
+    fn test_varlen_next_entry_unloaded() {
+        let metrics = Metrics::new();
+        let (shape, ks_id) = KeyShape::new_single_config_indexing(
+            KeyIndexing::variable_length(),
+            1,
+            KeyType::uniform(1),
+            Default::default(),
+        );
+        let ks = shape.ks(ks_id);
+
+        // Build a sorted key list to compare against iterator output.
+        let mut keys: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
+        keys.push(vec![]); // empty key sorts first
+        keys.sort();
+
+        let mut table = IndexTable::default();
+        for (i, key) in keys.iter().enumerate() {
+            table.insert(Bytes::from(key.clone()), WalPosition::test_value(i as u64));
+        }
+
+        let index_format = LookupHeaderIndex;
+        let serialized = index_format.clean_serialize_index(&mut table, ks);
+        let reader = MockRandomRead::new(serialized);
+        let dummy_pos = WalPosition::test_value(0);
+
+        // Forward iteration
+        let mut current_key: Option<Bytes> = None;
+        let mut forward: Vec<Bytes> = Vec::new();
+        let mut cache = None;
+        loop {
+            let result = index_format.next_entry_unloaded(
+                ks,
+                &reader,
+                current_key.as_deref(),
+                Direction::Forward,
+                &metrics,
+                dummy_pos,
+                &mut cache,
+            );
+            let Some((key, _)) = result else { break };
+            current_key = Some(key.clone());
+            forward.push(key);
+        }
+        assert_eq!(forward.len(), keys.len(), "forward: wrong count");
+        for (i, k) in forward.iter().enumerate() {
+            assert_eq!(k.as_ref(), keys[i].as_slice(), "forward: wrong key at {i}");
+        }
+
+        // Backward iteration
+        let mut current_key: Option<Bytes> = None;
+        let mut backward: Vec<Bytes> = Vec::new();
+        let mut cache = None;
+        loop {
+            let result = index_format.next_entry_unloaded(
+                ks,
+                &reader,
+                current_key.as_deref(),
+                Direction::Backward,
+                &metrics,
+                dummy_pos,
+                &mut cache,
+            );
+            let Some((key, _)) = result else { break };
+            current_key = Some(key.clone());
+            backward.push(key);
+        }
+        assert_eq!(backward.len(), keys.len(), "backward: wrong count");
+        for (i, k) in backward.iter().enumerate() {
+            let expected = &keys[keys.len() - 1 - i];
+            assert_eq!(
+                k.as_ref(),
+                expected.as_slice(),
+                "backward: wrong key at position {i}"
+            );
+        }
+    }
 }

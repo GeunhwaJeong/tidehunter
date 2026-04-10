@@ -2314,10 +2314,7 @@ fn test_variable_length_keys_it() {
     config.sync_flush = false;
     let config = Arc::new(config);
     let metrics = Metrics::new();
-    let ks_config = KeySpaceConfig::default()
-        // todo unloaded iterator is not supported
-        // .with_unloaded_iterator(true)
-        .with_max_dirty_keys(1);
+    let ks_config = KeySpaceConfig::default().with_max_dirty_keys(1);
     let (key_shape, ks) = KeyShape::new_single_config_indexing(
         KeyIndexing::VariableLength,
         16,
@@ -2429,7 +2426,7 @@ fn test_variable_length_keys_many() {
         }
 
         db.large_table.flusher.barrier();
-        db.rebuild_control_region().unwrap();
+        db.force_rebuild_control_region().unwrap();
 
         // Do absent-key lookups first, before present-key lookups warm the cell
         // cache. Cells are unloaded at this point, so each absent lookup reaches
@@ -2502,6 +2499,92 @@ fn test_variable_length_keys_many() {
         }
         assert!(db.get(ks, &[]).unwrap().is_none());
         assert!(db.get(ks, &[0xab, 0xcd, 0xef]).unwrap().is_none());
+    }
+}
+
+/// Tests that the unloaded iterator works correctly for variable-length key spaces:
+/// forward and backward iteration across multiple micro-cells, O(1) sequential
+/// fast path, and correct ordering after a reopen (all cells start unloaded).
+#[test]
+fn test_variable_length_keys_unloaded_iterator() {
+    let dir = tempdir::TempDir::new("test_variable_length_keys_unloaded_iterator").unwrap();
+    let mut config = Config::small();
+    config.sync_flush = false;
+    let config = Arc::new(config);
+    let metrics = Metrics::new();
+    // max_dirty_keys=1 forces every insert to flush so cells are unloaded on reopen.
+    let ks_config = KeySpaceConfig::default().with_max_dirty_keys(1);
+    let (key_shape, ks) = KeyShape::new_single_config_indexing(
+        KeyIndexing::VariableLength,
+        16,
+        KeyType::uniform(1),
+        ks_config,
+    );
+
+    // 256 single-byte keys spread across all micro-cells.
+    let keys: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
+
+    {
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            metrics.clone(),
+        )
+        .unwrap();
+
+        for (i, key) in keys.iter().enumerate() {
+            db.insert(ks, key.clone(), vec![i as u8]).unwrap();
+        }
+        db.large_table.flusher.barrier();
+        db.force_rebuild_control_region().unwrap();
+    }
+
+    // Reopen: all cells start unloaded, so every iterator step exercises
+    // next_entry_unloaded_varlen including micro-cell boundary crossings.
+    {
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            metrics.clone(),
+        )
+        .unwrap();
+
+        // Confirm cells are unloaded at the start.
+        db.large_table.each_entry(|entry| {
+            assert!(
+                !entry.is_index_loaded(),
+                "cells should start unloaded after reopen"
+            );
+        });
+
+        // Forward iteration: keys must come out in lexicographic order.
+        let collected: Vec<(Bytes, Bytes)> = db.iterator(ks).map(|r| r.unwrap()).collect();
+        assert_eq!(collected.len(), keys.len(), "forward: wrong key count");
+        for (i, (k, v)) in collected.iter().enumerate() {
+            assert_eq!(k.as_ref(), keys[i].as_slice(), "forward: wrong key at {i}");
+            assert_eq!(v.as_ref(), &[i as u8], "forward: wrong value at {i}");
+        }
+
+        // Backward iteration: keys must come out in reverse lexicographic order.
+        let mut rev_it = db.iterator(ks);
+        rev_it.reverse();
+        let collected_rev: Vec<(Bytes, Bytes)> = rev_it.map(|r| r.unwrap()).collect();
+        assert_eq!(collected_rev.len(), keys.len(), "backward: wrong key count");
+        for (i, (k, v)) in collected_rev.iter().enumerate() {
+            let expected_idx = keys.len() - 1 - i;
+            assert_eq!(
+                k.as_ref(),
+                keys[expected_idx].as_slice(),
+                "backward: wrong key at position {i}"
+            );
+            assert_eq!(
+                v.as_ref(),
+                &[expected_idx as u8],
+                "backward: wrong value at position {i}"
+            );
+        }
     }
 }
 

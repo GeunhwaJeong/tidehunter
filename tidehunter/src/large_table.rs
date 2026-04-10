@@ -1096,7 +1096,6 @@ impl LargeTable {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn each_entry(&self, f: impl Fn(&mut LargeTableEntry)) {
         for ks_table in &self.table {
             for mutex in ks_table.rows.mutexes() {
@@ -1785,6 +1784,15 @@ impl LargeTableEntry {
                 Some(FlushKind::FlushLoaded(self.data.clone_shared()))
             }
         }
+    }
+
+    /// Returns true if the in-memory index is currently loaded (Loaded or DirtyLoaded).
+    #[cfg(test)]
+    pub fn is_index_loaded(&self) -> bool {
+        matches!(
+            self.state,
+            LargeTableEntryState::Loaded(_) | LargeTableEntryState::DirtyLoaded(_)
+        )
     }
 }
 
