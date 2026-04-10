@@ -224,13 +224,6 @@ impl KeyShapeBuilder {
                 );
             }
             ks.key_type.verify_key_size(ks.index_key_size());
-            if matches!(ks.key_indexing, KeyIndexing::VariableLength) {
-                // todo this can be supported
-                assert!(
-                    !ks.config.unloaded_iterator,
-                    "Unloaded iterator currently not supported for variable length key indexing"
-                );
-            }
         }
     }
 }
