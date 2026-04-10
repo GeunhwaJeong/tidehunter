@@ -591,11 +591,6 @@ impl KeySpaceConfig {
         self
     }
 
-    pub fn with_unloaded_iterator_disabled(mut self) -> Self {
-        self.unloaded_iterator = false;
-        self
-    }
-
     fn default_unloaded_iterator() -> bool {
         true
     }

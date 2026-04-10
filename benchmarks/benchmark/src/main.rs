@@ -289,11 +289,9 @@ pub fn main() {
 fn key_space_config() -> KeySpaceConfig {
     use tidehunter::index::index_format::IndexFormatType;
     use tidehunter::index::uniform_lookup::UniformLookupIndex;
-    KeySpaceConfig::new()
-        .with_index_format(IndexFormatType::Uniform(
-            UniformLookupIndex::new_with_window_size(744),
-        ))
-        .with_unloaded_iterator(true)
+    KeySpaceConfig::new().with_index_format(IndexFormatType::Uniform(
+        UniformLookupIndex::new_with_window_size(744),
+    ))
 }
 
 struct Stress {
