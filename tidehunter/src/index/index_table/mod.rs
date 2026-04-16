@@ -764,19 +764,30 @@ impl IndexTable {
     /// Rebuilds flat with Modified→Clean and Removed entries dropped.
     /// After this call both flat and BTreeMap contain only Clean entries.
     pub fn clean_self(&mut self) {
-        // Rebuild flat: convert Modified→Clean, drop Removed.
+        // A Removed tombstone in `data` shadows any flat entry for the same key;
+        // both sides must be dropped together, otherwise the shadowed flat entry
+        // survives as a stale record.
         let old_flat = std::mem::take(&mut self.flat);
+        let tombstoned: HashSet<&[u8]> = self
+            .data
+            .iter()
+            .filter(|(_, v)| matches!(v.kind, IndexEntryKind::Removed))
+            .map(|(k, _)| k.as_ref())
+            .collect();
+
+        // Rebuild flat: convert Modified→Clean, drop Removed (in flat or shadowed by data).
         let kept: Vec<(Bytes, IndexWalPosition)> = FlatIter::new(&old_flat, self.key_size)
-            .filter(|(_, iwp)| !iwp.is_removed())
+            .filter(|(k, iwp)| !iwp.is_removed() && !tombstoned.contains(*k))
             .map(|(k, mut iwp)| {
                 iwp.kind = IndexEntryKind::Clean;
                 (Bytes::from(k.to_vec()), iwp)
             })
             .collect();
+        drop(tombstoned);
         self.flat = build_flat_bytes(kept, self.key_size);
 
-        // Clean BTreeMap: Modified→Clean, drop Removed (no flat shadowing needed
-        // because Removed entries in flat are already gone after the rebuild above).
+        // Clean BTreeMap: Modified→Clean, drop Removed (shadowed flat entries
+        // were filtered out above).
         self.retain(|_, v| match v.kind {
             IndexEntryKind::Clean => true,
             IndexEntryKind::Modified => {
@@ -1651,6 +1662,27 @@ mod tests {
         assert_eq!(table.get(&[1]), Some(WalPosition::test_value(1)));
         assert_eq!(table.get(&[2]), Some(WalPosition::test_value(2)));
         assert_eq!(table.get(&[3]), Some(WalPosition::test_value(3)));
+    }
+
+    #[test]
+    fn test_clean_self_drops_flat_shadowed_by_tombstone() {
+        // Regression: a Removed tombstone in `data` must also erase the
+        // matching flat entry, otherwise clean_self leaks a stale record.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(1));
+        table.promote_to_flat();
+        // flat: [1]=Modified, data: empty
+        assert_eq!(table.flat_len(), 1);
+
+        table.remove(vec![1].into(), WalPosition::test_value(10));
+        // flat: [1]=Modified, data: [1]=Removed (shadows flat)
+
+        table.clean_self();
+
+        assert!(table.get(&[1]).is_none());
+        assert_eq!(table.flat_len(), 0);
+        assert_eq!(table.dirty_count(), 0);
+        assert_eq!(table.len(), 0);
     }
 
     #[test]
