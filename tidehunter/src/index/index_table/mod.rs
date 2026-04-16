@@ -14,6 +14,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use minibytes::Bytes;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::btree_map::Entry;
 use std::ops::Bound;
@@ -228,29 +229,38 @@ impl IndexTable {
 
     /// Remove flushed index entries that have offset <= last_processed
     pub fn unmerge_flushed(&mut self, original: &Self, last_processed: LastProcessed) {
+        // Walk original.data; remove matching entries from self.data. If promote_flat_job
+        // ran between snapshot capture and now, an entry present in original.data may now
+        // live in self.flat — record those for the flat-rebuild pass below.
+        let mut pending_flat: HashMap<Bytes, IndexWalPosition> = HashMap::new();
         for (k, v) in original.data.iter() {
             if !last_processed.is_processed(v) {
                 // Do not unmerge entries that might have in-flight operations
                 continue;
             }
-            let entry = self.data.entry(k.clone());
-            match entry {
-                Entry::Vacant(_) => {
-                    #[cfg(any(debug_assertions, feature = "test_methods"))]
-                    panic!("unmerge_flushed entry mismatch {k:?}")
-                    // todo promote this to unconditional panic?
-                }
+            let removed_from_data = match self.data.entry(k.clone()) {
+                Entry::Vacant(_) => false,
                 Entry::Occupied(oc) => {
                     if oc.get().into_wal_position() == v.into_wal_position() {
                         self.key_bytes -= k.len();
                         oc.remove();
+                        true
+                    } else {
+                        false
                     }
                 }
+            };
+            if !removed_from_data {
+                // Either Vacant (likely promoted into self.flat) or Occupied with a newer
+                // position (a stale flat entry at the snapshot's position may still exist).
+                // Let the flat rebuild below drop it by key+position match.
+                pending_flat.insert(k.clone(), *v);
             }
         }
-        // Also unmerge flat entries (present when promote_to_flat was called on original).
-        // Rebuild self.flat, dropping entries whose key+position matches a processed original entry.
-        if !original.flat.is_empty() {
+        // Rebuild self.flat, dropping entries matched by either:
+        //   - original.flat (flat→flat: original was promoted before snapshot)
+        //   - original.data entries in `pending_flat` (data→flat: promote_flat_job raced us)
+        if !original.flat.is_empty() || !pending_flat.is_empty() {
             let orig_flat_bytes = original.flat.clone();
             let self_flat_bytes = std::mem::take(&mut self.flat);
             // Peekable iterator over original flat avoids a full Vec allocation.
@@ -261,15 +271,20 @@ impl IndexTable {
                 while orig_it.peek().map(|(ok, _)| *ok < sk).unwrap_or(false) {
                     orig_it.next();
                 }
-                // Check for an exact key match and consume the orig entry if found.
-                let should_remove = if orig_it.peek().map(|(ok, _)| *ok == sk).unwrap_or(false) {
+                // Check for an exact key match in original.flat and consume if found.
+                let remove_by_flat = if orig_it.peek().map(|(ok, _)| *ok == sk).unwrap_or(false) {
                     let (_, o_iwp) = orig_it.next().unwrap();
                     last_processed.is_processed(&o_iwp)
                         && s_iwp.into_wal_position() == o_iwp.into_wal_position()
                 } else {
                     false
                 };
-                if !should_remove {
+                let remove_by_data = !remove_by_flat
+                    && pending_flat
+                        .get(sk)
+                        .map(|o_iwp| s_iwp.into_wal_position() == o_iwp.into_wal_position())
+                        .unwrap_or(false);
+                if !remove_by_flat && !remove_by_data {
                     // Zero-copy: sk is a subslice of self_flat_bytes.
                     kept.push((self_flat_bytes.slice_to_bytes(sk), s_iwp));
                 }
@@ -1897,6 +1912,62 @@ mod tests {
         assert!(current.get(&[3]).is_none());
         assert_eq!(current.get(&[4]), Some(WalPosition::test_value(5)));
         assert_eq!(current.get(&[5]), Some(WalPosition::test_value(6)));
+    }
+
+    #[test]
+    fn test_unmerge_flushed_self_promoted_original_not() {
+        // Reproduces the promote_flat_job race: original's entries live in .data,
+        // but by the time unmerge_flushed runs they have been promoted into self.flat.
+        let mut original = IndexTable::default();
+        original.insert(vec![1].into(), WalPosition::test_value(2));
+        original.insert(vec![2].into(), WalPosition::test_value(3));
+        original.insert(vec![3].into(), WalPosition::test_value(4));
+        // original is NOT promoted — its entries still live in .data.
+        assert!(original.flat.is_empty());
+
+        // current was cloned from original, then promoted (simulating promote_flat_job),
+        // then accepted a new write after promotion.
+        let mut current = original.clone();
+        current.promote_to_flat();
+        assert!(current.data.is_empty());
+        assert!(!current.flat.is_empty());
+        current.insert(vec![4].into(), WalPosition::test_value(5));
+
+        let len_before = current.len();
+        current.unmerge_flushed(&original, LastProcessed::new_test(u64::MAX));
+        let len_after = current.len();
+
+        // [1, 2, 3] removed from self.flat; [4] remains in self.data.
+        assert_eq!(len_before as i64 - len_after as i64, 3);
+        assert!(current.get(&[1]).is_none());
+        assert!(current.get(&[2]).is_none());
+        assert!(current.get(&[3]).is_none());
+        assert_eq!(current.get(&[4]), Some(WalPosition::test_value(5)));
+        // The flushed entries must not continue to count as dirty.
+        assert_eq!(current.dirty_count(), 1);
+    }
+
+    #[test]
+    fn test_unmerge_flushed_self_promoted_stale_flat_after_overwrite() {
+        // original has K@pos1 in .data. self was promoted so K@pos1 is in self.flat,
+        // then a newer write lands K@pos2 in self.data. unmerge_flushed must drop
+        // the stale flat entry while leaving the newer data entry intact.
+        let mut original = IndexTable::default();
+        original.insert(vec![1].into(), WalPosition::test_value(2));
+        original.insert(vec![2].into(), WalPosition::test_value(3));
+
+        let mut current = original.clone();
+        current.promote_to_flat();
+        // Overwrite key [1] with a newer position in self.data.
+        current.insert(vec![1].into(), WalPosition::test_value(10));
+
+        current.unmerge_flushed(&original, LastProcessed::new_test(u64::MAX));
+
+        // Key [1] still has its newer position; key [2] fully removed.
+        assert_eq!(current.get(&[1]), Some(WalPosition::test_value(10)));
+        assert!(current.get(&[2]).is_none());
+        // No stale [1]@pos2 left behind in flat.
+        assert_eq!(current.flat_binary_search(&[1]), None);
     }
 }
 
