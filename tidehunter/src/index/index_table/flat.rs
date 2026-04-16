@@ -250,7 +250,9 @@ pub(super) fn append_flat_varlen(entries: &[(Bytes, IndexWalPosition)], out: &mu
 
     // Write data entries and back-fill each offset as we go.
     for (i, (key, iwp)) in entries.iter().enumerate() {
-        let entry_offset = (out.len() - data_start) as u32;
+        let entry_offset: u32 = (out.len() - data_start)
+            .try_into()
+            .expect("flat buffer exceeds u32 offset range");
         out[offsets_start + 4 * i..offsets_start + 4 * i + 4]
             .copy_from_slice(&entry_offset.to_be_bytes());
         out.extend_from_slice(&(key.len() as u16).to_be_bytes());
