@@ -325,20 +325,6 @@ impl IndexTable {
         }
     }
 
-    /// Reduces this index to its dirty overlay: keeps only Modified and Removed entries,
-    /// dropping all Clean entries. Used when transitioning to DirtyUnloaded state.
-    pub fn retain_dirty(&mut self) {
-        // Rebuild flat keeping only Modified and Removed entries.
-        let old_flat = std::mem::take(&mut self.flat);
-        let kept: Vec<(Bytes, IndexWalPosition)> = FlatIter::new(&old_flat, self.key_size)
-            .filter(|(_, iwp)| !iwp.is_clean())
-            .map(|(k, iwp)| (Bytes::from(k.to_vec()), iwp))
-            .collect();
-        self.flat = build_flat_bytes(kept, self.key_size);
-        // Drop Clean BTreeMap entries too.
-        self.retain(|_, pos| !pos.is_clean());
-    }
-
     pub fn get(&self, k: &[u8]) -> Option<WalPosition> {
         // BTreeMap (write buffer) takes priority: may have a more-recent entry.
         if let Some(p) = self.data.get(k) {
@@ -1839,28 +1825,6 @@ mod tests {
             prev = Some(entry.0);
         }
         assert!(table.next_entry(prev, true).is_none());
-    }
-
-    #[test]
-    fn test_retain_dirty_with_flat() {
-        let mut table = IndexTable::default();
-        table.insert(vec![1].into(), WalPosition::test_value(10)); // Modified
-        table.insert(vec![2].into(), WalPosition::test_value(20)); // will become Clean
-        table.insert(vec![3].into(), WalPosition::test_value(30)); // Modified
-        table
-            .data
-            .entry(vec![2].into())
-            .and_modify(|v| *v = v.as_clean_modified());
-        table.promote_to_flat();
-        // flat: [1]=Modified, [2]=Clean, [3]=Modified
-
-        table.retain_dirty();
-
-        assert_eq!(table.flat_len(), 2);
-        assert_eq!(table.get(&[1]), Some(WalPosition::test_value(10)));
-        assert!(table.get(&[2]).is_none()); // Clean removed
-        assert_eq!(table.get(&[3]), Some(WalPosition::test_value(30)));
-        assert_eq!(table.dirty_count(), 2);
     }
 
     #[test]
