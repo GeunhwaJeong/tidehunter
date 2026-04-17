@@ -466,6 +466,11 @@ impl IndexTable {
         self.data.is_empty() && self.flat.is_empty()
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn data_btree_is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (Bytes, WalPosition)> + '_ {
         // Both sources are sorted and disjoint (flat excludes keys present in data).
         // Merge in O(N+M) rather than collecting and sorting.
@@ -936,7 +941,20 @@ impl IndexTable {
 
     /// Returns `true` if the flat buffer was updated, `false` if nothing changed.
     pub fn promote_to_flat(&mut self) -> bool {
-        if self.data.len() <= Self::PROMOTE_THRESHOLD {
+        self.promote_to_flat_inner(Self::PROMOTE_THRESHOLD)
+    }
+
+    /// Test-only variant that bypasses `PROMOTE_THRESHOLD`. Lets concurrent tests
+    /// reliably open the `insert → promote → remove → FlushLoaded` window that
+    /// triggers the `clean_self` stale-record bug, without needing 128+ keys per
+    /// cell.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn promote_to_flat_force(&mut self) -> bool {
+        self.promote_to_flat_inner(0)
+    }
+
+    fn promote_to_flat_inner(&mut self, threshold: usize) -> bool {
+        if self.data.len() <= threshold {
             return false;
         }
 

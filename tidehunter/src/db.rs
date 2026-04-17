@@ -1147,6 +1147,15 @@ impl Db {
         let cr = ControlRegion::read_or_create(&path, &self.key_shape);
         cr.last_position()
     }
+
+    /// Drains every cell's BTreeMap into its flat buffer, bypassing
+    /// `PROMOTE_THRESHOLD`. Lets concurrent tests reliably hit the
+    /// `insert → promote → remove → FlushLoaded` window that triggered
+    /// the `clean_self` stale-record bug.
+    #[cfg(feature = "test-utils")]
+    pub fn test_promote_flat_force(&self) {
+        self.large_table.test_promote_flat_force()
+    }
 }
 
 impl Drop for Db {

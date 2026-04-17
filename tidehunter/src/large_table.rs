@@ -578,6 +578,31 @@ impl LargeTable {
         Ok(())
     }
 
+    /// Test-only: drains every cell's BTreeMap into its flat buffer under the
+    /// row lock, bypassing `PROMOTE_THRESHOLD`. Unlike `promote_flat_job`,
+    /// this does not call `promote_pending_and_check_flush` or trigger
+    /// flushes — it just performs the compaction step. Skips cells whose
+    /// BTreeMap is empty to avoid spurious `make_mut` (Arc clone) that would
+    /// break `same_shared` on the flusher's snapshot. Lets concurrent tests
+    /// reliably open the `insert → promote → remove → FlushLoaded` window
+    /// that triggered the `clean_self` stale-record bug without needing
+    /// 128+ keys per cell.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn test_promote_flat_force(&self) {
+        for ks_table in &self.table {
+            for mutex in ks_table.rows.mutexes() {
+                let mut row = mutex.lock();
+                for entry in row.entries.iter_mut() {
+                    if entry.data.data_btree_is_empty() {
+                        continue;
+                    }
+                    let table = entry.data.make_mut();
+                    table.promote_to_flat_force();
+                }
+            }
+        }
+    }
+
     fn too_many_dirty(&self, entry: &mut LargeTableEntry) -> bool {
         if entry.state.is_dirty() {
             let dirty_count = entry.data.dirty_count();

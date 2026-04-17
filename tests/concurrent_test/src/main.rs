@@ -305,6 +305,21 @@ fn main() {
                     db_instance.start_relocation().unwrap();
                 }
 
+                // 0.1% chance to force the flat-promotion pass with the threshold
+                // bypassed. Normally promote_to_flat runs on a 10-second timer and
+                // only fires when a cell's write buffer has more than 128 entries;
+                // with only 25 test keys spread across cells neither condition is
+                // met, so the insert → promote → remove → FlushLoaded window
+                // essentially never opens. Forcing it here interleaves
+                // promote_to_flat with writes from other threads and exposes the
+                // `clean_self` stale-record bug where a Removed tombstone in
+                // `data` shadows a Modified entry in `flat`.
+                if rng.gen_range(0..100u32) < 1 {
+                    let db_read = db.read();
+                    let db_instance = db_read.as_ref().unwrap();
+                    db_instance.test_promote_flat_force();
+                }
+
                 // 1% chance to operate on secondary key space
                 if rng.gen_range(0..100) < 1 {
                     let mut state = secondary_state.lock();
