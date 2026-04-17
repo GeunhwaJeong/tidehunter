@@ -241,7 +241,10 @@ impl IndexTable {
             let removed_from_data = match self.data.entry(k.clone()) {
                 Entry::Vacant(_) => false,
                 Entry::Occupied(oc) => {
-                    if oc.get().into_wal_position() == v.into_wal_position() {
+                    // Use into_update_position: into_wal_position collapses all Removed
+                    // entries to INVALID, which would incorrectly match two different
+                    // Removed tombstones at distinct WAL offsets.
+                    if oc.get().into_update_position() == v.into_update_position() {
                         self.key_bytes -= k.len();
                         oc.remove();
                         true
@@ -272,17 +275,19 @@ impl IndexTable {
                     orig_it.next();
                 }
                 // Check for an exact key match in original.flat and consume if found.
+                // Use into_update_position so two distinct Removed entries (both INVALID
+                // via into_wal_position) don't compare equal.
                 let remove_by_flat = if orig_it.peek().map(|(ok, _)| *ok == sk).unwrap_or(false) {
                     let (_, o_iwp) = orig_it.next().unwrap();
                     last_processed.is_processed(&o_iwp)
-                        && s_iwp.into_wal_position() == o_iwp.into_wal_position()
+                        && s_iwp.into_update_position() == o_iwp.into_update_position()
                 } else {
                     false
                 };
                 let remove_by_data = !remove_by_flat
                     && pending_flat
                         .get(sk)
-                        .map(|o_iwp| s_iwp.into_wal_position() == o_iwp.into_wal_position())
+                        .map(|o_iwp| s_iwp.into_update_position() == o_iwp.into_update_position())
                         .unwrap_or(false);
                 if !remove_by_flat && !remove_by_data {
                     // Zero-copy: sk is a subslice of self_flat_bytes.
