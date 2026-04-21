@@ -81,13 +81,12 @@ pub(crate) fn register(engine: &mut Engine) {
                             CellId::Integer(n) => Dynamic::from(*n as i64),
                             CellId::Bytes(b) => Dynamic::from(hex::encode(b.as_slice())),
                         };
-                        let (offset, len) = if entry.position.is_valid() {
-                            (
-                                entry.position.offset() as i64,
-                                entry.position.frame_len() as i64,
-                            )
-                        } else {
-                            (-1i64, 0i64)
+                        // TODO(levels-generic): surface every level once the
+                        // flusher writes L0 + L1. Today `levels` is single-level,
+                        // so `latest()` is the only on-disk blob.
+                        let (offset, len) = match entry.levels.latest() {
+                            Some(p) => (p.offset() as i64, p.frame_len() as i64),
+                            None => (-1i64, 0i64),
                         };
 
                         let mut cell_map = Map::new();
@@ -190,8 +189,10 @@ pub(crate) fn register(engine: &mut Engine) {
 
             let mut valid_offsets: Vec<u64> = Vec::new();
             for entry in snapshot.data[ks_idx].values() {
-                if entry.position.is_valid() {
-                    valid_offsets.push(entry.position.offset());
+                // TODO(levels-generic): iterate every level once L0 + L1 are
+                // populated. Today there's at most one blob per cell.
+                for pos in entry.levels.iter() {
+                    valid_offsets.push(pos.offset());
                 }
             }
             let total_index_entries = valid_offsets.len();
@@ -302,9 +303,11 @@ fn cr_stats_impl(h: &mut DbHandle, lowest_n: usize) -> Result<(), Box<EvalAltRes
     let mut total_position_size = 0u64;
     for (ks_idx, ks_data) in snapshot.data.iter().enumerate() {
         for entry in ks_data.values() {
-            if entry.position.is_valid() {
-                let off = entry.position.offset();
-                let len = entry.position.frame_len();
+            // TODO(levels-generic): every level will contribute its own
+            // (offset, len) tuple once the flusher writes L0 + L1.
+            for pos in entry.levels.iter() {
+                let off = pos.offset();
+                let len = pos.frame_len();
                 all_positions.push((off, len, ks_idx));
                 total_position_size += len as u64;
             }

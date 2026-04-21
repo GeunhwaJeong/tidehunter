@@ -7,6 +7,27 @@ use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
+/// On-disk control-region format version.
+///
+/// The file layout is either:
+///
+/// - **V1** (legacy): raw `bincode`-serialized [`legacy_v1::ControlRegionV1`]
+///   starting at byte 0. No header. Distinguished by the fact that the first
+///   8 bytes decode as a plausible `last_position: u64` — never the V2
+///   sentinel.
+/// - **V2**: 8-byte little-endian sentinel `u64::MAX`, followed by a 4-byte
+///   little-endian version number, followed by `bincode`-serialized
+///   [`ControlRegion`]. Using `u64::MAX` as the discriminator works because
+///   the first field of the V1 layout is `last_position: u64`, which would
+///   only take the value `u64::MAX` in a pathological/corrupt file — never
+///   in a real database.
+///
+/// Writers always emit V2; readers detect the sentinel and fall back to V1
+/// parsing + one-way migration.
+const CONTROL_REGION_V2_SENTINEL: u64 = u64::MAX;
+const CONTROL_REGION_V2_VERSION: u32 = 2;
+const CONTROL_REGION_V2_HEADER_LEN: usize = 12;
+
 #[derive(Serialize, Deserialize, Debug)]
 #[doc(hidden)] // Used by tools/tideconsole for control region inspection
 pub struct ControlRegion {
@@ -69,12 +90,38 @@ impl ControlRegion {
     #[doc(hidden)] // Used by tools/tideconsole for control region inspection
     pub fn read(path: &Path, key_shape: &KeyShape) -> io::Result<Self> {
         let bytes = fs::read(path)?;
-        let mut control_region: ControlRegion =
-            bincode::deserialize(&bytes).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+        let mut control_region = Self::deserialize_any_version(&bytes)
+            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
         control_region.populate_keyspace_names_if_empty(key_shape);
         control_region.verify_shape(key_shape);
         control_region.extend_snapshot_if_needed(key_shape);
         Ok(control_region)
+    }
+
+    /// Deserializes a control region from bytes, transparently handling
+    /// both V1 (pre-levels) and V2 (with `IndexLevels`) formats.
+    ///
+    /// V1 control regions are migrated on read: each single-position cell
+    /// becomes a one-level `IndexLevels`. The migration is one-way — the
+    /// next successful `store` rewrites the file in V2 format.
+    fn deserialize_any_version(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        if bytes.len() >= CONTROL_REGION_V2_HEADER_LEN {
+            let sentinel = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            if sentinel == CONTROL_REGION_V2_SENTINEL {
+                let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                assert_eq!(
+                    version, CONTROL_REGION_V2_VERSION,
+                    "Unsupported control region version {version}; expected \
+                     {CONTROL_REGION_V2_VERSION}. This binary is older than the \
+                     database it is trying to open."
+                );
+                let payload = &bytes[CONTROL_REGION_V2_HEADER_LEN..];
+                return bincode::deserialize::<ControlRegion>(payload);
+            }
+        }
+        // No sentinel ⇒ legacy V1 layout.
+        let v1: legacy_v1::ControlRegionV1 = bincode::deserialize(bytes)?;
+        Ok(v1.migrate())
     }
 
     /// Populates keyspace names from key_shape if they're empty (for old control regions)
@@ -177,8 +224,13 @@ impl ControlRegionStore {
         );
         let force_relocation_position = snapshot.pct_wal_position(FORCE_RELOCATION_PCT);
         let control_region = ControlRegion::new(snapshot, last_position, key_shape);
-        let serialized =
-            bincode::serialize(&control_region).expect("Failed to serialize control region");
+        // V2 layout: sentinel + version + bincode payload. See the comment
+        // on `CONTROL_REGION_V2_SENTINEL` for the rationale.
+        let mut serialized = Vec::with_capacity(CONTROL_REGION_V2_HEADER_LEN + 4 * 1024);
+        serialized.extend_from_slice(&CONTROL_REGION_V2_SENTINEL.to_le_bytes());
+        serialized.extend_from_slice(&CONTROL_REGION_V2_VERSION.to_le_bytes());
+        bincode::serialize_into(&mut serialized, &control_region)
+            .expect("Failed to serialize control region");
         let temp_file = self.path.with_extension(".bak");
         fs::write(&temp_file, &serialized).unwrap_or_else(|e| {
             panic!(
@@ -213,5 +265,201 @@ impl ControlRegionStore {
 
     pub fn force_relocation_position(&self) -> Option<WalPosition> {
         self.force_relocation_position
+    }
+}
+
+/// Legacy on-disk representation — read-only, used for one-way migration of
+/// V1 control regions.
+///
+/// V1 stored a single `WalPosition` per cell. V2 stores an `IndexLevels`
+/// (`SmallVec<[WalPosition; 2]>`). The migration maps every valid single
+/// position to a one-element level list; `WalPosition::INVALID` maps to an
+/// empty list.
+mod legacy_v1 {
+    use super::ControlRegion;
+    use crate::cell::CellId;
+    use crate::index::levels::IndexLevels;
+    use crate::large_table::{LargeTableContainer, SnapshotEntryData};
+    use crate::wal::position::{LastProcessed, WalPosition};
+    use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
+
+    /// Exact on-disk layout of `SnapshotEntryData` prior to the two-level
+    /// LSM schema change. Field names and ordering must stay in sync with
+    /// the pre-change definition.
+    #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+    pub(super) struct SnapshotEntryDataV1 {
+        position: WalPosition,
+        last_processed: LastProcessed,
+    }
+
+    impl SnapshotEntryDataV1 {
+        fn migrate(self) -> SnapshotEntryData {
+            SnapshotEntryData::from_levels(
+                IndexLevels::from_legacy_position(self.position),
+                self.last_processed,
+            )
+        }
+    }
+
+    /// Exact on-disk layout of `ControlRegion` prior to the two-level LSM
+    /// schema change. `keyspace_names` keeps `#[serde(default)]` for
+    /// pre-keyspace-names compatibility within V1 files.
+    #[derive(Serialize, Deserialize, Debug)]
+    pub(super) struct ControlRegionV1 {
+        last_position: u64,
+        snapshot: LargeTableContainer<SnapshotEntryDataV1>,
+        #[serde(default)]
+        keyspace_names: Vec<String>,
+    }
+
+    impl ControlRegionV1 {
+        pub(super) fn migrate(self) -> ControlRegion {
+            let data: Vec<BTreeMap<CellId, SnapshotEntryData>> = self
+                .snapshot
+                .data
+                .into_iter()
+                .map(|ks_map| {
+                    ks_map
+                        .into_iter()
+                        .map(|(cell, entry)| (cell, entry.migrate()))
+                        .collect()
+                })
+                .collect();
+            ControlRegion {
+                last_position: self.last_position,
+                snapshot: LargeTableContainer { data },
+                keyspace_names: self.keyspace_names,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cell::CellId;
+    use crate::index::levels::IndexLevels;
+    use crate::key_shape::{KeyShape, KeyType, UniformKeyConfig};
+    use crate::wal::position::{LastProcessed, WalPosition};
+    use std::collections::BTreeMap;
+
+    /// Returns a minimal key_shape with one uniform keyspace of a few cells,
+    /// suitable for round-tripping control regions through disk.
+    fn tiny_shape() -> KeyShape {
+        let (shape, _ks) = KeyShape::new_single(
+            /*key_size=*/ 8,
+            /*mutexes=*/ 2,
+            KeyType::Uniform(UniformKeyConfig::new(/*cells_per_mutex=*/ 2)),
+        );
+        shape
+    }
+
+    #[test]
+    fn v2_roundtrip() {
+        let dir = tempdir::TempDir::new("cr_v2_roundtrip").unwrap();
+        let path = dir.path().join("cr");
+        let shape = tiny_shape();
+
+        let mut cr = ControlRegion::new_empty(&shape);
+        // Populate one cell with a known level set so we can check we read
+        // back the same bytes.
+        cr.snapshot.data[0].insert(
+            CellId::Integer(0),
+            SnapshotEntryData::from_levels(
+                IndexLevels::single(WalPosition::test_value(7777)),
+                LastProcessed::new_test(42),
+            ),
+        );
+        cr.last_position = 100;
+
+        let mut store = ControlRegionStore::new(path.clone(), &cr);
+        store.store(cr.snapshot, cr.last_position, &shape, &Metrics::new());
+
+        let read_cr = ControlRegion::read(&path, &shape).unwrap();
+        assert_eq!(read_cr.last_position, 100);
+        let entry = read_cr.snapshot.data[0]
+            .get(&CellId::Integer(0))
+            .expect("cell 0 exists");
+        assert_eq!(entry.levels.len(), 1);
+        assert_eq!(entry.levels.latest(), Some(WalPosition::test_value(7777)));
+        assert_eq!(entry.last_processed, LastProcessed::new_test(42));
+    }
+
+    #[test]
+    fn v1_file_migrates_to_v2() {
+        // Hand-build a V1 byte stream and read it through the public `read`
+        // path to ensure the sentinel detection and migration do the right
+        // thing on a file that predates the schema change.
+        let dir = tempdir::TempDir::new("cr_v1_migrate").unwrap();
+        let path = dir.path().join("cr_v1");
+        let shape = tiny_shape();
+        let num_ks = shape.num_ks();
+
+        let mut ks_map: BTreeMap<CellId, legacy_v1_probe::SnapshotEntryDataV1Probe> =
+            BTreeMap::new();
+        ks_map.insert(
+            CellId::Integer(0),
+            legacy_v1_probe::SnapshotEntryDataV1Probe {
+                position: WalPosition::test_value(1234),
+                last_processed: LastProcessed::new_test(10),
+            },
+        );
+        ks_map.insert(
+            CellId::Integer(1),
+            legacy_v1_probe::SnapshotEntryDataV1Probe {
+                position: WalPosition::INVALID,
+                last_processed: LastProcessed::none(),
+            },
+        );
+        let mut data = vec![ks_map];
+        // Pad to match shape's keyspace count; verify_shape requires equality.
+        for _ in 1..num_ks {
+            data.push(BTreeMap::new());
+        }
+        let keyspace_names: Vec<String> = shape.iter_ks().map(|ks| ks.name().to_string()).collect();
+        let v1 = legacy_v1_probe::ControlRegionV1Probe {
+            last_position: 55,
+            snapshot: LargeTableContainer { data },
+            keyspace_names,
+        };
+        let bytes = bincode::serialize(&v1).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let read_cr = ControlRegion::read(&path, &shape).unwrap();
+        assert_eq!(read_cr.last_position, 55);
+
+        let cell0 = read_cr.snapshot.data[0]
+            .get(&CellId::Integer(0))
+            .expect("cell 0 present");
+        assert_eq!(cell0.levels.len(), 1);
+        assert_eq!(cell0.levels.latest(), Some(WalPosition::test_value(1234)));
+
+        let cell1 = read_cr.snapshot.data[0]
+            .get(&CellId::Integer(1))
+            .expect("cell 1 present");
+        assert!(cell1.levels.is_empty(), "INVALID ⇒ empty level list");
+    }
+
+    /// Outside-the-module copy of the V1 types so the test can build a V1
+    /// byte stream without poking at the `legacy_v1` implementation details.
+    mod legacy_v1_probe {
+        use crate::large_table::LargeTableContainer;
+        use crate::wal::position::{LastProcessed, WalPosition};
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+        pub struct SnapshotEntryDataV1Probe {
+            pub position: WalPosition,
+            pub last_processed: LastProcessed,
+        }
+
+        #[derive(Serialize, Deserialize, Debug)]
+        pub struct ControlRegionV1Probe {
+            pub last_position: u64,
+            pub snapshot: LargeTableContainer<SnapshotEntryDataV1Probe>,
+            #[serde(default)]
+            pub keyspace_names: Vec<String>,
+        }
     }
 }

@@ -4,6 +4,7 @@ use crate::context::{KsContext, LookupResult, LookupSource};
 use crate::flusher::{FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread};
 use crate::index::index_format::{Direction, IndexFormat, IndexIterCache};
 use crate::index::index_table::IndexTable;
+use crate::index::levels::IndexLevels;
 use crate::index::pending_table::{CommittedChange, PendingTable, Transaction};
 use crate::index::utils::{NextEntryResult, take_next_entry};
 use crate::iterators::IteratorResult;
@@ -102,11 +103,19 @@ enum Entries {
     Tree(BTreeMap<CellIdBytesContainer, LargeTableEntry>),
 }
 
-/// Snapshot data for a single entry containing both WAL position and last processed position
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+/// Snapshot data for a single entry: the list of on-disk index blobs
+/// (`levels`) plus the durable WAL frontier (`last_processed`).
+///
+/// `levels` is stored as an `IndexLevels` so the schema admits multi-level
+/// LSM layouts (see `docs/two_level_lsm_design.md`). The **runtime** still
+/// only populates a single level today; places that assume `levels.len() ≤ 1`
+/// carry `TODO(levels-generic):` markers. Backward compatibility with the
+/// legacy `{ position, last_processed }` on-disk format is handled by the
+/// control-region reader, not by this struct.
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[doc(hidden)] // Used by tools/tideconsole for control region inspection
 pub struct SnapshotEntryData {
-    pub position: WalPosition,
+    pub levels: IndexLevels,
     pub last_processed: LastProcessed,
 }
 
@@ -114,8 +123,37 @@ impl SnapshotEntryData {
     /// Creates an empty/invalid snapshot entry data
     pub fn empty() -> Self {
         Self {
-            position: WalPosition::INVALID,
+            levels: IndexLevels::new(),
             last_processed: LastProcessed::none(),
+        }
+    }
+
+    /// Returns the on-disk index blobs for this cell as an `IndexLevels`.
+    ///
+    /// Today this is at most one blob (the legacy single-level case).
+    /// Callers that need "walk every on-disk blob for this cell" should
+    /// always go through this method so that multi-level code paths work
+    /// unchanged once the runtime populates L0 + L1.
+    pub fn levels(&self) -> &IndexLevels {
+        &self.levels
+    }
+
+    /// Constructs from an `IndexLevels` + frontier.
+    ///
+    /// TODO(levels-generic): the runtime currently only produces
+    /// single-level lists; we assert that invariant so stray multi-level
+    /// writes from unrelated code paths don't silently slip through before
+    /// the flusher learns how to emit and unmerge them.
+    pub fn from_levels(levels: IndexLevels, last_processed: LastProcessed) -> Self {
+        assert!(
+            levels.is_single_level(),
+            "SnapshotEntryData cannot yet encode multi-level index blobs \
+             (len = {}); flusher support is a later phase",
+            levels.len(),
+        );
+        Self {
+            levels,
+            last_processed,
         }
     }
 }
@@ -177,7 +215,7 @@ impl LargeTable {
 
                     for (cell, entry_data) in ks_cells {
                         let mutex_idx = ks.mutex_for_cell(cell);
-                        row_cells[mutex_idx].push((cell.clone(), *entry_data));
+                        row_cells[mutex_idx].push((cell.clone(), entry_data.clone()));
                     }
 
                     // Create Row structures
@@ -185,9 +223,12 @@ impl LargeTable {
                         let entries = cells.into_iter().map(|(cell, entry_data)| {
                             let bloom_filter = context.ks_config.bloom_filter().map(|opts| {
                                 let mut filter = BloomFilter::with_rate(opts.rate, opts.count);
-                                if entry_data.position.is_valid() {
-                                    let data =
-                                    loader.load(&context.ks_config, entry_data.position).expect(
+                                // Rebuild the cell-wide bloom by walking every on-disk
+                                // level. With a single level this loads one blob; with
+                                // multiple levels it unions keys across all blobs, which
+                                // matches the read-path union semantics.
+                                for position in entry_data.levels().iter() {
+                                    let data = loader.load(&context.ks_config, position).expect(
                                         "Failed to load an index entry to reconstruct bloom filter",
                                     );
                                     for key in data.keys() {
@@ -768,11 +809,13 @@ impl LargeTable {
                 if !entry.state.is_dirty() && !entry.state.is_empty() {
                     entry.last_processed = loader_last_processed;
                 }
-                let position = entry.state.wal_position();
-                let snapshot_data = SnapshotEntryData {
-                    position,
-                    last_processed: entry.last_processed,
-                };
+                // TODO(levels-generic): `entry.state.wal_position()` returns the
+                // one-and-only on-disk blob position today. The state machine
+                // will need to surface an `IndexLevels` once multi-level
+                // flushing lands. For now the single-level projection is
+                // lossless: we wrap it as a degenerate level list.
+                let levels = IndexLevels::from_legacy_position(entry.state.wal_position());
+                let snapshot_data = SnapshotEntryData::from_levels(levels, entry.last_processed);
                 ks_data.insert(entry.cell.clone(), snapshot_data);
                 // Do not use last_processed from empty entries
                 if !entry.state.is_empty() {
@@ -1279,16 +1322,23 @@ impl LargeTableEntry {
         unload_jitter: usize,
         bloom_filter: Option<BloomFilter>,
     ) -> Self {
-        let mut entry = if entry_data.position == WalPosition::INVALID {
-            LargeTableEntry::new_empty(context, cell, unload_jitter)
-        } else {
-            LargeTableEntry::new_unloaded(
-                context,
-                cell,
-                entry_data.position,
-                unload_jitter,
-                bloom_filter,
-            )
+        // TODO(levels-generic): Unloaded carries a single WalPosition today.
+        // When multi-level flushing lands, either the state machine grows to
+        // carry `IndexLevels`, or the entry owns the full list and the state
+        // keeps only the level currently being read. See
+        // `docs/two_level_lsm_design.md` §9. Until then we accept single-level
+        // input; `levels().latest()` is a correct single-level projection.
+        let levels = entry_data.levels();
+        assert!(
+            levels.is_single_level(),
+            "from_snapshot_data: multi-level cells not yet supported (levels = {})",
+            levels.len(),
+        );
+        let mut entry = match levels.latest() {
+            None => LargeTableEntry::new_empty(context, cell, unload_jitter),
+            Some(position) => {
+                LargeTableEntry::new_unloaded(context, cell, position, unload_jitter, bloom_filter)
+            }
         };
         entry.last_processed = entry_data.last_processed;
         entry
@@ -1951,12 +2001,12 @@ enum UnloadedState {
     Clean,
 }
 
-impl<T: Copy> LargeTableContainer<T> {
-    /// Creates a new container with the given shape and filled with copy of passed value
+impl<T: Clone> LargeTableContainer<T> {
+    /// Creates a new container with the given shape and filled with clones of the passed value
     pub fn new_from_key_shape(key_shape: &KeyShape, value: T) -> Self {
         let data = key_shape
             .iter_ks()
-            .map(|ks| Self::new_keyspace(ks, value))
+            .map(|ks| Self::new_keyspace(ks, value.clone()))
             .collect();
         Self { data }
     }
@@ -1970,22 +2020,30 @@ impl<T: Copy> LargeTableContainer<T> {
                     .map(|cell_idx| {
                         let row = cell_idx / config.cells_per_mutex();
                         let offset = cell_idx % config.cells_per_mutex();
-                        (CellId::Integer(ks.cell_by_location(row, offset)), value)
+                        (
+                            CellId::Integer(ks.cell_by_location(row, offset)),
+                            value.clone(),
+                        )
                     })
                     .collect()
             }
             KeyType::PrefixedUniform(_) => BTreeMap::new(),
         }
     }
+}
 
+impl<T> LargeTableContainer<T> {
     pub fn iter_cells(&self) -> impl Iterator<Item = &T> {
         self.data.iter().flat_map(|ks_map| ks_map.values())
     }
 }
 
 impl LargeTableContainer<SnapshotEntryData> {
+    /// Iterates every on-disk index-blob position across every cell, in
+    /// keyspace-then-cell order. Level-generic: a multi-level cell yields
+    /// one position per level.
     pub fn iter_valid_val_positions(&self) -> impl Iterator<Item = WalPosition> + '_ {
-        self.iter_cells().filter_map(|entry| entry.position.valid())
+        self.iter_cells().flat_map(|entry| entry.levels().iter())
     }
 
     /// Returns a given percentile across valid wal positions in the container.
@@ -2539,10 +2597,10 @@ mod tests {
             let position_value = (i + 1) * 100;
             entries.insert(
                 CellId::Integer(i),
-                SnapshotEntryData {
-                    position: WalPosition::test_value(position_value as u64),
-                    last_processed: LastProcessed::new_test(position_value as u64),
-                },
+                SnapshotEntryData::from_levels(
+                    IndexLevels::single(WalPosition::test_value(position_value as u64)),
+                    LastProcessed::new_test(position_value as u64),
+                ),
             );
         }
         let container = LargeTableContainer {
@@ -2592,15 +2650,9 @@ mod tests {
         // Test with container having only invalid positions
         let invalid_container = LargeTableContainer {
             data: vec![
-                vec![(
-                    CellId::Integer(0),
-                    SnapshotEntryData {
-                        position: WalPosition::INVALID,
-                        last_processed: LastProcessed::none(),
-                    },
-                )]
-                .into_iter()
-                .collect(),
+                vec![(CellId::Integer(0), SnapshotEntryData::empty())]
+                    .into_iter()
+                    .collect(),
             ],
         };
         assert_eq!(invalid_container.pct_wal_position(50), None);
