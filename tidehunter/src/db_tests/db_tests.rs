@@ -2653,6 +2653,39 @@ fn test_reverse_iterator_without_bounds() {
     );
 }
 
+#[test]
+fn test_rebuild_replay_from_monotonic_across_keyspaces() {
+    let dir = tempdir::TempDir::new("test-replay-monotonic").unwrap();
+    let config = Arc::new(Config::small());
+    let mut builder = KeyShapeBuilder::new();
+    let ks1 = builder.add_key_space("ks1", 8, 1, KeyType::uniform(8));
+    let ks2 = builder.add_key_space("ks2", 8, 1, KeyType::uniform(8));
+    let key_shape = builder.build();
+
+    let db = Db::open(
+        dir.path(),
+        key_shape.clone(),
+        config.clone(),
+        Metrics::new(),
+    )
+    .unwrap();
+
+    db.insert(ks1, 1u64.to_be_bytes().to_vec(), vec![1])
+        .unwrap();
+    db.wal_writer.wal_tracker_barrier();
+    let replay1 = db.force_rebuild_control_region().unwrap();
+    assert!(replay1 > 0, "replay1 must not be 0 after force_rebuild");
+
+    db.insert(ks2, 2u64.to_be_bytes().to_vec(), vec![2])
+        .unwrap();
+    let replay2 = db.rebuild_control_region().unwrap();
+
+    assert!(
+        replay2 >= replay1,
+        "replay_from regressed: replay1={replay1}, replay2={replay2}"
+    );
+}
+
 #[ignore]
 #[test]
 fn test_force_rebuild_control_region() {

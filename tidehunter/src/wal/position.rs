@@ -124,7 +124,7 @@ impl MapId {
 }
 
 impl LastProcessed {
-    pub(super) fn new(value: u64) -> Self {
+    pub(crate) fn new(value: u64) -> Self {
         Self(value)
     }
 

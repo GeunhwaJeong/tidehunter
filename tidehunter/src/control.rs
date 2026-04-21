@@ -170,6 +170,11 @@ impl ControlRegionStore {
         key_shape: &KeyShape,
         metrics: &Metrics,
     ) {
+        assert!(
+            last_position >= self.last_position,
+            "control region last_position regressed: new={last_position} < old={}",
+            self.last_position,
+        );
         let force_relocation_position = snapshot.pct_wal_position(FORCE_RELOCATION_PCT);
         let control_region = ControlRegion::new(snapshot, last_position, key_shape);
         let serialized =

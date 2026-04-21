@@ -1314,6 +1314,19 @@ impl LargeTableEntry {
         skip
     }
 
+    /// Transitions the entry into a dirty state for a write at WAL position `v`.
+    ///
+    /// Also anchors `last_processed` at `v.offset()` when the entry was
+    /// previously `Empty`: without this, a freshly-dirty entry carries
+    /// `last_processed = 0` until its first flush and pins the snapshot's
+    /// `replay_from` to 0 — violating monotonicity of `cr.last_position`.
+    fn mark_dirty(&mut self, v: WalPosition) {
+        if matches!(self.state, LargeTableEntryState::Empty) {
+            self.last_processed = LastProcessed::new(v.offset());
+        }
+        self.state.mark_dirty();
+    }
+
     /// Returns true if successful, false if update was skipped.
     /// The lru_value must be provided if LRU is configured.
     pub fn insert(
@@ -1326,7 +1339,7 @@ impl LargeTableEntry {
         if self.skip_stale_update(&k, &v, "insert") {
             return false;
         }
-        self.state.mark_dirty();
+        self.mark_dirty(v);
         self.insert_bloom_filter(&k);
         self.data.make_mut().insert(k.clone(), v);
         self.report_loaded_keys_count();
@@ -1345,7 +1358,7 @@ impl LargeTableEntry {
         if self.skip_stale_update(&k, &v, "remove") {
             return false;
         }
-        self.state.mark_dirty();
+        self.mark_dirty(v);
 
         // Remove from LRU cache if enabled
         if let Some(value_lru) = &mut self.value_lru {
@@ -1822,7 +1835,9 @@ impl LargeTableEntry {
 }
 
 impl LargeTableEntryState {
-    pub fn mark_dirty(&mut self) {
+    /// State transition only. Callers must go through `LargeTableEntry::mark_dirty`,
+    /// which also initializes `last_processed` on the `Empty → DirtyLoaded` edge.
+    fn mark_dirty(&mut self) {
         match self {
             LargeTableEntryState::Empty => {
                 *self = LargeTableEntryState::DirtyLoaded(WalPosition::INVALID)
