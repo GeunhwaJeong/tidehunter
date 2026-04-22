@@ -4,6 +4,7 @@ use flat::{
     flat_upper_bound,
 };
 
+use crate::index::index_format::Direction;
 use crate::key_shape::KeySpaceDesc;
 #[cfg(test)]
 use crate::primitives::cursor::SliceCursor;
@@ -379,28 +380,41 @@ impl IndexTable {
     ///
     /// This works even if prev is set to Some(k), but the value at k does not exist (for ex. was deleted).
     pub fn next_entry(&self, prev: Option<Bytes>, reverse: bool) -> Option<(Bytes, WalPosition)> {
-        if reverse {
-            self.next_entry_reverse(prev.as_deref())
-        } else {
-            self.next_entry_forward(prev.as_deref())
-        }
+        self.next_entry_directional(prev.as_deref(), Direction::from_bool(reverse))
     }
 
-    fn next_entry_forward(&self, prev: Option<&[u8]>) -> Option<(Bytes, WalPosition)> {
-        // Find first BTreeMap entry strictly after prev.
-        // We include Removed entries so callers can see the tombstone (INVALID position)
-        // and correctly shadow any matching on-disk entry (used by DirtyUnloaded iteration).
-        let btree_cand: Option<(&Bytes, &IndexWalPosition)> = if let Some(prev) = prev {
-            self.data
-                .range::<[u8], _>((Bound::Excluded(prev), Bound::<&[u8]>::Unbounded))
-                .next()
-        } else {
-            self.data.iter().next()
+    /// Walk to the next entry in the given direction. BTreeMap and flat are
+    /// both sorted ascending, so Forward picks the smaller key and Backward
+    /// the larger; BTreeMap wins on ties in either direction (freshest data).
+    ///
+    /// Removed tombstones in BTreeMap are surfaced (as INVALID positions) so
+    /// callers can shadow a matching on-disk entry — but a tombstone that
+    /// shadows a *flat* entry at the same key suppresses that flat candidate
+    /// from this iterator (the tombstone in BTreeMap is the winning view).
+    fn next_entry_directional(
+        &self,
+        prev: Option<&[u8]>,
+        direction: Direction,
+    ) -> Option<(Bytes, WalPosition)> {
+        let btree_cand: Option<(&Bytes, &IndexWalPosition)> = match (direction, prev) {
+            (Direction::Forward, Some(p)) => self
+                .data
+                .range::<[u8], _>((Bound::Excluded(p), Bound::<&[u8]>::Unbounded))
+                .next(),
+            (Direction::Forward, None) => self.data.iter().next(),
+            (Direction::Backward, Some(p)) => self
+                .data
+                .range::<[u8], _>((Bound::Unbounded, Bound::Excluded(p)))
+                .next_back(),
+            (Direction::Backward, None) => self.data.iter().next_back(),
         };
 
-        // Find the first flat entry strictly after prev, skipping entries that are
-        // shadowed by a Removed tombstone in BTreeMap.
-        let mut flat_cand = self.flat_next_forward(prev);
+        let flat_step = |from: Option<&[u8]>| match direction {
+            Direction::Forward => self.flat_next_forward(from),
+            Direction::Backward => self.flat_next_reverse(from),
+        };
+
+        let mut flat_cand = flat_step(prev);
         while let Some((ref fk, _)) = flat_cand {
             if self
                 .data
@@ -409,61 +423,29 @@ impl IndexTable {
                 .unwrap_or(false)
             {
                 let fk_clone = fk.clone();
-                flat_cand = self.flat_next_forward(Some(fk_clone.as_ref()));
+                flat_cand = flat_step(Some(fk_clone.as_ref()));
             } else {
                 break;
             }
         }
 
-        // Take the candidate with the smaller key; BTreeMap wins on ties.
         match (btree_cand, flat_cand) {
             (None, None) => None,
             (Some((bk, bv)), None) => Some((bk.clone(), bv.into_wal_position())),
             (None, Some((fk, fv))) => Some((fk, fv)),
-            (Some((bk, bv)), Some((fk, fv))) => match bk.as_ref().cmp(fk.as_ref()) {
-                Ordering::Less | Ordering::Equal => Some((bk.clone(), bv.into_wal_position())),
-                Ordering::Greater => Some((fk, fv)),
-            },
-        }
-    }
-
-    fn next_entry_reverse(&self, prev: Option<&[u8]>) -> Option<(Bytes, WalPosition)> {
-        // Find last BTreeMap entry strictly before prev.
-        // We include Removed entries so callers can see the tombstone (INVALID position)
-        // and correctly shadow any matching on-disk entry (used by DirtyUnloaded iteration).
-        let btree_cand: Option<(&Bytes, &IndexWalPosition)> = if let Some(prev) = prev {
-            self.data
-                .range::<[u8], _>((Bound::Unbounded, Bound::Excluded(prev)))
-                .next_back()
-        } else {
-            self.data.iter().next_back()
-        };
-
-        // Find the last flat entry strictly before prev, skipping deleted entries.
-        let mut flat_cand = self.flat_next_reverse(prev);
-        while let Some((ref fk, _)) = flat_cand {
-            if self
-                .data
-                .get(fk.as_ref())
-                .map(|v| v.is_removed())
-                .unwrap_or(false)
-            {
-                let fk_clone = fk.clone();
-                flat_cand = self.flat_next_reverse(Some(fk_clone.as_ref()));
-            } else {
-                break;
+            (Some((bk, bv)), Some((fk, fv))) => {
+                let cmp = bk.as_ref().cmp(fk.as_ref());
+                // Forward: smaller wins; Backward: larger wins. BTreeMap wins ties.
+                let btree_wins = match direction {
+                    Direction::Forward => cmp != Ordering::Greater,
+                    Direction::Backward => cmp != Ordering::Less,
+                };
+                if btree_wins {
+                    Some((bk.clone(), bv.into_wal_position()))
+                } else {
+                    Some((fk, fv))
+                }
             }
-        }
-
-        // Take the candidate with the larger key; BTreeMap wins on ties.
-        match (btree_cand, flat_cand) {
-            (None, None) => None,
-            (Some((bk, bv)), None) => Some((bk.clone(), bv.into_wal_position())),
-            (None, Some((fk, fv))) => Some((fk, fv)),
-            (Some((bk, bv)), Some((fk, fv))) => match bk.as_ref().cmp(fk.as_ref()) {
-                Ordering::Greater | Ordering::Equal => Some((bk.clone(), bv.into_wal_position())),
-                Ordering::Less => Some((fk, fv)),
-            },
         }
     }
 
