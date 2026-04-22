@@ -882,6 +882,30 @@ impl IndexTable {
     /// Marks all elements in this index as clean and removes tombstones.
     /// Rebuilds flat with Modified→Clean and Removed entries dropped.
     /// After this call both flat and BTreeMap contain only Clean entries.
+    ///
+    /// # LSM tombstone invariant — read before changing call sites
+    ///
+    /// On-disk index blobs may contain tombstones (`WalPosition::INVALID`
+    /// entries). A tombstone exists solely to shadow a key in a **deeper**
+    /// LSM level. Therefore:
+    ///
+    /// - The **deepest** level below a cell has nothing to shadow —
+    ///   tombstones there are dead weight and MUST be stripped by calling
+    ///   this function before the blob is written.
+    /// - **Shallower** levels MUST preserve tombstones; stripping them would
+    ///   resurrect the deeper key the tombstone was shadowing.
+    ///
+    /// Call sites that honor this rule (keep in sync if you add another):
+    /// - `flusher.rs` promote branch: new L1 is deepest → `clean_self`.
+    /// - `flusher.rs` non-promote branch: `clean_self` **only if**
+    ///   `existing_l1.is_none()`.
+    /// - `large_table.rs::clear_after_flush`: strips in-memory tombstones
+    ///   only when no L1 sits below.
+    ///
+    /// The read path (`IndexTable::get` returning `Some(INVALID)` →
+    /// `LargeTable::get` shadowing via `found.valid()`) relies on this
+    /// invariant: a surviving tombstone in a shallower level is what makes
+    /// a deletion observable across a flush boundary.
     pub fn clean_self(&mut self) {
         // A Removed tombstone in `data` shadows any flat entry for the same key;
         // both sides must be dropped together, otherwise the shadowed flat entry
