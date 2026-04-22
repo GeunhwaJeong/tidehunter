@@ -903,14 +903,21 @@ impl IndexTable {
         // both sides must be dropped together, otherwise the shadowed flat entry
         // survives as a stale record.
         //
-        // Collect tombstone keys as owned Bytes so the closure below doesn't
-        // hold a borrow of `self.data` across the `retain_flat` call.
-        let tombstoned: HashSet<Bytes> = self
-            .data
-            .iter()
-            .filter(|(_, v)| matches!(v.kind, IndexEntryKind::Removed))
-            .map(|(k, _)| k.clone())
-            .collect();
+        // Single pass over `data`: collect tombstone keys AND clean the map
+        // (Modified→Clean, drop Removed). Collecting keys inside the retain
+        // closure avoids a separate filter-and-collect walk.
+        let mut tombstoned: HashSet<Bytes> = HashSet::new();
+        self.retain(|k, v| match v.kind {
+            IndexEntryKind::Clean => true,
+            IndexEntryKind::Modified => {
+                *v = v.as_clean_modified();
+                true
+            }
+            IndexEntryKind::Removed => {
+                tombstoned.insert(k.clone());
+                false
+            }
+        });
 
         // Rebuild flat: convert Modified→Clean, drop Removed (in flat or shadowed by data).
         self.retain_flat(|k, mut iwp| {
@@ -921,18 +928,7 @@ impl IndexTable {
                 Some(iwp)
             }
         });
-        drop(tombstoned);
 
-        // Clean BTreeMap: Modified→Clean, drop Removed (shadowed flat entries
-        // were filtered out above).
-        self.retain(|_, v| match v.kind {
-            IndexEntryKind::Clean => true,
-            IndexEntryKind::Modified => {
-                *v = v.as_clean_modified();
-                true
-            }
-            IndexEntryKind::Removed => false,
-        });
         // All remaining entries are Clean after this call — bypass the slow
         // recount. `retain_flat` intentionally doesn't touch dirty_count; `retain`
         // above tracked BTreeMap changes but didn't see the flat dirty drops.
