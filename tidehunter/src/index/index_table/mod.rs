@@ -766,16 +766,91 @@ impl IndexTable {
     /// Entries whose on-disk position is `WalPosition::INVALID` are decoded as
     /// Removed tombstones (see `serialize_index_entries`). The two-level LSM
     /// needs on-disk tombstones in L0 to shadow keys still present in L1.
+    ///
+    /// Fast path: for fixed-size keys with no tombstones, the on-disk format
+    /// is byte-identical to the flat buffer format (clean entries have
+    /// `kind=0`, so `encoded_len = len`). We validate sortedness and absence
+    /// of tombstones in a single pass and, on success, hand the input buffer
+    /// straight to `flat`.
     pub fn deserialize_index_entries(ks: &KeySpaceDesc, bytes: Bytes) -> Self {
+        if let Some(key_size) = ks.index_key_size() {
+            return Self::deserialize_fixed_size(key_size, bytes);
+        }
+        Self::deserialize_varlen(bytes)
+    }
+
+    fn deserialize_fixed_size(key_size: usize, bytes: Bytes) -> Self {
+        let elem_size = key_size + WalPosition::LENGTH;
+        assert_eq!(
+            bytes.len() % elem_size,
+            0,
+            "fixed-size index blob length {} is not a multiple of element size {}",
+            bytes.len(),
+            elem_size,
+        );
+
+        // Single pass: validate sortedness + detect on-disk tombstones.
+        // On-disk tombstones carry `offset = u64::MAX`; the flat encoding of a
+        // tombstone uses `encoded_len = 0x8000_0000` (kind=Removed packed into
+        // the top 2 bits over `len = 0`), so the two layouts differ and we
+        // must fall back to the decode-and-rebuild path in that case.
+        let mut has_tombstone = false;
+        let mut prev_key: Option<&[u8]> = None;
+        for chunk in bytes.chunks_exact(elem_size) {
+            let key = &chunk[..key_size];
+            if let Some(prev) = prev_key {
+                match prev.cmp(key) {
+                    Ordering::Less => {}
+                    Ordering::Equal => panic!("Duplicate keys detected in index"),
+                    Ordering::Greater => {
+                        panic!("Out-of-order keys detected in index (flat requires sorted input)")
+                    }
+                }
+            }
+            prev_key = Some(key);
+            let offset = u64::from_be_bytes(chunk[key_size..key_size + 8].try_into().unwrap());
+            if offset == u64::MAX {
+                has_tombstone = true;
+            }
+        }
+
+        if !has_tombstone {
+            return IndexTable {
+                data: BTreeMap::new(),
+                key_bytes: 0,
+                flat: bytes,
+                key_size: Some(key_size),
+                dirty_count: 0,
+            };
+        }
+
+        // Slow path: blob contains tombstones whose on-disk encoding
+        // (`encoded_len = u32::MAX`) differs from the flat encoding
+        // (`0x8000_0000`). Decode per-entry and rebuild via build_flat_bytes.
+        let mut sb = SliceBuf::new(bytes);
+        let mut entries: Vec<(Bytes, IndexWalPosition)> =
+            Vec::with_capacity(sb.remaining() / elem_size);
+        while sb.has_remaining() {
+            let key = sb.slice_n(key_size);
+            let value = WalPosition::read_from_buf(&mut sb);
+            entries.push((key, IndexWalPosition::from_disk(value)));
+        }
+        let flat = build_flat_bytes(entries, Some(key_size));
+        IndexTable {
+            data: BTreeMap::new(),
+            key_bytes: 0,
+            flat,
+            key_size: Some(key_size),
+            dirty_count: 0,
+        }
+    }
+
+    fn deserialize_varlen(bytes: Bytes) -> Self {
         let mut bytes = SliceBuf::new(bytes);
         let mut entries: Vec<(Bytes, IndexWalPosition)> = Vec::new();
         while bytes.has_remaining() {
-            let key = if let Some(key_len) = ks.index_key_size() {
-                bytes.slice_n(key_len)
-            } else {
-                let key_len = deserialize_u16_varint(&mut bytes);
-                bytes.slice_n(key_len as usize)
-            };
+            let key_len = deserialize_u16_varint(&mut bytes);
+            let key = bytes.slice_n(key_len as usize);
             let value = WalPosition::read_from_buf(&mut bytes);
             let iwp = IndexWalPosition::from_disk(value);
             if let Some((prev_key, _)) = entries.last() {
@@ -789,12 +864,12 @@ impl IndexTable {
             }
             entries.push((key, iwp));
         }
-        let flat = build_flat_bytes(entries, ks.index_key_size());
+        let flat = build_flat_bytes(entries, None);
         IndexTable {
             data: BTreeMap::new(),
             key_bytes: 0,
             flat,
-            key_size: ks.index_key_size(),
+            key_size: None,
             dirty_count: 0,
         }
     }
