@@ -757,20 +757,19 @@ impl IndexTable {
         }
     }
 
-    /// Deserializes IndexTable from bytes
-    /// - data_offset: Where actual data begins (after any headers)
-    /// - ks: KeySpaceDesc to determine element sizes
-    /// - b: Source bytes
-    ///   Returns the deserialized IndexTable
+    /// Deserializes IndexTable from bytes.
+    ///
+    /// Loaded entries populate `flat` (not the BTreeMap `data`): on-disk blobs
+    /// are already sorted and immutable, so the compact flat representation
+    /// with its offset table fits the read-only nature of the deserialized
+    /// table and avoids a per-entry BTreeMap allocation.
     ///
     /// Entries whose on-disk position is `WalPosition::INVALID` are decoded as
-    /// Removed tombstones (see `serialize_index_entries` with
-    /// `preserve_tombstones = true`). The two-level LSM needs on-disk
-    /// tombstones in L0 to shadow keys still present in L1.
+    /// Removed tombstones (see `serialize_index_entries`). The two-level LSM
+    /// needs on-disk tombstones in L0 to shadow keys still present in L1.
     pub fn deserialize_index_entries(ks: &KeySpaceDesc, bytes: Bytes) -> Self {
         let mut bytes = SliceBuf::new(bytes);
-        let mut data = BTreeMap::new();
-        let mut key_bytes = 0usize;
+        let mut entries: Vec<(Bytes, IndexWalPosition)> = Vec::new();
         while bytes.has_remaining() {
             let key = if let Some(key_len) = ks.index_key_size() {
                 bytes.slice_n(key_len)
@@ -779,16 +778,23 @@ impl IndexTable {
                 bytes.slice_n(key_len as usize)
             };
             let value = WalPosition::read_from_buf(&mut bytes);
-            key_bytes += key.len();
             let iwp = IndexWalPosition::from_disk(value);
-            if data.insert(key, iwp).is_some() {
-                panic!("Duplicate keys detected in index");
+            if let Some((prev_key, _)) = entries.last() {
+                match prev_key.as_ref().cmp(key.as_ref()) {
+                    Ordering::Less => {}
+                    Ordering::Equal => panic!("Duplicate keys detected in index"),
+                    Ordering::Greater => {
+                        panic!("Out-of-order keys detected in index (flat requires sorted input)")
+                    }
+                }
             }
+            entries.push((key, iwp));
         }
+        let flat = build_flat_bytes(entries, ks.index_key_size());
         IndexTable {
-            data,
-            key_bytes,
-            flat: Bytes::default(),
+            data: BTreeMap::new(),
+            key_bytes: 0,
+            flat,
             key_size: ks.index_key_size(),
             dirty_count: 0,
         }
@@ -1933,12 +1939,12 @@ mod tests {
     fn test_merge_dirty_and_clean_preserves_tombstones() {
         // Regression for two-level LSM: tombstones in `dirty` must survive
         // into the merged output so they shadow deeper-level entries in the
-        // new L0. Before the fix, tombstones were dropped whenever
-        // `self.flat.is_empty()` — which is always the case for tables loaded
-        // from disk via `deserialize_index_entries`, causing phantom keys to
-        // resurrect from L1 under aggressive promotion.
+        // new L0. An earlier bug dropped tombstones when `self.flat.is_empty()`
+        // — the common shape in any merge path where `self` is a freshly-built
+        // overlay — causing phantom keys to resurrect from L1 under aggressive
+        // promotion.
 
-        // self: loaded-from-disk L0 shape (entries in `data`, flat empty).
+        // self: flat-empty shape (entries in `data`, flat empty).
         let mut self_table = IndexTable::default();
         self_table.insert(vec![1].into(), WalPosition::test_value(10));
         self_table.insert(vec![2].into(), WalPosition::test_value(20));
