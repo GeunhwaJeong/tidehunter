@@ -197,6 +197,11 @@ pub struct Metrics {
     pub flushed_bytes: MetricIntCounterVec,
     pub flush_pending: MetricIntGauge,
 
+    // Two-level LSM accounting (see docs/two_level_lsm_design.md).
+    pub l0_bytes_written: MetricIntCounterVec,
+    pub l1_bytes_written: MetricIntCounterVec,
+    pub promote_total: MetricIntCounterVec,
+
     pub relocation_target_position: MetricIntGauge,
     pub relocation_terminal_position: MetricIntGauge,
     pub gc_position: MetricIntGaugeVec,
@@ -415,6 +420,10 @@ impl Metrics {
             flushed_keys: counter_vec!("flushed_keys", &["ks"], registry, enabled),
             flushed_bytes: counter_vec!("flushed_bytes", &["ks"], registry, enabled),
             flush_pending: gauge!("flush_pending", registry, enabled),
+
+            l0_bytes_written: counter_vec!("l0_bytes_written", &["ks"], registry, enabled),
+            l1_bytes_written: counter_vec!("l1_bytes_written", &["ks"], registry, enabled),
+            promote_total: counter_vec!("promote_total", &["ks"], registry, enabled),
 
             relocation_target_position: gauge!("relocation_target_position", registry, enabled),
             relocation_terminal_position: gauge!("relocation_terminal_position", registry, enabled),

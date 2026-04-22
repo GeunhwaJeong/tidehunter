@@ -1,17 +1,16 @@
 //! `IndexLevels` — the per-cell list of on-disk index blobs.
 //!
-//! Today every cell references a single serialized index blob. The two-level
-//! LSM design (see `docs/two_level_lsm_design.md`) generalizes this to an
-//! ordered list of blobs: L0 (freshest, small, rewritten often), L1 (cold,
-//! large, rewritten only on promote), and — schema-wise — further levels if
-//! ever needed.
+//! The two-level LSM design (see `docs/two_level_lsm_design.md`) represents
+//! each cell's on-disk state as an ordered list of level slots: L0 (freshest,
+//! small, rewritten often) at index 0, L1 (cold, large, rewritten only on
+//! promote) at index 1, and — schema-wise — further levels if ever needed.
 //!
-//! This module is deliberately level-generic. The single-level behavior the
-//! rest of the codebase currently implements is the `len() ≤ 1` degenerate
-//! case. Call sites that genuinely assume "exactly one level" should route
-//! through `single()` / `latest()` helpers and carry a `TODO(levels-generic)`
-//! comment, so the assumption is explicit and auditable when multi-level
-//! flushing lands.
+//! A slot can be "empty" even when a later slot is populated: immediately
+//! after a promote, L0 is empty and L1 holds the merged blob. To represent
+//! that unambiguously (without depending on size-based classification at
+//! read-time) we store `WalPosition::INVALID` as a sentinel for empty
+//! interior slots, and trim trailing INVALIDs so `len()` reflects the
+//! highest populated schema slot plus one.
 use crate::wal::position::WalPosition;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -19,15 +18,16 @@ use smallvec::SmallVec;
 /// Ordered list of on-disk index-blob positions for one cell, freshest first.
 ///
 /// Invariants:
-/// - `positions[0]` is L0 (most recently flushed, smallest).
-/// - `positions[i]` for `i > 0` are older, larger levels, merged into
-///   from `i - 1` on promote.
-/// - All entries must be valid `WalPosition`s; `WalPosition::INVALID` is
-///   never stored — an absent level is represented by shortening the vec.
+/// - `positions[0]` is the L0 slot, `positions[1]` is L1, etc.
+/// - An entry of `WalPosition::INVALID` means "this level slot exists in the
+///   schema but currently holds no blob" (e.g., L0 right after a promote).
+/// - Trailing INVALIDs are trimmed: `[L0, INVALID]` and `[L0]` are not both
+///   valid representations of "L0 only"; only `[L0]` is. Interior INVALIDs
+///   — typically `[INVALID, L1]` post-promote — are preserved.
 /// - The empty list represents a cell that has never been flushed.
 ///
-/// The `SmallVec` inline capacity of 2 means the common (and, for the
-/// foreseeable future, only) case — one or two levels — never allocates.
+/// The `SmallVec` inline capacity of 2 means the common case (up to two
+/// levels) never allocates.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexLevels {
     positions: SmallVec<[WalPosition; 2]>,
@@ -41,15 +41,27 @@ impl IndexLevels {
         }
     }
 
-    /// Returns a level set with a single L0 blob. Used everywhere the
-    /// current single-level code would have stored one `WalPosition`.
+    /// Returns a level set with a single L0 blob.
     pub fn single(position: WalPosition) -> Self {
         debug_assert!(
             position.is_valid(),
-            "IndexLevels must not store INVALID positions",
+            "IndexLevels::single requires a valid position",
         );
         let mut positions = SmallVec::new();
         positions.push(position);
+        Self { positions }
+    }
+
+    /// Returns a post-promote level set: L0 is empty (sentinel), L1 holds
+    /// the promoted blob. Shape: `[INVALID, l1]`.
+    pub fn promoted(l1: WalPosition) -> Self {
+        debug_assert!(
+            l1.is_valid(),
+            "IndexLevels::promoted requires a valid L1 position",
+        );
+        let mut positions = SmallVec::new();
+        positions.push(WalPosition::INVALID);
+        positions.push(l1);
         Self { positions }
     }
 
@@ -65,48 +77,60 @@ impl IndexLevels {
         }
     }
 
+    /// True when no level holds a blob. Equivalent to `l0().is_none() && l1().is_none() && ...`
+    /// for the populated slots.
     pub fn is_empty(&self) -> bool {
-        self.positions.is_empty()
+        self.positions.iter().all(|p| !p.is_valid())
     }
 
+    /// Number of schema slots currently tracked (including empty interior slots).
+    /// Not the same as the number of populated blobs — see `populated_len` if
+    /// that's what you want.
     pub fn len(&self) -> usize {
         self.positions.len()
     }
 
-    /// Returns the freshest level (L0) if any.
+    /// Returns the freshest populated level (lowest-index non-INVALID).
     ///
-    /// `latest()` is the correct accessor for "which blob do I read first"
-    /// and "which blob was just written". It is also the right answer to
-    /// "which single position to record" in legacy code paths that have not
-    /// been generalized yet.
+    /// Skips empty interior slots: for `[INVALID, L1]`, this returns `Some(L1)`.
     pub fn latest(&self) -> Option<WalPosition> {
-        self.positions.first().copied()
+        self.positions.iter().copied().find(|p| p.is_valid())
     }
 
-    /// Returns the oldest (largest) level.
+    /// Returns the oldest populated level (highest-index non-INVALID).
     pub fn oldest(&self) -> Option<WalPosition> {
-        self.positions.last().copied()
+        self.positions.iter().copied().rev().find(|p| p.is_valid())
     }
 
-    /// Iterates levels from freshest (L0) to oldest. This is the read-path
-    /// order: first hit wins.
+    /// Iterates **populated** levels from freshest (L0) to oldest, skipping
+    /// empty interior slots. This is the read-path order: first hit wins.
     pub fn iter(&self) -> impl Iterator<Item = WalPosition> + '_ {
-        self.positions.iter().copied()
+        self.positions.iter().copied().filter(|p| p.is_valid())
     }
 
-    /// Consumes the level list and yields owned positions. Useful when the
-    /// caller cannot retain the `IndexLevels` (e.g. iterating over an
-    /// `entry.levels()` temporary).
+    /// Consumes the level list and yields populated positions.
     pub fn into_iter_owned(self) -> impl Iterator<Item = WalPosition> {
-        self.positions.into_iter()
+        self.positions.into_iter().filter(|p| p.is_valid())
     }
 
-    /// Returns the position at a specific level index, if present.
+    /// Returns the position at a specific level slot, if populated.
+    /// INVALID slot or out-of-bounds both return `None`.
     pub fn get(&self, level: usize) -> Option<WalPosition> {
-        self.positions.get(level).copied()
+        self.positions.get(level).copied().filter(|p| p.is_valid())
     }
 
-    /// Replaces (or appends) the position at `level`.
+    /// Convenience for the L0 slot.
+    pub fn l0(&self) -> Option<WalPosition> {
+        self.get(0)
+    }
+
+    /// Convenience for the L1 slot.
+    pub fn l1(&self) -> Option<WalPosition> {
+        self.get(1)
+    }
+
+    /// Replaces (or appends) the position at `level`. `position` must be valid;
+    /// use `clear(level)` to mark a slot empty.
     ///
     /// Panics if `level > len()` — callers must fill levels contiguously.
     pub fn set(&mut self, level: usize, position: WalPosition) {
@@ -123,25 +147,49 @@ impl IndexLevels {
         }
     }
 
-    /// Drops the blob at level `level`. Subsequent levels shift down by one.
-    /// No-op if `level >= len()`.
+    /// Marks the slot at `level` as empty (stores INVALID).
+    /// If the cleared slot is the last populated one, trailing INVALIDs are
+    /// trimmed so the vec stays in canonical form.
+    pub fn clear(&mut self, level: usize) {
+        if level >= self.positions.len() {
+            return;
+        }
+        self.positions[level] = WalPosition::INVALID;
+        self.trim_trailing_invalid();
+    }
+
+    /// Drops the blob at level `level` and **shifts** subsequent levels down by
+    /// one. This changes the schema meaning of older slots — prefer `clear()`
+    /// to leave the slot empty. No-op if `level >= len()`.
     pub fn remove(&mut self, level: usize) {
         if level < self.positions.len() {
             self.positions.remove(level);
+            self.trim_trailing_invalid();
         }
     }
 
     /// Truncates the level list to `len` entries.
     pub fn truncate(&mut self, len: usize) {
         self.positions.truncate(len);
+        self.trim_trailing_invalid();
     }
 
-    /// Returns `true` if the single-level assumption currently holds.
-    ///
-    /// Call sites that genuinely need to fall back to single-level
-    /// behavior (e.g., legacy flush commands) can assert this.
+    /// True when at most one slot is populated (post-promote `[INVALID, L1]`
+    /// counts as single-level since only L1 holds data). Used by call sites
+    /// that need to assert the L0-only or L1-only invariant explicitly.
     pub fn is_single_level(&self) -> bool {
-        self.positions.len() <= 1
+        self.iter().count() <= 1
+    }
+
+    fn trim_trailing_invalid(&mut self) {
+        while self
+            .positions
+            .last()
+            .map(|p| !p.is_valid())
+            .unwrap_or(false)
+        {
+            self.positions.pop();
+        }
     }
 }
 
@@ -166,6 +214,8 @@ mod tests {
         assert!(lvls.is_empty());
         assert_eq!(lvls.len(), 0);
         assert_eq!(lvls.latest(), None);
+        assert_eq!(lvls.l0(), None);
+        assert_eq!(lvls.l1(), None);
         assert!(lvls.is_single_level());
     }
 
@@ -176,6 +226,8 @@ mod tests {
         assert_eq!(lvls.len(), 1);
         assert_eq!(lvls.latest(), Some(pos(42)));
         assert_eq!(lvls.oldest(), Some(pos(42)));
+        assert_eq!(lvls.l0(), Some(pos(42)));
+        assert_eq!(lvls.l1(), None);
         assert!(lvls.is_single_level());
     }
 
@@ -192,9 +244,25 @@ mod tests {
         assert_eq!(lvls.len(), 2);
         assert_eq!(lvls.latest(), Some(pos(1)));
         assert_eq!(lvls.oldest(), Some(pos(2)));
+        assert_eq!(lvls.l0(), Some(pos(1)));
+        assert_eq!(lvls.l1(), Some(pos(2)));
         assert!(!lvls.is_single_level());
         let collected: Vec<_> = lvls.iter().collect();
         assert_eq!(collected, vec![pos(1), pos(2)]);
+    }
+
+    #[test]
+    fn promoted_post_promote_state() {
+        let lvls = IndexLevels::promoted(pos(99));
+        assert!(!lvls.is_empty());
+        assert_eq!(lvls.len(), 2);
+        assert_eq!(lvls.l0(), None);
+        assert_eq!(lvls.l1(), Some(pos(99)));
+        assert_eq!(lvls.latest(), Some(pos(99)));
+        assert_eq!(lvls.oldest(), Some(pos(99)));
+        assert!(lvls.is_single_level());
+        let collected: Vec<_> = lvls.iter().collect();
+        assert_eq!(collected, vec![pos(99)]);
     }
 
     #[test]
@@ -203,6 +271,35 @@ mod tests {
         lvls.set(0, pos(10));
         assert_eq!(lvls.latest(), Some(pos(10)));
         assert_eq!(lvls.len(), 1);
+    }
+
+    #[test]
+    fn clear_l0_with_l1_keeps_sentinel() {
+        let mut lvls = IndexLevels::single(pos(1));
+        lvls.set(1, pos(2));
+        lvls.clear(0);
+        // Interior INVALID is preserved — [INVALID, L1].
+        assert_eq!(lvls.len(), 2);
+        assert_eq!(lvls.l0(), None);
+        assert_eq!(lvls.l1(), Some(pos(2)));
+    }
+
+    #[test]
+    fn clear_l1_trims() {
+        let mut lvls = IndexLevels::single(pos(1));
+        lvls.set(1, pos(2));
+        lvls.clear(1);
+        // Trailing INVALID trimmed — back to [L0].
+        assert_eq!(lvls.len(), 1);
+        assert_eq!(lvls.l0(), Some(pos(1)));
+    }
+
+    #[test]
+    fn clear_last_trims_to_empty() {
+        let mut lvls = IndexLevels::single(pos(1));
+        lvls.clear(0);
+        assert_eq!(lvls.len(), 0);
+        assert!(lvls.is_empty());
     }
 
     #[test]

@@ -4,6 +4,7 @@ use crate::cell::CellId;
 use crate::context::KsContext;
 use crate::db::Db;
 use crate::index::index_table::IndexTable;
+use crate::index::levels::IndexLevels;
 use crate::key_shape::KeySpace;
 use crate::large_table::Loader;
 use crate::metrics::Metrics;
@@ -50,8 +51,23 @@ impl IndexFlushCommand {
 }
 
 pub enum FlushKind {
-    MergeUnloaded(WalPosition, Arc<IndexTable>),
-    FlushLoaded(Arc<IndexTable>),
+    /// Flush dirty contents, producing a new on-disk level state.
+    ///
+    /// - `dirty` is the dirty/loaded in-memory index provided by the caller.
+    /// - `current_levels` is the entry's on-disk level state at the time the
+    ///   flush was scheduled. It tells the flusher which L0 (if any) to
+    ///   load-and-merge and which L1 (if any) to consult on promote.
+    /// - `loaded` distinguishes the two caller shapes:
+    ///   - `loaded = true` (was `FlushLoaded`): `dirty` already reflects
+    ///     L0 + overlay — no separate L0 load is needed.
+    ///   - `loaded = false` (was `MergeUnloaded`): `dirty` is only the
+    ///     overlay; the flusher must load L0 from `current_levels.l0()`
+    ///     (if any) and merge.
+    Flush {
+        dirty: Arc<IndexTable>,
+        current_levels: IndexLevels,
+        loaded: bool,
+    },
     ForceRelocate(WalPosition),
 }
 
@@ -147,17 +163,17 @@ impl IndexFlusherThread {
 
                     let ks_context = db.ks_context(command.ks);
                     let is_relocation = matches!(command.flush_kind, FlushKind::ForceRelocate(_));
-                    if let Some((original_index, position)) =
+                    if let Some((original_index, new_levels)) =
                         Self::handle_command(&*db, &command, ks_context, None, None)
                     {
                         if is_relocation {
-                            db.update_relocated_index(command.ks, command.cell, position);
+                            db.update_relocated_index(command.ks, command.cell, new_levels);
                         } else {
                             db.update_flushed_index(
                                 command.ks,
                                 command.cell,
                                 original_index,
-                                position,
+                                new_levels,
                             );
                         }
                     }
@@ -177,24 +193,47 @@ impl IndexFlusherThread {
         ctx: &KsContext,
         relocation_updates: Option<RelocationUpdates>,
         relocation_cutoff: Option<u64>,
-    ) -> Option<(Arc<IndexTable>, WalPosition)> {
-        let (original_index, mut merged_index) = match &command.flush_kind {
-            FlushKind::MergeUnloaded(position, dirty_index) => {
-                ctx.metrics.unload.with_label_values(&["merge_flush"]).inc();
-                let mut disk_index = loader
-                    .load(&ctx.ks_config, *position)
-                    .expect("Failed to load index in flusher thread");
-                disk_index.merge_dirty_and_clean(dirty_index);
-                (dirty_index.clone(), disk_index)
-            }
-            FlushKind::FlushLoaded(index) => {
-                ctx.metrics.unload.with_label_values(&["flush"]).inc();
-                // todo - no need to make copy if there is no compactor
-                let mut index_copy = IndexTable::clone(index);
-                index_copy.clean_self();
-                (index.clone(), index_copy)
+    ) -> Option<(Arc<IndexTable>, IndexLevels)> {
+        // Build the merged L0 candidate plus the existing L1 (if any).
+        //
+        // For `Flush`, `current_levels` describes the cell's pre-flush on-disk
+        // state; we honour the sentinel (empty L0 slot after a prior promote)
+        // so post-promote cells start a fresh L0 with just the overlay.
+        //
+        // `ForceRelocate` still addresses a single blob — TODO(levels-generic)
+        // below tracks generalizing it to per-level relocation.
+        let (original_index, mut merged_l0, existing_l1) = match &command.flush_kind {
+            FlushKind::Flush {
+                dirty,
+                current_levels,
+                loaded,
+            } => {
+                let label = if *loaded { "flush" } else { "merge_flush" };
+                ctx.metrics.unload.with_label_values(&[label]).inc();
+                let merged = if *loaded {
+                    // `dirty` already reflects L0+overlay; clean and reuse.
+                    // todo - no need to make copy if there is no compactor
+                    let mut copy = IndexTable::clone(dirty);
+                    copy.clean_self();
+                    copy
+                } else {
+                    let mut base = match current_levels.l0() {
+                        Some(pos) => loader
+                            .load(&ctx.ks_config, pos)
+                            .expect("Failed to load L0 index in flusher thread"),
+                        None => IndexTable::default(),
+                    };
+                    base.merge_dirty_and_clean(dirty);
+                    base
+                };
+                (dirty.clone(), merged, current_levels.l1())
             }
             FlushKind::ForceRelocate(position) => {
+                // TODO(levels-generic): force-relocate still rewrites a single
+                // blob. In two-level mode we rewrite whichever level the
+                // caller addressed and pretend it's L0 for now. When
+                // relocation becomes per-level-aware this branch should
+                // carry the source level.
                 ctx.metrics
                     .unload
                     .with_label_values(&["force_relocate"])
@@ -203,34 +242,83 @@ impl IndexFlusherThread {
                     .load(&ctx.ks_config, *position)
                     .expect("Failed to load index for forced relocation");
                 let arc_index = Arc::new(disk_index);
-                (arc_index.clone(), IndexTable::clone(&arc_index))
+                (arc_index.clone(), IndexTable::clone(&arc_index), None)
             }
         };
 
         if let Some(relocation_updates) = relocation_updates {
-            relocation_updates.apply(&mut merged_index);
+            relocation_updates.apply(&mut merged_l0);
         }
 
         match relocation_cutoff {
             Some(cutoff) => {
-                let length = merged_index.len();
-                merged_index.retain_above_position(cutoff);
-                if merged_index.len() == length {
+                let length = merged_l0.len();
+                merged_l0.retain_above_position(cutoff);
+                if merged_l0.len() == length {
                     return None;
                 }
             }
             // TODO: Used only if relocation doesn't call sync flush. Remove if no such implementation is needed anymore
-            None => merged_index.retain_above_position(loader.min_wal_position()),
+            None => merged_l0.retain_above_position(loader.min_wal_position()),
         }
-        Self::run_compactor(ctx, &mut merged_index);
 
-        // Always flush everything to disk to avoid data loss
-        // The filtering will happen during unmerge_flushed
-        let position = loader
-            .flush(command.ks, &merged_index)
-            .expect("Failed to flush index");
+        // Decide: write as a new L0 on top of the existing L1, or promote by
+        // merging L0 into L1. `ForceRelocate` keeps single-level semantics.
+        //
+        // TODO(two-level): set `PROMOTE_ENABLED` to true once
+        // `large_table::get` / `next_in_cell` walk `entry.levels()`
+        // (miss-chain on get, k-way merge for iteration). Today the read
+        // path still only consults `levels.latest()`, so producing
+        // `[L0, L1]` states would silently lose keys that live in L1. See
+        // docs/two_level_lsm_design.md §7.
+        const PROMOTE_ENABLED: bool = false;
+        let is_relocation = matches!(&command.flush_kind, FlushKind::ForceRelocate(_));
+        let _l0_threshold = ctx.l0_max_entries();
+        let over_threshold = PROMOTE_ENABLED && !is_relocation && merged_l0.len() > _l0_threshold;
 
-        Some((original_index, position))
+        let new_levels = if over_threshold {
+            // Promote: merge the freshly-built L0 with the existing L1 (if
+            // any). `merge_dirty_and_clean` lets `merged_l0` win on overlap
+            // by treating it as the "dirty" overlay.
+            let mut new_l1 = match existing_l1 {
+                Some(pos) => loader
+                    .load(&ctx.ks_config, pos)
+                    .expect("Failed to load L1 index in flusher thread"),
+                None => IndexTable::default(),
+            };
+            new_l1.merge_dirty_and_clean(&merged_l0);
+            Self::run_compactor(ctx, &mut new_l1);
+            let new_l1_pos = loader
+                .flush(command.ks, &new_l1)
+                .expect("Failed to flush index");
+            ctx.metrics
+                .promote_total
+                .with_label_values(&[ctx.name()])
+                .inc();
+            ctx.metrics
+                .l1_bytes_written
+                .with_label_values(&[ctx.name()])
+                .inc_by(new_l1_pos.frame_len() as u64);
+            IndexLevels::promoted(new_l1_pos)
+        } else {
+            Self::run_compactor(ctx, &mut merged_l0);
+            let new_l0_pos = loader
+                .flush(command.ks, &merged_l0)
+                .expect("Failed to flush index");
+            if !is_relocation {
+                ctx.metrics
+                    .l0_bytes_written
+                    .with_label_values(&[ctx.name()])
+                    .inc_by(new_l0_pos.frame_len() as u64);
+            }
+            let mut levels = IndexLevels::single(new_l0_pos);
+            if let Some(l1) = existing_l1 {
+                levels.set(1, l1);
+            }
+            levels
+        };
+
+        Some((original_index, new_levels))
     }
 
     // todo - result of compactor is not applied to in-memory index for DirtyLoaded

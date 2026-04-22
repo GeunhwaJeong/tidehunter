@@ -218,6 +218,15 @@ impl KsContext {
         dirty_keys_count > self.max_dirty_keys()
     }
 
+    /// L0 capacity, in keys. When a flush's merged L0 would exceed this,
+    /// the flusher promotes L0 into L1 instead of writing it as a new L0.
+    /// See `docs/two_level_lsm_design.md` §3 — optimal `M ≈ √(2N/D)`; 8 is a
+    /// conservative default that wins at cell sizes ≥ ~64k keys and doesn't
+    /// lose much at smaller sizes.
+    pub fn l0_max_entries(&self) -> usize {
+        self.max_dirty_keys().saturating_mul(8)
+    }
+
     /// Returns fixed key size or None if variable keys are configured for this key space.
     pub fn index_key_size(&self) -> Option<usize> {
         self.ks_config.index_key_size()

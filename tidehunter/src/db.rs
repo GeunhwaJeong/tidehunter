@@ -7,6 +7,7 @@ use crate::crc::IntoBytesFixed;
 use crate::flusher::IndexFlusher;
 use crate::index::index_format::{IndexFormat, IndexIterCache};
 use crate::index::index_table::IndexTable;
+use crate::index::levels::IndexLevels;
 use crate::iterators::IteratorResult;
 use crate::iterators::db_iterator::DbIterator;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc, KeyType};
@@ -724,18 +725,23 @@ impl Db {
         ks: KeySpace,
         cell: CellId,
         original_index: Arc<IndexTable>,
-        position: WalPosition,
+        new_levels: IndexLevels,
     ) {
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::UpdateFlushedIndex);
         self.large_table
-            .update_flushed_index(context, &cell, original_index, position)
+            .update_flushed_index(context, &cell, original_index, new_levels)
     }
 
-    pub(crate) fn update_relocated_index(&self, ks: KeySpace, cell: CellId, position: WalPosition) {
+    pub(crate) fn update_relocated_index(
+        &self,
+        ks: KeySpace,
+        cell: CellId,
+        new_levels: IndexLevels,
+    ) {
         let context = self.ks_context(ks);
         self.large_table
-            .update_relocated_index(context, &cell, position);
+            .update_relocated_index(context, &cell, new_levels);
     }
 
     fn read_record_check_key(

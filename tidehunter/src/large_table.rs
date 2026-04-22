@@ -157,19 +157,10 @@ impl SnapshotEntryData {
         &self.levels
     }
 
-    /// Constructs from an `IndexLevels` + frontier.
-    ///
-    /// TODO(levels-generic): the runtime currently only produces
-    /// single-level lists; we assert that invariant so stray multi-level
-    /// writes from unrelated code paths don't silently slip through before
-    /// the flusher learns how to emit and unmerge them.
+    /// Constructs from an `IndexLevels` + frontier. The flusher may emit
+    /// sparse/multi-level lists (e.g. `[INVALID, L1]` after a promote) —
+    /// they round-trip through the on-disk control region as-is.
     pub fn from_levels(levels: IndexLevels, last_processed: LastProcessed) -> Self {
-        assert!(
-            levels.is_single_level(),
-            "SnapshotEntryData cannot yet encode multi-level index blobs \
-             (len = {}); flusher support is a later phase",
-            levels.len(),
-        );
         Self {
             levels,
             last_processed,
@@ -1130,30 +1121,31 @@ impl LargeTable {
         context: &KsContext,
         cell: &CellId,
         original_index: Arc<IndexTable>,
-        position: WalPosition,
+        new_levels: IndexLevels,
     ) {
         let row = context.ks_config.mutex_for_cell(cell);
         let ks_table = self.ks_rows(&context.ks_config);
         let mut row = ks_table.lock(row, &context.large_table_contention);
         let entry = self.entry_mut(&mut row, cell);
         entry.promote_pending();
-        entry.update_flushed_index(original_index, position);
+        entry.update_flushed_index(original_index, new_levels);
     }
 
     /// Called by the flusher after a `ForceRelocate` flush completes.
-    /// Updates the entry's WAL position to the new location without requiring the original index.
+    /// Updates the entry's level state to reflect the relocated blob without
+    /// requiring the original index.
     pub(crate) fn update_relocated_index(
         &self,
         context: &KsContext,
         cell: &CellId,
-        position: WalPosition,
+        new_levels: IndexLevels,
     ) {
         let row = context.ks_config.mutex_for_cell(cell);
         let ks_table = self.ks_rows(&context.ks_config);
         let mut row = ks_table.lock(row, &context.large_table_contention);
         let entry = self.entry_mut(&mut row, cell);
         entry.promote_pending();
-        entry.update_relocated_position(position);
+        entry.update_relocated_position(new_levels);
     }
 
     /// Pass 1 of the two-pass snapshot flush: iterate all entries and queue async flushes
@@ -1291,11 +1283,27 @@ impl LargeTableEntry {
         unload_jitter: usize,
         bloom_filter: Option<BloomFilter>,
     ) -> Self {
+        Self::new_unloaded_with_levels(
+            context,
+            cell,
+            IndexLevels::single(position),
+            unload_jitter,
+            bloom_filter,
+        )
+    }
+
+    pub fn new_unloaded_with_levels(
+        context: KsContext,
+        cell: CellId,
+        levels: IndexLevels,
+        unload_jitter: usize,
+        bloom_filter: Option<BloomFilter>,
+    ) -> Self {
         Self::new_with_state(
             context,
             cell,
             LargeTableEntryState::Unloaded,
-            IndexLevels::single(position),
+            levels,
             unload_jitter,
             bloom_filter,
         )
@@ -1350,23 +1358,17 @@ impl LargeTableEntry {
         unload_jitter: usize,
         bloom_filter: Option<BloomFilter>,
     ) -> Self {
-        // TODO(levels-generic): Unloaded carries a single WalPosition today.
-        // When multi-level flushing lands, either the state machine grows to
-        // carry `IndexLevels`, or the entry owns the full list and the state
-        // keeps only the level currently being read. See
-        // `docs/two_level_lsm_design.md` §9. Until then we accept single-level
-        // input; `levels().latest()` is a correct single-level projection.
         let levels = entry_data.levels();
-        assert!(
-            levels.is_single_level(),
-            "from_snapshot_data: multi-level cells not yet supported (levels = {})",
-            levels.len(),
-        );
-        let mut entry = match levels.latest() {
-            None => LargeTableEntry::new_empty(context, cell, unload_jitter),
-            Some(position) => {
-                LargeTableEntry::new_unloaded(context, cell, position, unload_jitter, bloom_filter)
-            }
+        let mut entry = if levels.is_empty() {
+            LargeTableEntry::new_empty(context, cell, unload_jitter)
+        } else {
+            LargeTableEntry::new_unloaded_with_levels(
+                context,
+                cell,
+                levels.clone(),
+                unload_jitter,
+                bloom_filter,
+            )
         };
         entry.last_processed = entry_data.last_processed;
         entry
@@ -1577,10 +1579,15 @@ impl LargeTableEntry {
         let Some(unloaded) = self.as_unloaded_state() else {
             return Ok(());
         };
-        // TODO(levels-generic): loads only the primary (L0) blob; with L1 we'd
-        // need to merge across levels before promoting to `Loaded`.
-        let position = self.wal_position();
-        let mut data = loader.load(&self.context.ks_config, position)?;
+        // Load only the L0 slot — never L1. Reading L1 into `self.data` here
+        // would make the next flush treat L1 content as "L0 + overlay" and
+        // rewrite L1 as the new L0 (see sentinel discussion in
+        // docs/two_level_lsm_design.md §9). On the read path, lookups already
+        // walk `levels` level-by-level, so L1 is reached via on-disk reads.
+        let mut data = match self.levels.l0() {
+            Some(pos) => loader.load(&self.context.ks_config, pos)?,
+            None => IndexTable::default(),
+        };
         let is_dirty = match unloaded {
             UnloadedState::Dirty => {
                 data.merge_dirty_no_clean(&self.data);
@@ -1670,36 +1677,36 @@ impl LargeTableEntry {
         }
     }
 
-    /// Updates the entry's WAL position after a `ForceRelocate` flush completes.
+    /// Updates the entry's level state after a `ForceRelocate` flush completes.
     /// Unlike `update_flushed_index`, this handles clean entries (Unloaded/Loaded)
     /// since forced relocation re-flushes an already-clean entry to a new position.
-    pub fn update_relocated_position(&mut self, position: WalPosition) {
+    pub fn update_relocated_position(&mut self, new_levels: IndexLevels) {
         let pending_last_processed = self
             .pending_last_processed
             .take()
             .expect("update_relocated_position called while pending_last_processed is not set");
         self.last_processed = pending_last_processed;
-        // Update position in levels. New writes may have arrived making the entry dirty —
-        // in that case, just update the base position. The dirty overlay remains valid.
+        // Update levels. New writes may have arrived making the entry dirty —
+        // in that case, just update the on-disk levels. The dirty overlay remains valid.
         // TODO(levels-generic): force-relocate rewrites the sole on-disk blob today;
         // with L0 + L1, only the level that was relocated should be replaced.
         match self.state {
             LargeTableEntryState::Unloaded => {
-                self.levels = IndexLevels::single(position);
+                self.levels = new_levels;
             }
             LargeTableEntryState::Loaded => {
                 // Unload after relocation (snapshot context)
-                self.levels = IndexLevels::single(position);
+                self.levels = new_levels;
                 self.state = LargeTableEntryState::Unloaded;
                 self.data = Default::default();
                 self.report_loaded_keys_count();
             }
             LargeTableEntryState::DirtyUnloaded => {
                 // New write arrived while relocation was in flight — update base position
-                self.levels = IndexLevels::single(position);
+                self.levels = new_levels;
             }
             LargeTableEntryState::DirtyLoaded => {
-                self.levels = IndexLevels::single(position);
+                self.levels = new_levels;
             }
             LargeTableEntryState::Empty => {
                 panic!("update_relocated_position called in Empty state")
@@ -1734,12 +1741,16 @@ impl LargeTableEntry {
                     return Ok(()); // Not in a flushable state and relocation was not requested
                 }
                 self.maybe_load(loader)?;
-                FlushKind::FlushLoaded(self.data.clone_shared())
+                FlushKind::Flush {
+                    dirty: self.data.clone_shared(),
+                    current_levels: self.levels.clone(),
+                    loaded: true,
+                }
             }
         };
 
         // Perform a synchronous flush
-        let Some((_original_index, position)) = IndexFlusherThread::handle_command(
+        let Some((_original_index, new_levels)) = IndexFlusherThread::handle_command(
             loader,
             &IndexFlushCommand::new(self.context.id(), self.cell.clone(), flush_kind),
             &self.context,
@@ -1749,7 +1760,7 @@ impl LargeTableEntry {
             return Ok(());
         };
         self.last_processed = last_processed;
-        self.clear_after_flush(position, last_processed, true);
+        self.clear_after_flush(new_levels, last_processed, true);
         Ok(())
     }
 
@@ -1783,14 +1794,11 @@ impl LargeTableEntry {
 
     fn clear_after_flush(
         &mut self,
-        position: WalPosition,
+        new_levels: IndexLevels,
         last_processed: LastProcessed,
         unload: bool,
     ) {
-        // TODO(levels-generic): every branch here writes a single on-disk blob
-        // and stamps its position into `levels`. With L0 + L1, the flusher will
-        // supply which level was written and only that slot should be replaced.
-        self.levels = IndexLevels::single(position);
+        self.levels = new_levels;
         if !unload && self.state == LargeTableEntryState::DirtyUnloaded {
             // Keep dirty entries in memory; just update the on-disk index position.
             // Transitioning to DirtyLoaded would be wrong — self.data only has the dirty
@@ -1835,7 +1843,11 @@ impl LargeTableEntry {
         }
     }
 
-    pub fn update_flushed_index(&mut self, original_index: Arc<IndexTable>, position: WalPosition) {
+    pub fn update_flushed_index(
+        &mut self,
+        original_index: Arc<IndexTable>,
+        new_levels: IndexLevels,
+    ) {
         let pending_last_processed = self
             .pending_last_processed
             .take()
@@ -1853,14 +1865,13 @@ impl LargeTableEntry {
         // Now that flush is complete, update last_processed
         self.last_processed = pending_last_processed;
         if self.data.same_shared(&original_index) {
-            self.clear_after_flush(position, pending_last_processed, true);
+            self.clear_after_flush(new_levels, pending_last_processed, true);
         } else {
             self.data
                 .make_mut()
                 .unmerge_flushed(&original_index, pending_last_processed);
             self.report_loaded_keys_count();
-            // TODO(levels-generic): single-level flush rewrites the sole blob.
-            self.levels = IndexLevels::single(position);
+            self.levels = new_levels;
             self.state = LargeTableEntryState::DirtyUnloaded;
             self.context
                 .metrics
@@ -1906,15 +1917,16 @@ impl LargeTableEntry {
             LargeTableEntryState::Empty => None,
             LargeTableEntryState::Unloaded => None,
             LargeTableEntryState::Loaded => None,
-            LargeTableEntryState::DirtyUnloaded => {
-                // TODO(levels-generic): `MergeUnloaded` takes a single on-disk
-                // blob today; with L0 + L1 this becomes a per-level merge.
-                let position = self.wal_position();
-                Some(FlushKind::MergeUnloaded(position, self.data.clone_shared()))
-            }
-            LargeTableEntryState::DirtyLoaded => {
-                Some(FlushKind::FlushLoaded(self.data.clone_shared()))
-            }
+            LargeTableEntryState::DirtyUnloaded => Some(FlushKind::Flush {
+                dirty: self.data.clone_shared(),
+                current_levels: self.levels.clone(),
+                loaded: false,
+            }),
+            LargeTableEntryState::DirtyLoaded => Some(FlushKind::Flush {
+                dirty: self.data.clone_shared(),
+                current_levels: self.levels.clone(),
+                loaded: true,
+            }),
         }
     }
 
