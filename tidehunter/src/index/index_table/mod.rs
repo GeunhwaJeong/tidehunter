@@ -1160,14 +1160,20 @@ impl IndexWalPosition {
 
     /// Constructs an IndexWalPosition from a WAL position read off disk.
     /// `WalPosition::INVALID` is the on-disk marker for a tombstone; any other
-    /// position is treated as a clean entry. The offset/len of a tombstone
-    /// decoded this way is `u64::MAX`/`u32::MAX` — preserving the sentinel so
-    /// `into_wal_position()` reports INVALID on subsequent reads.
+    /// position is treated as a clean entry.
+    ///
+    /// For a tombstone the concrete `len` is semantically meaningless (there
+    /// is no WAL frame) — `into_wal_position()` collapses the `Removed` arm
+    /// to `WalPosition::INVALID` regardless. We deliberately normalise the
+    /// len to `0` so that `build_flat_bytes` can pack the kind into the top
+    /// two bits of `encoded_len` without colliding with the real len bits
+    /// (see `encode_kind_in_len` — it requires `len < 2^30`; the on-disk
+    /// tombstone sentinel uses `len = u32::MAX`, which would violate that).
     fn from_disk(w: WalPosition) -> Self {
         if w == WalPosition::INVALID {
             Self {
                 offset: w.offset(),
-                len: w.frame_len_u32(),
+                len: 0,
                 kind: IndexEntryKind::Removed,
             }
         } else {
@@ -1858,6 +1864,45 @@ mod tests {
         assert_eq!(deserialized.get(&[2]), Some(WalPosition::test_value(20)));
         assert_eq!(deserialized.get(&[3]), Some(WalPosition::test_value(30)));
         assert_eq!(deserialized.len(), 3);
+    }
+
+    #[test]
+    fn test_deserialize_preserves_tombstone() {
+        // Regression: a tombstone round-tripped through serialize/deserialize
+        // must decode back as a tombstone, not as a bogus live pointer.
+        //
+        // Pre-fix: `IndexWalPosition::from_disk(INVALID)` produced
+        // `len = u32::MAX`, and `encode_kind_in_len(u32::MAX, Removed=2)`
+        // collided with the kind bits (top 2 bits of the encoded len were
+        // both already set by len), so decode yielded kind byte 3 — which
+        // `IndexEntryKind::from_u8` maps to `Clean` via its fallback arm.
+        // The tombstone then surfaced as a live `{u64::MAX, 0x3FFF_FFFF}`
+        // hit on read.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(10));
+        table.insert(vec![2].into(), WalPosition::test_value(20));
+        // Tombstone on key [2].
+        table.remove(vec![2].into(), WalPosition::test_value(25));
+
+        let (shape, ks) = KeyShape::new_single_config_indexing(
+            KeyIndexing::variable_length(),
+            1,
+            KeyType::uniform(1),
+            Default::default(),
+        );
+        let ks = shape.ks(ks);
+
+        let mut buf = BytesMut::new();
+        table.serialize_index_entries(ks, &mut buf);
+        let deserialized = IndexTable::deserialize_index_entries(ks, Bytes::from(buf.freeze()));
+
+        assert_eq!(deserialized.get(&[1]), Some(WalPosition::test_value(10)));
+        // A tombstone must surface as INVALID via get().
+        assert_eq!(
+            deserialized.get(&[2]),
+            Some(WalPosition::INVALID),
+            "tombstone failed to round-trip through serialize/deserialize"
+        );
     }
 
     #[test]

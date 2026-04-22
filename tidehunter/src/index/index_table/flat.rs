@@ -43,8 +43,14 @@ fn var_flat_read_entry_offset(flat: &[u8], idx: usize) -> usize {
 }
 
 /// Encode `kind` into the top 2 bits of `len`. `len` must be < 2^30 (asserted in `Wal::multi_write`).
+/// Tombstones read from disk carry `WalPosition::INVALID` whose len is `u32::MAX` —
+/// `IndexWalPosition::from_disk` normalises that to `0` so the encoding here stays lossless.
 #[inline]
 pub(super) fn encode_kind_in_len(len: u32, kind: IndexEntryKind) -> u32 {
+    debug_assert!(
+        len < (1 << 30),
+        "encode_kind_in_len: len must be < 2^30 (got 0x{len:08x}) — kind bits collide",
+    );
     len | ((kind.to_u8() as u32) << 30)
 }
 
