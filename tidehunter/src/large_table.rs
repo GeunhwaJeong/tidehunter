@@ -48,6 +48,13 @@ pub struct LargeTableEntry {
     pub(crate) data: ArcCow<IndexTable>,
     pending_data: PendingTable,
     state: LargeTableEntryState,
+    /// On-disk index-blob positions for this cell.
+    ///
+    /// Invariant: empty iff `state == Empty`; otherwise `len() == 1` until
+    /// the flusher grows to emit L0 + L1 (see
+    /// `docs/two_level_lsm_design.md`). Held as an `IndexLevels` so
+    /// state-transition code is already level-generic.
+    levels: IndexLevels,
     context: KsContext,
     bloom_filter: Option<BloomFilter>,
     unload_jitter: usize,
@@ -69,12 +76,24 @@ pub struct LargeTableEntry {
     last_reported_dirty_count: i64,
 }
 
+/// In-memory status of a `LargeTableEntry`.
+///
+/// The on-disk position(s) for the cell are stored separately on
+/// [`LargeTableEntry::levels`] — see `docs/two_level_lsm_design.md` for the
+/// long-form rationale. This enum used to carry a `WalPosition` in each
+/// non-`Empty` variant; that field has moved onto the entry so that the
+/// runtime can grow from one position per cell to an `IndexLevels` list
+/// without touching every state transition.
+///
+/// Invariant: `Empty` ⇔ `levels.is_empty()`. All other states carry
+/// `levels.len() == 1` today; multi-level populations are a later phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LargeTableEntryState {
     Empty,
-    Unloaded(WalPosition),
-    Loaded(WalPosition),
-    DirtyUnloaded(WalPosition),
-    DirtyLoaded(WalPosition),
+    Unloaded,
+    Loaded,
+    DirtyUnloaded,
+    DirtyLoaded,
 }
 
 struct KsTable {
@@ -460,7 +479,7 @@ impl LargeTable {
             LargeTableEntryState::Empty => {
                 return Ok(context.report_lookup_result(None, LookupSource::Cache));
             }
-            LargeTableEntryState::Loaded(_) => {
+            LargeTableEntryState::Loaded => {
                 let result = entry.get(k);
                 if result == Some(WalPosition::INVALID) {
                     panic!(
@@ -470,20 +489,22 @@ impl LargeTable {
                 }
                 return Ok(context.report_lookup_result(result, LookupSource::Cache));
             }
-            LargeTableEntryState::DirtyLoaded(_) => {
+            LargeTableEntryState::DirtyLoaded => {
                 return Ok(context.report_lookup_result(
                     entry.get(k).and_then(WalPosition::valid),
                     LookupSource::Cache,
                 ));
             }
-            LargeTableEntryState::DirtyUnloaded(position) => {
+            LargeTableEntryState::DirtyUnloaded => {
                 // optimization: in dirty unloaded state we might not need to load entry
                 if let Some(found) = entry.get(k) {
                     return Ok(context.report_lookup_result(found.valid(), LookupSource::Cache));
                 }
-                position
+                // TODO(levels-generic): read path picks the primary (L0) blob;
+                // once L1 exists, this becomes a miss-chain across all levels.
+                entry.wal_position()
             }
-            LargeTableEntryState::Unloaded(position) => position,
+            LargeTableEntryState::Unloaded => entry.wal_position(),
         };
         // Allocate index reader **before** dropping the mutex - this ensures
         // that we can read from the index,
@@ -809,13 +830,12 @@ impl LargeTable {
                 if !entry.state.is_dirty() && !entry.state.is_empty() {
                     entry.last_processed = loader_last_processed;
                 }
-                // TODO(levels-generic): `entry.state.wal_position()` returns the
-                // one-and-only on-disk blob position today. The state machine
-                // will need to surface an `IndexLevels` once multi-level
-                // flushing lands. For now the single-level projection is
-                // lossless: we wrap it as a degenerate level list.
-                let levels = IndexLevels::from_legacy_position(entry.state.wal_position());
-                let snapshot_data = SnapshotEntryData::from_levels(levels, entry.last_processed);
+                // `entry.levels()` is the full on-disk level list for this
+                // cell. Today it's always len 0 or 1; persisting it verbatim
+                // means the snapshot shape will grow with no extra work once
+                // the flusher emits L0 + L1.
+                let snapshot_data =
+                    SnapshotEntryData::from_levels(entry.levels().clone(), entry.last_processed);
                 ks_data.insert(entry.cell.clone(), snapshot_data);
                 // Do not use last_processed from empty entries
                 if !entry.state.is_empty() {
@@ -921,7 +941,7 @@ impl LargeTable {
 
         match &entry.state {
             // If already loaded, just use what's in memory — cache is not used.
-            LargeTableEntryState::Loaded(_) | LargeTableEntryState::DirtyLoaded(_) => {
+            LargeTableEntryState::Loaded | LargeTableEntryState::DirtyLoaded => {
                 *cache = None;
                 let mut prev_key = prev_key;
                 // Skip entries marked as invalid (deleted)
@@ -944,8 +964,10 @@ impl LargeTable {
             }
 
             // For unloaded states, read from disk without loading everything
-            LargeTableEntryState::Unloaded(position) => {
-                let position = *position;
+            LargeTableEntryState::Unloaded => {
+                // TODO(levels-generic): single-level projection; multi-level
+                // iteration needs a k-way merge across levels.
+                let position = entry.wal_position();
                 // Get reader for on-disk index
                 let index_reader = loader.index_reader(position)?;
                 let format = entry.context.ks_config.index_format();
@@ -975,8 +997,10 @@ impl LargeTable {
             }
 
             // For dirty unloaded, combine in-memory and on-disk entries
-            LargeTableEntryState::DirtyUnloaded(position) => {
-                let position = *position;
+            LargeTableEntryState::DirtyUnloaded => {
+                // TODO(levels-generic): single-level projection; multi-level
+                // iteration needs a k-way merge across levels.
+                let position = entry.wal_position();
                 // Get reader for on-disk index (opened once for all skip iterations)
                 let index_reader = loader.index_reader(position)?;
                 let format = entry.context.ks_config.index_format();
@@ -1196,8 +1220,8 @@ impl LargeTable {
             for mutex in ks_table.rows.mutexes() {
                 let mut row = mutex.lock();
                 for entry in row.entries.iter_mut() {
-                    if let LargeTableEntryState::Loaded(pos) = entry.state {
-                        entry.state = LargeTableEntryState::Unloaded(pos);
+                    if entry.state == LargeTableEntryState::Loaded {
+                        entry.state = LargeTableEntryState::Unloaded;
                         entry.data = Default::default();
                     }
                 }
@@ -1270,7 +1294,8 @@ impl LargeTableEntry {
         Self::new_with_state(
             context,
             cell,
-            LargeTableEntryState::Unloaded(position),
+            LargeTableEntryState::Unloaded,
+            IndexLevels::single(position),
             unload_jitter,
             bloom_filter,
         )
@@ -1285,6 +1310,7 @@ impl LargeTableEntry {
             context,
             cell,
             LargeTableEntryState::Empty,
+            IndexLevels::new(),
             unload_jitter,
             bloom_filter,
         )
@@ -1294,6 +1320,7 @@ impl LargeTableEntry {
         context: KsContext,
         cell: CellId,
         state: LargeTableEntryState,
+        levels: IndexLevels,
         unload_jitter: usize,
         bloom_filter: Option<BloomFilter>,
     ) -> Self {
@@ -1302,6 +1329,7 @@ impl LargeTableEntry {
             context,
             cell,
             state,
+            levels,
             data: Default::default(),
             pending_data: Default::default(),
             bloom_filter,
@@ -1527,7 +1555,7 @@ impl LargeTableEntry {
     }
 
     pub fn get(&self, k: &[u8]) -> Option<WalPosition> {
-        if matches!(&self.state, LargeTableEntryState::Unloaded(_)) {
+        if self.state == LargeTableEntryState::Unloaded {
             panic!("Can't get in unloaded state");
         }
         self.data.get(k)
@@ -1539,18 +1567,21 @@ impl LargeTableEntry {
         prev_key: Option<Bytes>,
         reverse: bool,
     ) -> Option<(Bytes, WalPosition)> {
-        if matches!(&self.state, LargeTableEntryState::Unloaded(_)) {
+        if self.state == LargeTableEntryState::Unloaded {
             panic!("Can't next_entry in unloaded state");
         }
         self.data.next_entry(prev_key, reverse)
     }
 
     pub fn maybe_load<L: Loader>(&mut self, loader: &L) -> Result<(), L::Error> {
-        let Some((state, position)) = self.state.as_unloaded_state() else {
+        let Some(unloaded) = self.as_unloaded_state() else {
             return Ok(());
         };
+        // TODO(levels-generic): loads only the primary (L0) blob; with L1 we'd
+        // need to merge across levels before promoting to `Loaded`.
+        let position = self.wal_position();
         let mut data = loader.load(&self.context.ks_config, position)?;
-        let is_dirty = match state {
+        let is_dirty = match unloaded {
             UnloadedState::Dirty => {
                 data.merge_dirty_no_clean(&self.data);
                 true
@@ -1562,10 +1593,11 @@ impl LargeTableEntry {
         };
         self.data = ArcCow::new_owned(data);
         self.report_loaded_keys_count();
+        // Levels unchanged — maybe_load doesn't alter the on-disk state.
         if is_dirty {
-            self.state = LargeTableEntryState::DirtyLoaded(position);
+            self.state = LargeTableEntryState::DirtyLoaded;
         } else {
-            self.state = LargeTableEntryState::Loaded(position);
+            self.state = LargeTableEntryState::Loaded;
         }
         Ok(())
     }
@@ -1585,7 +1617,7 @@ impl LargeTableEntry {
             return;
         }
         let forced_relocation = if let (Some(index_wal_position), Some(force_relocate_below)) =
-            (self.state.wal_position().valid(), force_relocate_below)
+            (self.wal_position().valid(), force_relocate_below)
         {
             index_wal_position < force_relocate_below
         } else {
@@ -1619,7 +1651,6 @@ impl LargeTableEntry {
         if forced_relocation && !self.state.is_dirty() {
             // Clean entry needing relocation: re-read from old position and re-write
             let old_position = self
-                .state
                 .wal_position()
                 .valid()
                 .expect("forced relocation entry must have valid wal position");
@@ -1648,24 +1679,27 @@ impl LargeTableEntry {
             .take()
             .expect("update_relocated_position called while pending_last_processed is not set");
         self.last_processed = pending_last_processed;
-        // Update position in state. New writes may have arrived making the entry dirty —
+        // Update position in levels. New writes may have arrived making the entry dirty —
         // in that case, just update the base position. The dirty overlay remains valid.
+        // TODO(levels-generic): force-relocate rewrites the sole on-disk blob today;
+        // with L0 + L1, only the level that was relocated should be replaced.
         match self.state {
-            LargeTableEntryState::Unloaded(_) => {
-                self.state = LargeTableEntryState::Unloaded(position);
+            LargeTableEntryState::Unloaded => {
+                self.levels = IndexLevels::single(position);
             }
-            LargeTableEntryState::Loaded(_) => {
+            LargeTableEntryState::Loaded => {
                 // Unload after relocation (snapshot context)
-                self.state = LargeTableEntryState::Unloaded(position);
+                self.levels = IndexLevels::single(position);
+                self.state = LargeTableEntryState::Unloaded;
                 self.data = Default::default();
                 self.report_loaded_keys_count();
             }
-            LargeTableEntryState::DirtyUnloaded(_) => {
+            LargeTableEntryState::DirtyUnloaded => {
                 // New write arrived while relocation was in flight — update base position
-                self.state = LargeTableEntryState::DirtyUnloaded(position);
+                self.levels = IndexLevels::single(position);
             }
-            LargeTableEntryState::DirtyLoaded(_) => {
-                self.state = LargeTableEntryState::DirtyLoaded(position);
+            LargeTableEntryState::DirtyLoaded => {
+                self.levels = IndexLevels::single(position);
             }
             LargeTableEntryState::Empty => {
                 panic!("update_relocated_position called in Empty state")
@@ -1753,17 +1787,20 @@ impl LargeTableEntry {
         last_processed: LastProcessed,
         unload: bool,
     ) {
-        if !unload && let LargeTableEntryState::DirtyUnloaded(_) = self.state {
+        // TODO(levels-generic): every branch here writes a single on-disk blob
+        // and stamps its position into `levels`. With L0 + L1, the flusher will
+        // supply which level was written and only that slot should be replaced.
+        self.levels = IndexLevels::single(position);
+        if !unload && self.state == LargeTableEntryState::DirtyUnloaded {
             // Keep dirty entries in memory; just update the on-disk index position.
             // Transitioning to DirtyLoaded would be wrong — self.data only has the dirty
             // overlay, not the full merged index that was written to disk.
-            self.state = LargeTableEntryState::DirtyUnloaded(position);
             return;
         }
         if self.state.is_loaded() && (!unload || self.context.ks_config.unloading_disabled()) {
             if self.data.has_unprocessed(last_processed) {
                 // Some entries remain (newer than last_processed), keep state as DirtyLoaded
-                self.state = LargeTableEntryState::DirtyLoaded(position);
+                self.state = LargeTableEntryState::DirtyLoaded;
             } else {
                 // All entries are processed — tombstones (Removed entries) must be cleaned up
                 // before entering Loaded state. In Loaded state, get() does not filter INVALID
@@ -1771,7 +1808,7 @@ impl LargeTableEntry {
                 // returned to callers and trigger a crash in Wal::read.
                 self.data.make_mut().clean_self();
                 self.report_loaded_keys_count();
-                self.state = LargeTableEntryState::Loaded(position);
+                self.state = LargeTableEntryState::Loaded;
             }
             return;
         }
@@ -1781,7 +1818,7 @@ impl LargeTableEntry {
 
         // If all entries were removed, update state to Unloaded
         if self.data.is_empty() {
-            self.state = LargeTableEntryState::Unloaded(position);
+            self.state = LargeTableEntryState::Unloaded;
             self.context
                 .metrics
                 .flush_update
@@ -1789,7 +1826,7 @@ impl LargeTableEntry {
                 .inc();
         } else {
             // Some entries remain, keep state as DirtyUnloaded
-            self.state = LargeTableEntryState::DirtyUnloaded(position);
+            self.state = LargeTableEntryState::DirtyUnloaded;
             self.context
                 .metrics
                 .flush_update
@@ -1807,11 +1844,11 @@ impl LargeTableEntry {
         // For unmerge, we always use the actual last_processed value (not u64::MAX)
         // to ensure we only remove entries that were actually committed
         match self.state {
-            LargeTableEntryState::DirtyUnloaded(_) => {}
-            LargeTableEntryState::DirtyLoaded(_) => {}
+            LargeTableEntryState::DirtyUnloaded => {}
+            LargeTableEntryState::DirtyLoaded => {}
             LargeTableEntryState::Empty => panic!("update_merged_index in Empty state"),
-            LargeTableEntryState::Unloaded(_) => panic!("update_merged_index in Unloaded state"),
-            LargeTableEntryState::Loaded(_) => panic!("update_merged_index in Loaded state"),
+            LargeTableEntryState::Unloaded => panic!("update_merged_index in Unloaded state"),
+            LargeTableEntryState::Loaded => panic!("update_merged_index in Loaded state"),
         }
         // Now that flush is complete, update last_processed
         self.last_processed = pending_last_processed;
@@ -1822,7 +1859,9 @@ impl LargeTableEntry {
                 .make_mut()
                 .unmerge_flushed(&original_index, pending_last_processed);
             self.report_loaded_keys_count();
-            self.state = LargeTableEntryState::DirtyUnloaded(position);
+            // TODO(levels-generic): single-level flush rewrites the sole blob.
+            self.levels = IndexLevels::single(position);
+            self.state = LargeTableEntryState::DirtyUnloaded;
             self.context
                 .metrics
                 .flush_update
@@ -1839,7 +1878,8 @@ impl LargeTableEntry {
         data.clean_self();
         // todo - if this line returns error, self.data will be in the inconsistent state
         let position = loader.flush(self.context.id(), &data)?;
-        self.state = LargeTableEntryState::Unloaded(position);
+        self.levels = IndexLevels::single(position);
+        self.state = LargeTableEntryState::Unloaded;
         self.data = Default::default();
         self.report_loaded_keys_count();
         Ok(())
@@ -1852,6 +1892,7 @@ impl LargeTableEntry {
     /// Clears this entry, setting its state to Empty and dropping all data.
     pub(crate) fn clear(&mut self) {
         self.state = LargeTableEntryState::Empty;
+        self.levels = IndexLevels::new();
         self.data = Default::default();
         if let Some(ref mut bloom) = self.bloom_filter {
             bloom.clear();
@@ -1863,12 +1904,15 @@ impl LargeTableEntry {
     pub fn flush_kind(&mut self) -> Option<FlushKind> {
         match self.state {
             LargeTableEntryState::Empty => None,
-            LargeTableEntryState::Unloaded(_) => None,
-            LargeTableEntryState::Loaded(_) => None,
-            LargeTableEntryState::DirtyUnloaded(position) => {
+            LargeTableEntryState::Unloaded => None,
+            LargeTableEntryState::Loaded => None,
+            LargeTableEntryState::DirtyUnloaded => {
+                // TODO(levels-generic): `MergeUnloaded` takes a single on-disk
+                // blob today; with L0 + L1 this becomes a per-level merge.
+                let position = self.wal_position();
                 Some(FlushKind::MergeUnloaded(position, self.data.clone_shared()))
             }
-            LargeTableEntryState::DirtyLoaded(_) => {
+            LargeTableEntryState::DirtyLoaded => {
                 Some(FlushKind::FlushLoaded(self.data.clone_shared()))
             }
         }
@@ -1879,63 +1923,66 @@ impl LargeTableEntry {
     pub fn is_index_loaded(&self) -> bool {
         matches!(
             self.state,
-            LargeTableEntryState::Loaded(_) | LargeTableEntryState::DirtyLoaded(_)
+            LargeTableEntryState::Loaded | LargeTableEntryState::DirtyLoaded
         )
+    }
+
+    /// Returns the "primary" on-disk WAL position for this cell —
+    /// `levels.latest()` projected to `WalPosition::INVALID` when the cell has
+    /// never been flushed.
+    ///
+    /// TODO(levels-generic): callers that use this as "the" on-disk blob need
+    /// to be re-examined once the runtime populates multiple levels. Today
+    /// this is exact; tomorrow it's the freshest level (L0) and the caller
+    /// may need to look at older levels too.
+    pub fn wal_position(&self) -> WalPosition {
+        self.levels.latest().unwrap_or(WalPosition::INVALID)
+    }
+
+    /// Returns the full list of on-disk blob positions for this cell. Prefer
+    /// this accessor (over `wal_position()`) in read/iteration paths so the
+    /// code is already level-generic.
+    pub fn levels(&self) -> &IndexLevels {
+        &self.levels
+    }
+
+    /// If this entry is in an unloaded state, returns which flavor of
+    /// unloaded it is. Returns `None` for loaded / empty states.
+    fn as_unloaded_state(&self) -> Option<UnloadedState> {
+        match self.state {
+            LargeTableEntryState::Empty => None,
+            LargeTableEntryState::Unloaded => Some(UnloadedState::Clean),
+            LargeTableEntryState::Loaded => None,
+            LargeTableEntryState::DirtyUnloaded => Some(UnloadedState::Dirty),
+            LargeTableEntryState::DirtyLoaded => None,
+        }
     }
 }
 
 impl LargeTableEntryState {
-    /// State transition only. Callers must go through `LargeTableEntry::mark_dirty`,
-    /// which also initializes `last_processed` on the `Empty → DirtyLoaded` edge.
+    /// Pure state-label transition for the dirty edge. Callers must go
+    /// through `LargeTableEntry::mark_dirty`, which also initializes
+    /// `last_processed` on the `Empty → DirtyLoaded` edge and owns the
+    /// `levels` field.
     fn mark_dirty(&mut self) {
         match self {
-            LargeTableEntryState::Empty => {
-                *self = LargeTableEntryState::DirtyLoaded(WalPosition::INVALID)
-            }
-            LargeTableEntryState::Loaded(position) => {
-                *self = LargeTableEntryState::DirtyLoaded(*position)
-            }
-            LargeTableEntryState::DirtyLoaded(_) => {}
-            LargeTableEntryState::Unloaded(pos) => {
-                *self = LargeTableEntryState::DirtyUnloaded(*pos)
-            }
-            LargeTableEntryState::DirtyUnloaded(_) => {}
-        }
-    }
-
-    pub fn as_unloaded_state(&mut self) -> Option<(UnloadedState, WalPosition)> {
-        match self {
-            LargeTableEntryState::Empty => None,
-            LargeTableEntryState::Unloaded(pos) => Some((UnloadedState::Clean, *pos)),
-            LargeTableEntryState::Loaded(_) => None,
-            LargeTableEntryState::DirtyUnloaded(pos) => Some((UnloadedState::Dirty, *pos)),
-            LargeTableEntryState::DirtyLoaded(_) => None,
+            LargeTableEntryState::Empty => *self = LargeTableEntryState::DirtyLoaded,
+            LargeTableEntryState::Loaded => *self = LargeTableEntryState::DirtyLoaded,
+            LargeTableEntryState::DirtyLoaded => {}
+            LargeTableEntryState::Unloaded => *self = LargeTableEntryState::DirtyUnloaded,
+            LargeTableEntryState::DirtyUnloaded => {}
         }
     }
 
     /// Empty, Loaded and DirtyLoaded is considered 'loaded' state.
     /// No disk lookup is needed when accessing entry in this state.
-    /// This is opposite of as_unloaded_state:
-    /// - if this method returns true, as_unloaded_state returns None
-    /// - if this method returns false, as_unloaded_state returns Some(...)
     pub fn is_loaded(&self) -> bool {
         match self {
             LargeTableEntryState::Empty => true,
-            LargeTableEntryState::Unloaded(_) => false,
-            LargeTableEntryState::Loaded(_) => true,
-            LargeTableEntryState::DirtyUnloaded(_) => false,
-            LargeTableEntryState::DirtyLoaded(_) => true,
-        }
-    }
-
-    /// Wal position of the persisted index entry.
-    pub fn wal_position(&self) -> WalPosition {
-        match self {
-            LargeTableEntryState::Empty => WalPosition::INVALID,
-            LargeTableEntryState::Unloaded(w) => *w,
-            LargeTableEntryState::Loaded(w) => *w,
-            LargeTableEntryState::DirtyUnloaded(w) => *w,
-            LargeTableEntryState::DirtyLoaded(w) => *w,
+            LargeTableEntryState::Unloaded => false,
+            LargeTableEntryState::Loaded => true,
+            LargeTableEntryState::DirtyUnloaded => false,
+            LargeTableEntryState::DirtyLoaded => true,
         }
     }
 
@@ -1943,17 +1990,15 @@ impl LargeTableEntryState {
         matches!(self, LargeTableEntryState::Empty)
     }
 
-    /// Returns whether wal needs to be replayed from the position returned by wal_position()
-    /// to restore large table entry.
-    ///
-    /// This is the same as as_dirty_state().is_some()
+    /// Returns whether wal needs to be replayed from this entry's
+    /// `last_processed` to restore the large-table entry.
     pub fn is_dirty(&self) -> bool {
         match self {
             LargeTableEntryState::Empty => false,
-            LargeTableEntryState::Unloaded(_) => false,
-            LargeTableEntryState::Loaded(_) => false,
-            LargeTableEntryState::DirtyUnloaded(_) => true,
-            LargeTableEntryState::DirtyLoaded(_) => true,
+            LargeTableEntryState::Unloaded => false,
+            LargeTableEntryState::Loaded => false,
+            LargeTableEntryState::DirtyUnloaded => true,
+            LargeTableEntryState::DirtyLoaded => true,
         }
     }
 
@@ -1961,10 +2006,10 @@ impl LargeTableEntryState {
     pub fn name(&self) -> &'static str {
         match self {
             LargeTableEntryState::Empty => "empty",
-            LargeTableEntryState::Unloaded(_) => "unloaded",
-            LargeTableEntryState::Loaded(_) => "loaded",
-            LargeTableEntryState::DirtyUnloaded(_) => "dirty_unloaded",
-            LargeTableEntryState::DirtyLoaded(_) => "dirty_loaded",
+            LargeTableEntryState::Unloaded => "unloaded",
+            LargeTableEntryState::Loaded => "loaded",
+            LargeTableEntryState::DirtyUnloaded => "dirty_unloaded",
+            LargeTableEntryState::DirtyLoaded => "dirty_loaded",
         }
     }
 }
@@ -2380,7 +2425,8 @@ mod tests {
             // Create a row with a Loaded entry
             let mut entry = LargeTableEntry::new_empty(context.clone(), cell_id.clone(), 0);
             entry.data = ArcCow::new_owned(disk_index.clone());
-            entry.state = LargeTableEntryState::Loaded(WalPosition::test_value(42));
+            entry.levels = IndexLevels::single(WalPosition::test_value(42));
+            entry.state = LargeTableEntryState::Loaded;
 
             let mut row = Row {
                 context: context.clone(),
@@ -2486,7 +2532,8 @@ mod tests {
                 WalPosition::test_value(18),
             ); // Deleted key
 
-            entry.state = LargeTableEntryState::DirtyLoaded(WalPosition::test_value(42));
+            entry.levels = IndexLevels::single(WalPosition::test_value(42));
+            entry.state = LargeTableEntryState::DirtyLoaded;
 
             let mut row = Row {
                 context: context.clone(),
@@ -2548,7 +2595,7 @@ mod tests {
                 WalPosition::test_value(16),
             );
 
-            entry.state = LargeTableEntryState::DirtyUnloaded(WalPosition::test_value(42));
+            entry.state = LargeTableEntryState::DirtyUnloaded;
 
             let mut row = Row {
                 context: context.clone(),
@@ -2853,7 +2900,8 @@ mod tests {
             .data
             .make_mut()
             .insert(Bytes::from(vec![0u8]), WalPosition::test_value(1));
-        entry.state = LargeTableEntryState::DirtyLoaded(WalPosition::test_value(1));
+        entry.levels = IndexLevels::single(WalPosition::test_value(1));
+        entry.state = LargeTableEntryState::DirtyLoaded;
         drop(row);
 
         table.report_entries_state();
