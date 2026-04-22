@@ -289,8 +289,8 @@ mod legacy_v1 {
     /// the pre-change definition.
     #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
     pub(super) struct SnapshotEntryDataV1 {
-        position: WalPosition,
-        last_processed: LastProcessed,
+        pub(super) position: WalPosition,
+        pub(super) last_processed: LastProcessed,
     }
 
     impl SnapshotEntryDataV1 {
@@ -307,10 +307,10 @@ mod legacy_v1 {
     /// pre-keyspace-names compatibility within V1 files.
     #[derive(Serialize, Deserialize, Debug)]
     pub(super) struct ControlRegionV1 {
-        last_position: u64,
-        snapshot: LargeTableContainer<SnapshotEntryDataV1>,
+        pub(super) last_position: u64,
+        pub(super) snapshot: LargeTableContainer<SnapshotEntryDataV1>,
         #[serde(default)]
-        keyspace_names: Vec<String>,
+        pub(super) keyspace_names: Vec<String>,
     }
 
     impl ControlRegionV1 {
@@ -396,18 +396,17 @@ mod tests {
         let shape = tiny_shape();
         let num_ks = shape.num_ks();
 
-        let mut ks_map: BTreeMap<CellId, legacy_v1_probe::SnapshotEntryDataV1Probe> =
-            BTreeMap::new();
+        let mut ks_map: BTreeMap<CellId, legacy_v1::SnapshotEntryDataV1> = BTreeMap::new();
         ks_map.insert(
             CellId::Integer(0),
-            legacy_v1_probe::SnapshotEntryDataV1Probe {
+            legacy_v1::SnapshotEntryDataV1 {
                 position: WalPosition::test_value(1234),
                 last_processed: LastProcessed::new_test(10),
             },
         );
         ks_map.insert(
             CellId::Integer(1),
-            legacy_v1_probe::SnapshotEntryDataV1Probe {
+            legacy_v1::SnapshotEntryDataV1 {
                 position: WalPosition::INVALID,
                 last_processed: LastProcessed::none(),
             },
@@ -418,7 +417,7 @@ mod tests {
             data.push(BTreeMap::new());
         }
         let keyspace_names: Vec<String> = shape.iter_ks().map(|ks| ks.name().to_string()).collect();
-        let v1 = legacy_v1_probe::ControlRegionV1Probe {
+        let v1 = legacy_v1::ControlRegionV1 {
             last_position: 55,
             snapshot: LargeTableContainer { data },
             keyspace_names,
@@ -439,27 +438,5 @@ mod tests {
             .get(&CellId::Integer(1))
             .expect("cell 1 present");
         assert!(cell1.levels.is_empty(), "INVALID ⇒ empty level list");
-    }
-
-    /// Outside-the-module copy of the V1 types so the test can build a V1
-    /// byte stream without poking at the `legacy_v1` implementation details.
-    mod legacy_v1_probe {
-        use crate::large_table::LargeTableContainer;
-        use crate::wal::position::{LastProcessed, WalPosition};
-        use serde::{Deserialize, Serialize};
-
-        #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-        pub struct SnapshotEntryDataV1Probe {
-            pub position: WalPosition,
-            pub last_processed: LastProcessed,
-        }
-
-        #[derive(Serialize, Deserialize, Debug)]
-        pub struct ControlRegionV1Probe {
-            pub last_position: u64,
-            pub snapshot: LargeTableContainer<SnapshotEntryDataV1Probe>,
-            #[serde(default)]
-            pub keyspace_names: Vec<String>,
-        }
     }
 }
