@@ -1316,22 +1316,6 @@ impl LargeTableEntry {
     pub fn new_unloaded(
         context: KsContext,
         cell: CellId,
-        position: WalPosition,
-        unload_jitter: usize,
-        bloom_filter: Option<BloomFilter>,
-    ) -> Self {
-        Self::new_unloaded_with_levels(
-            context,
-            cell,
-            IndexLevels::single(position),
-            unload_jitter,
-            bloom_filter,
-        )
-    }
-
-    pub fn new_unloaded_with_levels(
-        context: KsContext,
-        cell: CellId,
         levels: IndexLevels,
         unload_jitter: usize,
         bloom_filter: Option<BloomFilter>,
@@ -1399,7 +1383,7 @@ impl LargeTableEntry {
         let mut entry = if levels.is_empty() {
             LargeTableEntry::new_empty(context, cell, unload_jitter)
         } else {
-            LargeTableEntry::new_unloaded_with_levels(
+            LargeTableEntry::new_unloaded(
                 context,
                 cell,
                 levels.clone(),
@@ -2607,7 +2591,7 @@ mod tests {
             let entry = LargeTableEntry::new_unloaded(
                 context.clone(),
                 cell_id.clone(),
-                WalPosition::test_value(42),
+                IndexLevels::single(WalPosition::test_value(42)),
                 0,
                 None,
             );
@@ -2716,7 +2700,7 @@ mod tests {
             let mut entry = LargeTableEntry::new_unloaded(
                 context.clone(),
                 cell_id.clone(),
-                WalPosition::test_value(42),
+                IndexLevels::single(WalPosition::test_value(42)),
                 0,
                 None,
             );
