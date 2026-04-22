@@ -1147,12 +1147,9 @@ impl LargeTable {
         original_index: Arc<IndexTable>,
         new_levels: IndexLevels,
     ) {
-        let row = context.ks_config.mutex_for_cell(cell);
-        let ks_table = self.ks_rows(&context.ks_config);
-        let mut row = ks_table.lock(row, &context.large_table_contention);
-        let entry = self.entry_mut(&mut row, cell);
-        entry.promote_pending();
-        entry.update_flushed_index(original_index, new_levels);
+        self.with_promoted_entry(context, cell, |entry| {
+            entry.update_flushed_index(original_index, new_levels);
+        });
     }
 
     /// Called by the flusher after a `ForceRelocate` flush completes.
@@ -1164,12 +1161,25 @@ impl LargeTable {
         cell: &CellId,
         new_levels: IndexLevels,
     ) {
+        self.with_promoted_entry(context, cell, |entry| {
+            entry.update_relocated_position(new_levels);
+        });
+    }
+
+    /// Locks the row containing `cell`, calls `promote_pending` on the entry,
+    /// then hands it to `f`. Shared by flusher-completion callbacks.
+    fn with_promoted_entry<R>(
+        &self,
+        context: &KsContext,
+        cell: &CellId,
+        f: impl FnOnce(&mut LargeTableEntry) -> R,
+    ) -> R {
         let row = context.ks_config.mutex_for_cell(cell);
         let ks_table = self.ks_rows(&context.ks_config);
         let mut row = ks_table.lock(row, &context.large_table_contention);
         let entry = self.entry_mut(&mut row, cell);
         entry.promote_pending();
-        entry.update_relocated_position(new_levels);
+        f(entry)
     }
 
     /// Pass 1 of the two-pass snapshot flush: iterate all entries and queue async flushes
@@ -1750,11 +1760,7 @@ impl LargeTableEntry {
     /// Unlike `update_flushed_index`, this handles clean entries (Unloaded/Loaded)
     /// since forced relocation re-flushes an already-clean entry to a new position.
     pub fn update_relocated_position(&mut self, new_levels: IndexLevels) {
-        let pending_last_processed = self
-            .pending_last_processed
-            .take()
-            .expect("update_relocated_position called while pending_last_processed is not set");
-        self.last_processed = pending_last_processed;
+        self.commit_pending_last_processed();
         // Update levels. New writes may have arrived making the entry dirty —
         // in that case, just update the on-disk levels. The dirty overlay remains valid.
         // TODO(levels-generic): force-relocate rewrites the sole on-disk blob today;
@@ -1868,6 +1874,20 @@ impl LargeTableEntry {
         Ok(())
     }
 
+    /// Consumes the `pending_last_processed` captured when the async flush
+    /// was requested and commits it to `self.last_processed`. Returns the
+    /// value so callers can reuse it without re-reading `self`. Panics if
+    /// no pending value is set — call only from paths that match a prior
+    /// `pending_last_processed = Some(...)` assignment.
+    fn commit_pending_last_processed(&mut self) -> LastProcessed {
+        let pending = self
+            .pending_last_processed
+            .take()
+            .expect("commit_pending_last_processed called while pending_last_processed is not set");
+        self.last_processed = pending;
+        pending
+    }
+
     fn clear_after_flush(
         &mut self,
         new_levels: IndexLevels,
@@ -1932,11 +1952,6 @@ impl LargeTableEntry {
         original_index: Arc<IndexTable>,
         new_levels: IndexLevels,
     ) {
-        let pending_last_processed = self
-            .pending_last_processed
-            .take()
-            .expect("update_flushed_index called while pending_last_processed is not set");
-
         // For unmerge, we always use the actual last_processed value (not u64::MAX)
         // to ensure we only remove entries that were actually committed
         match self.state {
@@ -1946,8 +1961,8 @@ impl LargeTableEntry {
             LargeTableEntryState::Unloaded => panic!("update_merged_index in Unloaded state"),
             LargeTableEntryState::Loaded => panic!("update_merged_index in Loaded state"),
         }
-        // Now that flush is complete, update last_processed
-        self.last_processed = pending_last_processed;
+        // Now that flush is complete, commit pending_last_processed.
+        let pending_last_processed = self.commit_pending_last_processed();
         if self.data.same_shared(&original_index) {
             self.clear_after_flush(new_levels, pending_last_processed, true);
         } else {
