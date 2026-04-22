@@ -171,6 +171,9 @@ impl IndexTable {
     /// call `clean_self()` afterwards to strip them.
     fn merge_dirty(&mut self, dirty: &Self, promote_to_clean: bool) {
         // todo implement this efficiently taking into account both self and dirty are sorted
+        // self.flat is untouched here, so its dirty contribution to self.dirty_count is
+        // unchanged — we only need to track the delta on self.data inserts.
+        let mut dirty_delta: i64 = 0;
         for (k, v) in dirty.data.iter() {
             // Strict check for concurrent_test and unit tests
             #[cfg(any(debug_assertions, feature = "test_methods"))]
@@ -187,8 +190,14 @@ impl IndexTable {
             } else {
                 *v
             };
-            if self.data.insert(k.clone(), incoming).is_none() {
-                self.key_bytes += k.len();
+            let incoming_dirty = !incoming.is_clean();
+            match self.data.insert(k.clone(), incoming) {
+                Some(prev) if !prev.is_clean() => dirty_delta -= 1,
+                Some(_) => {}
+                None => self.key_bytes += k.len(),
+            }
+            if incoming_dirty {
+                dirty_delta += 1;
             }
         }
         // Also merge flat entries (present when promote_to_flat has been called on dirty).
@@ -205,11 +214,21 @@ impl IndexTable {
                 v
             };
             let len = key.len();
-            if self.data.insert(key, incoming).is_none() {
-                self.key_bytes += len;
+            let incoming_dirty = !incoming.is_clean();
+            match self.data.insert(key, incoming) {
+                Some(prev) if !prev.is_clean() => dirty_delta -= 1,
+                Some(_) => {}
+                None => self.key_bytes += len,
+            }
+            if incoming_dirty {
+                dirty_delta += 1;
             }
         }
-        self.dirty_count = self.count_dirty_slow();
+        if dirty_delta >= 0 {
+            self.dirty_count += dirty_delta as usize;
+        } else {
+            self.dirty_count = self.dirty_count.saturating_sub((-dirty_delta) as usize);
+        }
     }
 
     /// Remove flushed index entries that have offset <= last_processed
@@ -347,7 +366,9 @@ impl IndexTable {
         }
         let old_flat = std::mem::take(&mut self.flat);
         let kept: Vec<(Bytes, IndexWalPosition)> = FlatIter::new(&old_flat, self.key_size)
-            .filter_map(|(k, iwp)| keep(k, iwp).map(|new_iwp| (Bytes::from(k.to_vec()), new_iwp)))
+            .filter_map(|(k, iwp)| {
+                keep(k, iwp).map(|new_iwp| (old_flat.slice_to_bytes(k), new_iwp))
+            })
             .collect();
         self.flat = build_flat_bytes(kept, self.key_size);
     }
@@ -1060,10 +1081,11 @@ impl IndexTable {
             return false;
         }
 
-        // Collect old flat entries.
+        // Collect old flat entries. `slice_to_bytes` avoids per-key heap copies —
+        // each key is a refcount bump on `old_flat`, which outlives `flat_entries`.
         let old_flat = std::mem::take(&mut self.flat);
         let flat_entries: Vec<(Bytes, IndexWalPosition)> = FlatIter::new(&old_flat, self.key_size)
-            .map(|(k, iwp)| (Bytes::from(k.to_vec()), iwp))
+            .map(|(k, iwp)| (old_flat.slice_to_bytes(k), iwp))
             .collect();
 
         // Collect ALL BTreeMap entries sorted by key (BTreeMap is already sorted).
@@ -1071,7 +1093,9 @@ impl IndexTable {
             self.data.iter().map(|(k, v)| (k, *v)).collect();
 
         // Merge-sort: BTreeMap entries override flat entries for the same key.
-        let mut result: Vec<(Bytes, IndexWalPosition)> = Vec::new();
+        // Upper bound on result length is flat + btree (equal keys produce one row).
+        let mut result: Vec<(Bytes, IndexWalPosition)> =
+            Vec::with_capacity(flat_entries.len() + btree_entries.len());
         let mut fi = 0usize;
         let mut bi = 0usize;
         let flat_count = flat_entries.len();

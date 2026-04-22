@@ -525,10 +525,10 @@ impl LargeTable {
         // todo - consider only doing block_in_place for the syscall random reader
         // TODO: handle entries that may be removed by relocation but are still referenced in the index
         let (result, read_type) = runtime::block_in_place(|| {
-            let mut last_read_type = index_readers
-                .first()
-                .map(|r| r.read_type())
-                .unwrap_or_else(|| index_readers.last().unwrap().read_type());
+            // `index_readers` is non-empty (guarded by the `level_positions.is_empty()`
+            // check above), and the loop reassigns `last_read_type` on every iteration
+            // before the early-return branches can fire — so the init is just a seed.
+            let mut last_read_type = index_readers[0].read_type();
             for reader in &index_readers {
                 last_read_type = reader.read_type();
                 match ks
