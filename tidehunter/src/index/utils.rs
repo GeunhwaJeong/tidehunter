@@ -14,63 +14,52 @@ pub enum NextEntryResult {
     SkipDeleted(Bytes),
 }
 
-/// Determines which is the next entry to return when there are two possible sources
-/// (e.g., in-memory and on-disk).
+/// k-way merge of ordered (key, position) candidates from multiple sources,
+/// used by the iterator to walk an LSM level stack (in-memory overlay plus
+/// L0, L1, ...).
 ///
-/// This is used during iteration to correctly merge results from both memory and disk
-/// when handling entries in a DirtyUnloaded state.
+/// Priority ordering is expressed by iteration order: the first source yielded
+/// wins ties on equal keys. Typical call sites pass the in-memory overlay
+/// first, then L0 (freshest) through older levels — so fresher data shadows
+/// staler data, as required by the LSM read semantics.
 ///
-/// The function follows these rules:
-/// - If both sources have no entries, return NotFound
-/// - If only one source has an entry, return it (if valid) or SkipDeleted
-/// - If both sources have entries, compare them based on the direction:
-///   - For forward iteration, pick the smaller key
-///   - For reverse iteration, pick the larger key
-/// - If the keys are equal, prefer the in-memory version
-pub fn take_next_entry(
-    in_memory: Option<(Bytes, WalPosition)>,
-    on_disk: Option<(Bytes, WalPosition)>,
-    direction: Direction,
-) -> NextEntryResult {
-    match (in_memory, on_disk) {
-        (None, None) => NextEntryResult::NotFound,
-
-        (Some((k, v)), None) => {
-            if v.is_valid() {
-                NextEntryResult::Found(k, v)
-            } else {
-                // Need to skip this key and recursively try again
-                NextEntryResult::SkipDeleted(k)
+/// - `NotFound`: every source was `None`.
+/// - `Found(k, v)`: winning candidate has a valid position.
+/// - `SkipDeleted(k)`: winning candidate is a tombstone (`WalPosition::INVALID`).
+///   Callers advance `prev_key` past `k` and retry — the winning source's
+///   tombstone shadows any lower-priority hits at the same key.
+pub fn merge_levels_next_entry<I>(candidates: I, direction: Direction) -> NextEntryResult
+where
+    I: IntoIterator<Item = Option<(Bytes, WalPosition)>>,
+{
+    let mut winner: Option<(Bytes, WalPosition)> = None;
+    for candidate in candidates {
+        let Some((key, pos)) = candidate else {
+            continue;
+        };
+        match &winner {
+            None => winner = Some((key, pos)),
+            Some((existing_key, _)) => {
+                let cmp = key.as_ref().cmp(existing_key.as_ref());
+                let replace = match direction {
+                    Direction::Forward => cmp == Ordering::Less,
+                    Direction::Backward => cmp == Ordering::Greater,
+                };
+                // On equal keys we keep the first (highest-priority) entry —
+                // fresher levels shadow older ones at the same key.
+                if replace {
+                    winner = Some((key, pos));
+                }
             }
         }
-
-        (None, Some((k, v))) => NextEntryResult::Found(k, v),
-
-        (Some((k_mem, v_mem)), Some((k_disk, v_disk))) => {
-            // Compare keys based on direction
-            let compare = k_mem.as_ref().cmp(k_disk.as_ref());
-            let first_is_memory = match direction {
-                Direction::Forward => compare == Ordering::Less,
-                Direction::Backward => compare == Ordering::Greater,
-            };
-
-            if first_is_memory {
-                if v_mem.is_valid() {
-                    NextEntryResult::Found(k_mem, v_mem)
-                } else {
-                    // Skip deleted entry and continue with this key
-                    NextEntryResult::SkipDeleted(k_mem)
-                }
-            } else if compare == Ordering::Equal {
-                // Same key, prefer in-memory version
-                if v_mem.is_valid() {
-                    NextEntryResult::Found(k_mem, v_mem)
-                } else {
-                    // In-memory version is deleted, skip this key
-                    NextEntryResult::SkipDeleted(k_mem)
-                }
+    }
+    match winner {
+        None => NextEntryResult::NotFound,
+        Some((key, pos)) => {
+            if pos.is_valid() {
+                NextEntryResult::Found(key, pos)
             } else {
-                NextEntryResult::Found(k_disk, v_disk)
+                NextEntryResult::SkipDeleted(key)
             }
         }
     }
@@ -80,93 +69,93 @@ pub fn take_next_entry(
 mod tests {
     use super::*;
 
+    fn k(bytes: &[u8]) -> Bytes {
+        Bytes::from(bytes.to_vec())
+    }
+
     #[test]
-    fn test_take_next_entry() {
-        let key1 = Bytes::from(vec![1, 2, 3]);
-        let key2 = Bytes::from(vec![4, 5, 6]);
-        let key3 = Bytes::from(vec![7, 8, 9]);
-
-        let valid_pos = WalPosition::test_value(42);
-        let invalid_pos = WalPosition::INVALID;
-
-        // Case 1: Both None
+    fn merge_all_none() {
         assert_eq!(
-            take_next_entry(None, None, Direction::Forward),
+            merge_levels_next_entry(vec![None, None, None], Direction::Forward),
             NextEntryResult::NotFound
         );
+    }
 
-        // Case 2: Only in_memory has a value (valid)
-        let result = take_next_entry(Some((key1.clone(), valid_pos)), None, Direction::Forward);
-        assert_eq!(result, NextEntryResult::Found(key1.clone(), valid_pos));
+    #[test]
+    fn merge_single_source() {
+        let pos = WalPosition::test_value(5);
+        let result =
+            merge_levels_next_entry(vec![None, Some((k(&[3]), pos)), None], Direction::Forward);
+        assert_eq!(result, NextEntryResult::Found(k(&[3]), pos));
+    }
 
-        // Case 3: Only in_memory has a value (invalid)
-        let result = take_next_entry(Some((key1.clone(), invalid_pos)), None, Direction::Forward);
-        assert_eq!(result, NextEntryResult::SkipDeleted(key1.clone()));
-
-        // Case 4: Only on_disk has a value
-        let result = take_next_entry(None, Some((key2.clone(), valid_pos)), Direction::Forward);
-        assert_eq!(result, NextEntryResult::Found(key2.clone(), valid_pos));
-
-        // Case 5: Both have values, memory key < disk key (Forward direction)
-        // Should pick memory (smaller) key in forward direction
-        let result = take_next_entry(
-            Some((key1.clone(), valid_pos)),
-            Some((key2.clone(), valid_pos)),
+    #[test]
+    fn merge_two_levels_forward_picks_smaller() {
+        let pos = WalPosition::test_value(1);
+        // L0 has 5, L1 has 3 — forward picks the smaller (from L1).
+        let result = merge_levels_next_entry(
+            vec![None, Some((k(&[5]), pos)), Some((k(&[3]), pos))],
             Direction::Forward,
         );
-        assert_eq!(result, NextEntryResult::Found(key1.clone(), valid_pos));
+        assert_eq!(result, NextEntryResult::Found(k(&[3]), pos));
+    }
 
-        // Case 6: Both have values, memory key > disk key (Forward direction)
-        // Should pick disk (smaller) key in forward direction
-        let result = take_next_entry(
-            Some((key2.clone(), valid_pos)),
-            Some((key1.clone(), valid_pos)),
-            Direction::Forward,
-        );
-        assert_eq!(result, NextEntryResult::Found(key1.clone(), valid_pos));
-
-        // Case 7: Both have values, memory key < disk key (Backward direction)
-        // Should pick disk (larger) key in backward direction
-        let result = take_next_entry(
-            Some((key1.clone(), valid_pos)),
-            Some((key2.clone(), valid_pos)),
+    #[test]
+    fn merge_two_levels_backward_picks_larger() {
+        let pos = WalPosition::test_value(1);
+        let result = merge_levels_next_entry(
+            vec![None, Some((k(&[5]), pos)), Some((k(&[3]), pos))],
             Direction::Backward,
         );
-        assert_eq!(result, NextEntryResult::Found(key2.clone(), valid_pos));
+        assert_eq!(result, NextEntryResult::Found(k(&[5]), pos));
+    }
 
-        // Case 8: Both have values, memory key > disk key (Backward direction)
-        // Should pick memory (larger) key in backward direction
-        let result = take_next_entry(
-            Some((key2.clone(), valid_pos)),
-            Some((key1.clone(), valid_pos)),
-            Direction::Backward,
-        );
-        assert_eq!(result, NextEntryResult::Found(key2.clone(), valid_pos));
-
-        // Case 9: Both have values with equal keys, with valid memory value
-        // Should prefer memory version when keys are equal
-        let result = take_next_entry(
-            Some((key3.clone(), valid_pos)),
-            Some((key3.clone(), WalPosition::test_value(43))),
+    #[test]
+    fn merge_equal_keys_highest_priority_wins() {
+        let p0 = WalPosition::test_value(100);
+        let p1 = WalPosition::test_value(200);
+        // In-memory (priority 0) and L0 (priority 1) both have key 3 — in-memory wins.
+        let result = merge_levels_next_entry(
+            vec![Some((k(&[3]), p0)), Some((k(&[3]), p1))],
             Direction::Forward,
         );
-        assert_eq!(result, NextEntryResult::Found(key3.clone(), valid_pos));
+        assert_eq!(result, NextEntryResult::Found(k(&[3]), p0));
+    }
 
-        // Case 10: Both have values with equal keys, with invalid memory value
-        // Should signal to skip the key when memory version is invalid
-        let result = take_next_entry(
-            Some((key3.clone(), invalid_pos)),
-            Some((key3.clone(), valid_pos)),
+    #[test]
+    fn merge_in_memory_tombstone_shadows_disk_hit() {
+        let valid = WalPosition::test_value(42);
+        let tomb = WalPosition::INVALID;
+        // In-memory tombstone on key 3 shadows L0's valid 3.
+        let result = merge_levels_next_entry(
+            vec![Some((k(&[3]), tomb)), Some((k(&[3]), valid))],
             Direction::Forward,
         );
-        assert_eq!(result, NextEntryResult::SkipDeleted(key3.clone()));
+        assert_eq!(result, NextEntryResult::SkipDeleted(k(&[3])));
+    }
 
-        // Case 11: Memory entry is invalid and should be skipped
-        let result = take_next_entry(
-            Some((key1.clone(), invalid_pos)),
-            Some((key2.clone(), valid_pos)),
+    #[test]
+    fn merge_l0_tombstone_shadows_l1_hit() {
+        let valid = WalPosition::test_value(42);
+        let tomb = WalPosition::INVALID;
+        // L0 tombstone on key 3 shadows L1's valid 3 (no in-memory).
+        let result = merge_levels_next_entry(
+            vec![None, Some((k(&[3]), tomb)), Some((k(&[3]), valid))],
             Direction::Forward,
         );
-        assert_eq!(result, NextEntryResult::SkipDeleted(key1.clone()));
+        assert_eq!(result, NextEntryResult::SkipDeleted(k(&[3])));
+    }
+
+    #[test]
+    fn merge_disjoint_keys_tombstone_on_larger() {
+        let valid = WalPosition::test_value(42);
+        let tomb = WalPosition::INVALID;
+        // L0 has a tombstone on key 5; L1 has valid key 3. Forward: pick 3.
+        // L0's tombstone on 5 does not shadow L1's 3.
+        let result = merge_levels_next_entry(
+            vec![None, Some((k(&[5]), tomb)), Some((k(&[3]), valid))],
+            Direction::Forward,
+        );
+        assert_eq!(result, NextEntryResult::Found(k(&[3]), valid));
     }
 }

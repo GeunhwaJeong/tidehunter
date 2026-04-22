@@ -17,6 +17,12 @@ pub struct Config {
     /// The maximum number of dirty keys per LargeTable entry before it's counted as loaded
     /// This can be overwritten for individual key space via KeySpaceConfig::max_dirty_keys
     pub max_dirty_keys: usize,
+    /// Override for the L0 promotion threshold (in keys). When a flush's merged L0
+    /// would exceed this, the flusher promotes L0 into L1 instead of writing a new
+    /// L0. `None` falls back to `max_dirty_keys * 8` (see `KsContext::l0_max_entries`).
+    /// Can be overridden per key space via `KeySpaceConfig::l0_max_entries`.
+    #[serde(default)]
+    pub l0_max_entries: Option<usize>,
     /// How often to take snapshot depending on the number of entries written to the wal
     pub snapshot_written_bytes: u64,
     /// Force unload dirty entry if it's distance from wal tail exceeds given value
@@ -80,6 +86,7 @@ impl Default for Config {
             max_maps: 16, // Max 2 Gb mapped space
             max_index_maps: None,
             max_dirty_keys: 16 * 1024,
+            l0_max_entries: None,
             snapshot_written_bytes: 128 * 1024 * 1024 * 1024,
             snapshot_unload_threshold: 64 * 1024 * 1024 * 1024,
             unload_jitter_pct: 30,
@@ -104,6 +111,7 @@ impl Config {
             max_maps: 16,
             max_index_maps: None,
             max_dirty_keys: 32,
+            l0_max_entries: None,
             snapshot_written_bytes: 128 * 1024 * 1024, // 128 Mb
             snapshot_unload_threshold: 2 * 128 * 1024 * 1024, // 256 Mb
             unload_jitter_pct: 10,

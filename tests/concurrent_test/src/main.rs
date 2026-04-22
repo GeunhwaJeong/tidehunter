@@ -129,6 +129,7 @@ fn main() {
     // Use a custom config with very small values to trigger more frequent flushes and snapshots
     let mut config = Config::small();
     config.max_dirty_keys = 4;
+    config.l0_max_entries = Some(6);
     config.snapshot_unload_threshold = 1024;
     config.snapshot_written_bytes = 4 * 1024 * 1024; // 4 MB — trigger snapshots frequently
     let config = Arc::new(config);

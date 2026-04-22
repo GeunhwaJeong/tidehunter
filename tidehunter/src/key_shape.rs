@@ -55,6 +55,7 @@ pub struct KeySpaceConfig {
     compactor: Option<Arc<Compactor>>,
     disable_unload: bool,
     max_dirty_keys: Option<usize>,
+    l0_max_entries: Option<usize>,
     bloom_filter: Option<BloomFilterParams>,
     value_cache_size: usize,
     index_format: IndexFormatType,
@@ -70,6 +71,7 @@ impl Default for KeySpaceConfig {
             compactor: None,
             disable_unload: false,
             max_dirty_keys: None,
+            l0_max_entries: None,
             bloom_filter: None,
             value_cache_size: 0,
             index_format: IndexFormatType::default(),
@@ -430,6 +432,10 @@ impl KeySpaceDesc {
         self.config.max_dirty_keys
     }
 
+    pub(crate) fn l0_max_entries(&self) -> Option<usize> {
+        self.config.l0_max_entries
+    }
+
     pub(crate) fn unloaded_iterator_enabled(&self) -> bool {
         self.config.unloaded_iterator
     }
@@ -561,6 +567,14 @@ impl KeySpaceConfig {
     // todo this override currently does not work correctly with unload_jitter
     pub fn with_max_dirty_keys(mut self, max_dirty_keys: usize) -> Self {
         self.max_dirty_keys = Some(max_dirty_keys);
+        self
+    }
+
+    /// Overrides the L0 promotion threshold (in keys) for this key space.
+    /// Takes precedence over `Config::l0_max_entries`, which in turn falls
+    /// back to `max_dirty_keys * 8` (see `KsContext::l0_max_entries`).
+    pub fn with_l0_max_entries(mut self, l0_max_entries: usize) -> Self {
+        self.l0_max_entries = Some(l0_max_entries);
         self
     }
 

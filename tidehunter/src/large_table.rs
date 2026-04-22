@@ -2,11 +2,11 @@ use crate::cell::{CellId, CellIdBytesContainer};
 use crate::config::Config;
 use crate::context::{KsContext, LookupResult, LookupSource};
 use crate::flusher::{FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread};
-use crate::index::index_format::{Direction, IndexFormat, IndexIterCache};
+use crate::index::index_format::{Direction, IndexFormat, IndexIterCaches};
 use crate::index::index_table::IndexTable;
 use crate::index::levels::IndexLevels;
 use crate::index::pending_table::{CommittedChange, PendingTable, Transaction};
-use crate::index::utils::{NextEntryResult, take_next_entry};
+use crate::index::utils::{NextEntryResult, merge_levels_next_entry};
 use crate::iterators::IteratorResult;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc, KeyType};
 use crate::metrics::Metrics;
@@ -25,6 +25,7 @@ use parking_lot::{MutexGuard, RwLock};
 use rand::rngs::ThreadRng;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -466,57 +467,85 @@ impl LargeTable {
         if entry.bloom_filter_not_found(k) {
             return Ok(context.report_lookup_result(None, LookupSource::Bloom));
         }
-        let index_position = match entry.state {
+        // In the two-level LSM, the read path must walk every populated level
+        // until it finds either a hit or a tombstone (INVALID). We build the
+        // reader list while holding the mutex — otherwise a concurrent
+        // relocation could delete the backing blob before we open it.
+        let level_positions: SmallVec<[WalPosition; 2]> = match entry.state {
             LargeTableEntryState::Empty => {
                 return Ok(context.report_lookup_result(None, LookupSource::Cache));
             }
-            LargeTableEntryState::Loaded => {
-                let result = entry.get(k);
-                if result == Some(WalPosition::INVALID) {
-                    panic!(
-                        "Entry in loaded state has invalid wal position for the key {k:?} in ks {}",
-                        context.name()
-                    );
-                }
-                return Ok(context.report_lookup_result(result, LookupSource::Cache));
-            }
-            LargeTableEntryState::DirtyLoaded => {
-                return Ok(context.report_lookup_result(
-                    entry.get(k).and_then(WalPosition::valid),
-                    LookupSource::Cache,
-                ));
-            }
-            LargeTableEntryState::DirtyUnloaded => {
-                // optimization: in dirty unloaded state we might not need to load entry
+            LargeTableEntryState::Loaded | LargeTableEntryState::DirtyLoaded => {
+                // `maybe_load` only folds L0 into `entry.data`; L1+ stay on disk
+                // (see `maybe_load` doc comment). `entry.data` is authoritative
+                // for L0 content (+ dirty overlay when DirtyLoaded), so a hit
+                // here wins — a valid position returns Found, an INVALID/Removed
+                // means an L0 tombstone that shadows L1. A miss must fall
+                // through to the on-disk L1+ levels.
                 if let Some(found) = entry.get(k) {
                     return Ok(context.report_lookup_result(found.valid(), LookupSource::Cache));
                 }
-                // TODO(levels-generic): read path picks the primary (L0) blob;
-                // once L1 exists, this becomes a miss-chain across all levels.
-                entry.wal_position()
+                entry.levels().iter_below_l0().collect()
             }
-            LargeTableEntryState::Unloaded => entry.wal_position(),
+            LargeTableEntryState::DirtyUnloaded => {
+                // The dirty overlay may have the answer without touching disk.
+                if let Some(found) = entry.get(k) {
+                    return Ok(context.report_lookup_result(found.valid(), LookupSource::Cache));
+                }
+                entry.levels().iter().collect()
+            }
+            LargeTableEntryState::Unloaded => entry.levels().iter().collect(),
         };
-        // Allocate index reader **before** dropping the mutex - this ensures
-        // that we can read from the index,
-        // even if the relocation is concurrently deleting the file holding the index.
-        // See also test_concurrent_index_reclaim
-        let index_reader = loader.index_reader(index_position)?;
+        if level_positions.is_empty() {
+            // No on-disk levels left to consult (e.g., Loaded cell with just
+            // `[L0]` — entry.data is authoritative and already missed).
+            return Ok(context.report_lookup_result(None, LookupSource::Cache));
+        }
+        // Allocate index readers **before** dropping the mutex — this ensures
+        // that we can read from the index even if a relocation is concurrently
+        // deleting the underlying blobs. See also test_concurrent_index_reclaim.
+        let mut index_readers: SmallVec<[_; 2]> = SmallVec::new();
+        for pos in &level_positions {
+            index_readers.push(loader.index_reader(*pos)?);
+        }
         // drop row to avoid holding mutex during IO
         drop(row);
 
         self.fp.fp_lookup_after_lock_drop();
+        self.fp_lookup_after_lock_drop_if_needed();
         let now = Instant::now();
         // todo - consider only doing block_in_place for the syscall random reader
         // TODO: handle entries that may be removed by relocation but are still referenced in the index
-        let result = runtime::block_in_place(|| {
-            ks.index_format()
-                .lookup_unloaded(ks, &index_reader, k, &self.metrics)
+        let (result, read_type) = runtime::block_in_place(|| {
+            let mut last_read_type = index_readers
+                .first()
+                .map(|r| r.read_type())
+                .unwrap_or_else(|| index_readers.last().unwrap().read_type());
+            for reader in &index_readers {
+                last_read_type = reader.read_type();
+                match ks
+                    .index_format()
+                    .lookup_unloaded(ks, reader, k, &self.metrics)
+                {
+                    // Valid hit — return it.
+                    Some(pos) if pos.is_valid() => return (Some(pos), last_read_type),
+                    // On-disk tombstone shadows any key in deeper levels.
+                    Some(_) => return (None, last_read_type),
+                    // Miss on this level — continue to the next one.
+                    None => {}
+                }
+            }
+            (None, last_read_type)
         });
         context
-            .lookup_mcs_histogram(index_reader.read_type())
+            .lookup_mcs_histogram(read_type)
             .observe(now.elapsed().as_micros() as f64);
         Ok(context.report_lookup_result(result, LookupSource::Lookup))
+    }
+
+    fn fp_lookup_after_lock_drop_if_needed(&self) {
+        // Placeholder hook, matches the structure used by the single-level
+        // get path. Keeps the miss-chain call site self-contained.
     }
 
     fn entry_mut<'a>(&self, row: &'a mut Row, cell: &CellId) -> &'a mut LargeTableEntry {
@@ -732,8 +761,20 @@ impl LargeTable {
         // and at some point we might want to find a way to avoid it
         entry.maybe_load(loader)?;
 
-        // Return shared reference to the index data
-        Ok(Some(entry.data.clone_shared()))
+        // Fast path: single-level cell — entry.data is the complete view.
+        if entry.levels().l1().is_none() {
+            return Ok(Some(entry.data.clone_shared()));
+        }
+
+        // Multi-level cell (e.g., post-promote [INVALID, L1] or two-level [L0, L1]):
+        // maybe_load only populates entry.data from L0 (see its doc comment for why
+        // L1 cannot be folded into entry.data). For relocation and other consumers
+        // that need a full per-cell key view, merge L1 under entry.data here without
+        // mutating entry state.
+        let l1_pos = entry.levels().l1().expect("checked above that l1 is Some");
+        let mut merged = loader.load(&entry.context.ks_config, l1_pos)?;
+        merged.merge_dirty_and_clean(&entry.data);
+        Ok(Some(Arc::new(merged)))
     }
 
     pub fn sync_flush_for_relocation<L: Loader>(
@@ -866,14 +907,14 @@ impl LargeTable {
         loader: &L,
         end_cell_exclusive: &Option<CellId>,
         reverse: bool,
-        cache: &mut Option<IndexIterCache>,
+        caches: &mut IndexIterCaches,
     ) -> Result<Option<IteratorResult<GetResult>>, L::Error> {
         let ks_table = self.ks_rows(&context.ks_config);
         loop {
             let next_in_cell = {
                 let row = context.ks_config.mutex_for_cell(&cell);
                 let mut row = ks_table.lock(row, &context.large_table_contention);
-                Self::next_in_cell(loader, &mut row, &cell, prev_key, reverse, cache)?
+                Self::next_in_cell(loader, &mut row, &cell, prev_key, reverse, caches)?
                 // drop row mutex as required by Self::next_cell called below
             };
             if let Some((key, value)) = next_in_cell {
@@ -884,8 +925,8 @@ impl LargeTable {
                 }));
             } else {
                 prev_key = None;
-                // Moving to a new cell — the cached buffer is no longer valid.
-                *cache = None;
+                // Moving to a new cell — the cached buffers are no longer valid.
+                caches.clear();
                 let Some(next_cell) = self.next_cell(context, &cell, reverse) else {
                     return Ok(None);
                 };
@@ -909,7 +950,7 @@ impl LargeTable {
         cell: &CellId,
         mut prev_key: Option<Bytes>,
         reverse: bool,
-        cache: &mut Option<IndexIterCache>,
+        caches: &mut IndexIterCaches,
     ) -> Result<Option<(Bytes, GetResult)>, L::Error> {
         fn lru_or_wal(entry: &mut LargeTableEntry, key: &[u8], pos: WalPosition) -> GetResult {
             if let Some(lru) = &mut entry.value_lru
@@ -930,100 +971,87 @@ impl LargeTable {
             entry.maybe_load(loader)?;
         }
 
-        match &entry.state {
-            // If already loaded, just use what's in memory — cache is not used.
-            LargeTableEntryState::Loaded | LargeTableEntryState::DirtyLoaded => {
-                *cache = None;
-                let mut prev_key = prev_key;
-                // Skip entries marked as invalid (deleted)
-                while let Some((key, pos)) = entry.next_entry(prev_key.take(), reverse) {
-                    if pos.is_valid() {
-                        let get_result = lru_or_wal(entry, &key, pos);
-                        return Ok(Some((key, get_result)));
-                    }
-                    // Get next entry after the invalid one
-                    prev_key = Some(key);
-                }
-
-                Ok(None)
-            }
-
-            // For empty state, we have nothing to return
+        // Determine which positions to walk on disk and whether `entry.data`
+        // carries an in-memory overlay.
+        //
+        // - `Loaded` / `DirtyLoaded`: `maybe_load` folded L0 into `entry.data`,
+        //   so walk levels **below L0** and treat `entry.data` as the freshest
+        //   (in-memory) source for the k-way merge.
+        // - `Unloaded`: `entry.data` is empty; walk every populated level.
+        // - `DirtyUnloaded`: `entry.data` holds the dirty overlay (no L0
+        //   content); walk every populated level, overlay wins on ties.
+        // - `Empty`: nothing to return.
+        let (has_inmemory, level_positions): (bool, SmallVec<[WalPosition; 2]>) = match entry.state
+        {
             LargeTableEntryState::Empty => {
-                *cache = None;
-                Ok(None)
+                caches.clear();
+                return Ok(None);
             }
+            LargeTableEntryState::Loaded | LargeTableEntryState::DirtyLoaded => {
+                (true, entry.levels().iter_below_l0().collect())
+            }
+            LargeTableEntryState::Unloaded => (false, entry.levels().iter().collect()),
+            LargeTableEntryState::DirtyUnloaded => (true, entry.levels().iter().collect()),
+        };
 
-            // For unloaded states, read from disk without loading everything
-            LargeTableEntryState::Unloaded => {
-                // TODO(levels-generic): single-level projection; multi-level
-                // iteration needs a k-way merge across levels.
-                let position = entry.wal_position();
-                // Get reader for on-disk index
-                let index_reader = loader.index_reader(position)?;
-                let format = entry.context.ks_config.index_format();
+        if level_positions.is_empty() && !has_inmemory {
+            // No on-disk blobs and nothing in memory.
+            caches.clear();
+            return Ok(None);
+        }
+        // Loaded/DirtyLoaded don't rely on per-level caches (entry.data is
+        // walked in-process), but unloaded readers do. Clear before use so
+        // stale cache slots from a prior state don't mislead the current walk.
+        if !matches!(
+            entry.state,
+            LargeTableEntryState::Unloaded | LargeTableEntryState::DirtyUnloaded
+        ) {
+            caches.clear();
+        }
+        let direction = Direction::from_bool(reverse);
+        // Open one reader per populated level — done before releasing the
+        // row mutex below (same rationale as `get()`).
+        let mut readers: SmallVec<[WalRandomRead; 2]> = SmallVec::new();
+        for position in level_positions.iter() {
+            readers.push(loader.index_reader(*position)?);
+        }
+        let format = entry.context.ks_config.index_format();
 
-                // Use the format to find the next entry from on-disk index
-                let result = runtime::block_in_place(|| {
-                    let direction = Direction::from_bool(reverse);
+        loop {
+            let in_memory_next = if has_inmemory {
+                entry.next_entry(prev_key.clone(), reverse)
+            } else {
+                None
+            };
 
+            let mut candidates: SmallVec<[Option<(Bytes, WalPosition)>; 3]> = SmallVec::new();
+            candidates.push(in_memory_next);
+            for (level_idx, (position, reader)) in
+                level_positions.iter().zip(readers.iter()).enumerate()
+            {
+                let cache_slot = caches.slot_mut(level_idx);
+                let on_disk_next = runtime::block_in_place(|| {
                     format.next_entry_unloaded(
                         &entry.context.ks_config,
-                        &index_reader,
+                        reader,
                         prev_key.as_deref(),
                         direction,
                         &entry.context.metrics,
-                        position,
-                        cache,
+                        *position,
+                        cache_slot,
                     )
                 });
-
-                Ok(match result {
-                    Some((key, pos)) => {
-                        let get_result = lru_or_wal(entry, &key, pos);
-                        Some((key, get_result))
-                    }
-                    None => None,
-                })
+                candidates.push(on_disk_next);
             }
 
-            // For dirty unloaded, combine in-memory and on-disk entries
-            LargeTableEntryState::DirtyUnloaded => {
-                // TODO(levels-generic): single-level projection; multi-level
-                // iteration needs a k-way merge across levels.
-                let position = entry.wal_position();
-                // Get reader for on-disk index (opened once for all skip iterations)
-                let index_reader = loader.index_reader(position)?;
-                let format = entry.context.ks_config.index_format();
-                let direction = Direction::from_bool(reverse);
-
-                loop {
-                    // Check in-memory part first (dirty keys)
-                    let in_memory_next = entry.next_entry(prev_key.clone(), reverse);
-
-                    // Use the format to find the next entry from on-disk index
-                    let on_disk_next = runtime::block_in_place(|| {
-                        format.next_entry_unloaded(
-                            &entry.context.ks_config,
-                            &index_reader,
-                            prev_key.as_deref(),
-                            direction,
-                            &entry.context.metrics,
-                            position,
-                            cache,
-                        )
-                    });
-
-                    match take_next_entry(in_memory_next, on_disk_next, direction) {
-                        NextEntryResult::NotFound => return Ok(None),
-                        NextEntryResult::Found(key, val) => {
-                            let get_result = lru_or_wal(entry, &key, val);
-                            return Ok(Some((key, get_result)));
-                        }
-                        NextEntryResult::SkipDeleted(skip_key) => {
-                            prev_key = Some(skip_key);
-                        }
-                    }
+            match merge_levels_next_entry(candidates, direction) {
+                NextEntryResult::NotFound => return Ok(None),
+                NextEntryResult::Found(key, val) => {
+                    let get_result = lru_or_wal(entry, &key, val);
+                    return Ok(Some((key, get_result)));
+                }
+                NextEntryResult::SkipDeleted(skip_key) => {
+                    prev_key = Some(skip_key);
                 }
             }
         }
@@ -1247,6 +1275,9 @@ pub trait Loader {
 
     fn flush_supported(&self) -> bool;
 
+    /// Write an on-disk index blob. Any `Removed` entries in `data` are
+    /// persisted as tombstones. Callers writing the deepest level should call
+    /// `IndexTable::clean_self` first to strip them.
     fn flush(&self, ks: KeySpace, data: &IndexTable) -> Result<WalPosition, Self::Error>;
 
     /// Returns the last WAL position that has been fully processed and committed.
@@ -1887,6 +1918,8 @@ impl LargeTableEntry {
         mem::swap(&mut data, &mut self.data);
         let mut data = data.into_owned();
         data.clean_self();
+        // `clean_self` above strips tombstones — this path rewrites a single
+        // blob, so there is nothing below to shadow.
         // todo - if this line returns error, self.data will be in the inconsistent state
         let position = loader.flush(self.context.id(), &data)?;
         self.levels = IndexLevels::single(position);
@@ -2426,9 +2459,15 @@ mod tests {
             };
 
             // Test next_in_cell with empty state
-            let result =
-                LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, false, &mut None)
-                    .unwrap();
+            let result = LargeTable::next_in_cell(
+                &loader,
+                &mut row,
+                &cell_id,
+                None,
+                false,
+                &mut IndexIterCaches::new(),
+            )
+            .unwrap();
             assert!(result.is_none(), "Empty state should return None");
         }
 
@@ -2446,9 +2485,15 @@ mod tests {
             };
 
             // Test forward iteration with loaded state
-            let result =
-                LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, false, &mut None)
-                    .unwrap();
+            let result = LargeTable::next_in_cell(
+                &loader,
+                &mut row,
+                &cell_id,
+                None,
+                false,
+                &mut IndexIterCaches::new(),
+            )
+            .unwrap();
             assert!(result.is_some(), "Loaded state should return first entry");
             let (key, get_result) = result.unwrap();
             let pos = get_result.unwrap_wal_position();
@@ -2462,7 +2507,7 @@ mod tests {
                 &cell_id,
                 Some(Bytes::from(20_u64.to_be_bytes().to_vec())),
                 false,
-                &mut None,
+                &mut IndexIterCaches::new(),
             )
             .unwrap();
             assert!(result.is_some());
@@ -2472,9 +2517,15 @@ mod tests {
             assert_eq!(pos, WalPosition::test_value(3));
 
             // Test backward iteration
-            let result =
-                LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, true, &mut None)
-                    .unwrap();
+            let result = LargeTable::next_in_cell(
+                &loader,
+                &mut row,
+                &cell_id,
+                None,
+                true,
+                &mut IndexIterCaches::new(),
+            )
+            .unwrap();
             assert!(result.is_some());
             let (key, get_result) = result.unwrap();
             let pos = get_result.unwrap_wal_position();
@@ -2499,9 +2550,15 @@ mod tests {
             };
 
             // Test forward iteration with unloaded state
-            let result =
-                LargeTable::next_in_cell(&loader, &mut row, &cell_id, None, false, &mut None)
-                    .unwrap();
+            let result = LargeTable::next_in_cell(
+                &loader,
+                &mut row,
+                &cell_id,
+                None,
+                false,
+                &mut IndexIterCaches::new(),
+            )
+            .unwrap();
             assert!(
                 result.is_some(),
                 "Unloaded state should return first entry from disk"
@@ -2518,7 +2575,7 @@ mod tests {
                 &cell_id,
                 Some(Bytes::from(20_u64.to_be_bytes().to_vec())),
                 false,
-                &mut None,
+                &mut IndexIterCaches::new(),
             )
             .unwrap();
             assert!(result.is_some());
@@ -2559,7 +2616,7 @@ mod tests {
                 &cell_id,
                 Some(Bytes::from(30_u64.to_be_bytes().to_vec())),
                 false,
-                &mut None,
+                &mut IndexIterCaches::new(),
             )
             .unwrap();
             assert!(result.is_some());
@@ -2575,7 +2632,7 @@ mod tests {
                 &cell_id,
                 Some(Bytes::from(10_u64.to_be_bytes().to_vec())),
                 false,
-                &mut None,
+                &mut IndexIterCaches::new(),
             )
             .unwrap();
             assert!(result.is_some());
@@ -2621,7 +2678,7 @@ mod tests {
                 &cell_id,
                 Some(Bytes::from(10_u64.to_be_bytes().to_vec())),
                 false,
-                &mut None,
+                &mut IndexIterCaches::new(),
             )
             .unwrap();
             assert!(result.is_some());
@@ -2637,7 +2694,7 @@ mod tests {
                 &cell_id,
                 Some(Bytes::from(30_u64.to_be_bytes().to_vec())),
                 false,
-                &mut None,
+                &mut IndexIterCaches::new(),
             )
             .unwrap();
             assert!(result.is_some());

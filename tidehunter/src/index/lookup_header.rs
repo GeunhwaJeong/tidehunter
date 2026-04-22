@@ -315,8 +315,12 @@ impl IndexFormat for LookupHeaderIndex {
         //
         // Use a BTreeMap so only non-empty micro-cells allocate, and iteration
         // order matches the 0..HEADER_ELEMENTS micro-cell sequence.
+        //
+        // `iter_with_tombstones` yields tombstones as `INVALID`, which
+        // `append_flat_varlen_section` persists verbatim. Callers that want
+        // tombstones stripped should call `IndexTable::clean_self` first.
         let mut mc_entries: BTreeMap<usize, Vec<(Bytes, WalPosition)>> = BTreeMap::new();
-        for (key, pos) in table.iter() {
+        for (key, pos) in table.iter_with_tombstones() {
             mc_entries
                 .entry(Self::key_micro_cell(ks, &key))
                 .or_default()

@@ -108,6 +108,18 @@ impl IndexLevels {
         self.positions.iter().copied().filter(|p| p.is_valid())
     }
 
+    /// Iterates **populated** levels below L0 (slot index ≥ 1), skipping
+    /// empty interior slots. Used on read paths where L0 content has already
+    /// been folded into an in-memory view (e.g., after `maybe_load`) and the
+    /// caller needs to consult remaining on-disk levels.
+    pub fn iter_below_l0(&self) -> impl Iterator<Item = WalPosition> + '_ {
+        self.positions
+            .iter()
+            .copied()
+            .skip(1)
+            .filter(|p| p.is_valid())
+    }
+
     /// Consumes the level list and yields populated positions.
     pub fn into_iter_owned(self) -> impl Iterator<Item = WalPosition> {
         self.positions.into_iter().filter(|p| p.is_valid())

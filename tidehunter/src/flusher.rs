@@ -211,11 +211,14 @@ impl IndexFlusherThread {
                 let label = if *loaded { "flush" } else { "merge_flush" };
                 ctx.metrics.unload.with_label_values(&[label]).inc();
                 let merged = if *loaded {
-                    // `dirty` already reflects L0+overlay; clean and reuse.
+                    // `dirty` already reflects L0+overlay. Clone so we can
+                    // mutate (compact, strip tombstones, etc.) without
+                    // touching the shared in-memory table. Tombstone handling
+                    // is deferred to the per-level branch below: if this
+                    // flush produces the deepest blob we will `clean_self`
+                    // there; otherwise tombstones must survive to shadow L1.
                     // todo - no need to make copy if there is no compactor
-                    let mut copy = IndexTable::clone(dirty);
-                    copy.clean_self();
-                    copy
+                    IndexTable::clone(dirty)
                 } else {
                     let mut base = match current_levels.l0() {
                         Some(pos) => loader
@@ -246,6 +249,25 @@ impl IndexFlusherThread {
             }
         };
 
+        // `RelocationUpdates::apply` uses compare-and-set semantics — it can
+        // only rewrite positions for keys already in `merged_l0`. Keys that
+        // live only in L1 (the common case for post-promote `[INVALID, L1]`
+        // cells) would be silently dropped. Pre-load L1 into `merged_l0` so
+        // apply sees the full key set. The subsequent promote branch still
+        // re-loads L1 from disk; the duplication is acceptable on the
+        // relocation path — correctness first, optimize later.
+        if relocation_updates.is_some()
+            && let Some(l1_pos) = existing_l1
+        {
+            let l1_loaded = loader
+                .load(&ctx.ks_config, l1_pos)
+                .expect("Failed to load L1 index for relocation update");
+            let mut combined = l1_loaded;
+            // `merged_l0` is the fresher overlay (L0 + dirty) — it wins on
+            // overlapping keys, so treat it as the "dirty" side.
+            combined.merge_dirty_and_clean(&merged_l0);
+            merged_l0 = combined;
+        }
         if let Some(relocation_updates) = relocation_updates {
             relocation_updates.apply(&mut merged_l0);
         }
@@ -265,16 +287,12 @@ impl IndexFlusherThread {
         // Decide: write as a new L0 on top of the existing L1, or promote by
         // merging L0 into L1. `ForceRelocate` keeps single-level semantics.
         //
-        // TODO(two-level): set `PROMOTE_ENABLED` to true once
-        // `large_table::get` / `next_in_cell` walk `entry.levels()`
-        // (miss-chain on get, k-way merge for iteration). Today the read
-        // path still only consults `levels.latest()`, so producing
-        // `[L0, L1]` states would silently lose keys that live in L1. See
-        // docs/two_level_lsm_design.md §7.
-        const PROMOTE_ENABLED: bool = false;
+        // The read path walks `entry.levels()` — `get()` does a miss-chain
+        // across levels and `next_in_cell` does a k-way merge — so
+        // producing `[L0, L1]` is safe. See docs/two_level_lsm_design.md §7.
         let is_relocation = matches!(&command.flush_kind, FlushKind::ForceRelocate(_));
-        let _l0_threshold = ctx.l0_max_entries();
-        let over_threshold = PROMOTE_ENABLED && !is_relocation && merged_l0.len() > _l0_threshold;
+        let l0_threshold = ctx.l0_max_entries();
+        let over_threshold = !is_relocation && merged_l0.len() > l0_threshold;
 
         let new_levels = if over_threshold {
             // Promote: merge the freshly-built L0 with the existing L1 (if
@@ -288,6 +306,9 @@ impl IndexFlusherThread {
             };
             new_l1.merge_dirty_and_clean(&merged_l0);
             Self::run_compactor(ctx, &mut new_l1);
+            // L1 is the deepest level — nothing below to shadow, so drop
+            // tombstones (and the keys they shadow) before writing.
+            new_l1.clean_self();
             let new_l1_pos = loader
                 .flush(command.ks, &new_l1)
                 .expect("Failed to flush index");
@@ -302,6 +323,11 @@ impl IndexFlusherThread {
             IndexLevels::promoted(new_l1_pos)
         } else {
             Self::run_compactor(ctx, &mut merged_l0);
+            // If no L1 exists below, this L0 is the deepest level — strip
+            // tombstones. Otherwise leave them in so they shadow L1.
+            if existing_l1.is_none() {
+                merged_l0.clean_self();
+            }
             let new_l0_pos = loader
                 .flush(command.ks, &merged_l0)
                 .expect("Failed to flush index");

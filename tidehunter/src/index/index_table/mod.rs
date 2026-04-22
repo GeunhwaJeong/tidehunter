@@ -147,6 +147,13 @@ impl IndexTable {
     }
 
     /// Merges dirty IndexTable into a loaded IndexTable, producing **clean** index table
+    ///
+    /// Tombstones from `dirty` are preserved in the output: they replace any
+    /// matching entry in `self` and are inserted standalone when no matching
+    /// entry exists. This is required by the two-level LSM — a tombstone in
+    /// the new L0 must survive to shadow a live entry for the same key in L1
+    /// below. Callers producing the deepest level (no further level below)
+    /// should call `clean_self()` after this to strip tombstones.
     pub fn merge_dirty_and_clean(&mut self, dirty: &Self) {
         // todo implement this efficiently taking into account both self and dirty are sorted
         for (k, v) in dirty.data.iter() {
@@ -159,18 +166,12 @@ impl IndexTable {
                 // older entry in a dirty set.
                 panic!("found.offset {} > v.offset {}", found.offset, v.offset);
             }
-            if v.is_removed() {
-                if self.flat.is_empty() {
-                    if self.data.remove(k).is_some() {
-                        self.key_bytes -= k.len();
-                    }
-                } else {
-                    // Keep tombstone in BTreeMap to shadow any existing flat entry for this key.
-                    if self.data.insert(k.clone(), *v).is_none() {
-                        self.key_bytes += k.len();
-                    }
-                }
-            } else if self.data.insert(k.clone(), v.as_clean_modified()).is_none() {
+            let incoming = if v.is_removed() {
+                *v
+            } else {
+                v.as_clean_modified()
+            };
+            if self.data.insert(k.clone(), incoming).is_none() {
                 self.key_bytes += k.len();
             }
         }
@@ -182,22 +183,14 @@ impl IndexTable {
             }
             // Zero-copy: k is a subslice of dirty.flat, so slice_ref avoids a heap allocation.
             let key = dirty.flat.slice_to_bytes(k);
-            if v.is_removed() {
-                if self.flat.is_empty() {
-                    if self.data.remove(&key).is_some() {
-                        self.key_bytes -= key.len();
-                    }
-                } else {
-                    let len = key.len();
-                    if self.data.insert(key, v).is_none() {
-                        self.key_bytes += len;
-                    }
-                }
+            let incoming = if v.is_removed() {
+                v
             } else {
-                let len = key.len();
-                if self.data.insert(key, v.as_clean_modified()).is_none() {
-                    self.key_bytes += len;
-                }
+                v.as_clean_modified()
+            };
+            let len = key.len();
+            if self.data.insert(key, incoming).is_none() {
+                self.key_bytes += len;
             }
         }
         self.dirty_count = self.count_dirty_slow();
@@ -477,20 +470,44 @@ impl IndexTable {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Bytes, WalPosition)> + '_ {
+        self.iter_inner(false)
+    }
+
+    /// Same as `iter()` but yields tombstones as `(key, WalPosition::INVALID)`
+    /// instead of skipping them. Used by serializers that want to persist
+    /// tombstones on disk (two-level LSM L0 over L1).
+    pub fn iter_with_tombstones(&self) -> impl Iterator<Item = (Bytes, WalPosition)> + '_ {
+        self.iter_inner(true)
+    }
+
+    fn iter_inner(
+        &self,
+        include_tombstones: bool,
+    ) -> impl Iterator<Item = (Bytes, WalPosition)> + '_ {
         // Both sources are sorted and disjoint (flat excludes keys present in data).
         // Merge in O(N+M) rather than collecting and sorting.
         let mut flat_it = FlatIter::new(&self.flat, self.key_size)
             .filter(|(k, _)| !self.data.contains_key(*k))
-            .filter_map(|(k, iwp)| {
-                iwp.into_wal_position()
-                    .valid()
-                    .map(|pos| (Bytes::from(k.to_vec()), pos))
+            .filter_map(move |(k, iwp)| {
+                let pos = iwp.into_wal_position();
+                if include_tombstones || pos.is_valid() {
+                    Some((Bytes::from(k.to_vec()), pos))
+                } else {
+                    None
+                }
             })
             .peekable();
         let mut btree_it = self
             .data
             .iter()
-            .filter_map(|(k, v)| v.into_wal_position().valid().map(|pos| (k.clone(), pos)))
+            .filter_map(move |(k, v)| {
+                let pos = v.into_wal_position();
+                if include_tombstones || pos.is_valid() {
+                    Some((k.clone(), pos))
+                } else {
+                    None
+                }
+            })
             .peekable();
 
         let mut result = Vec::with_capacity(self.flat_len() + self.data.len());
@@ -546,7 +563,11 @@ impl IndexTable {
     }
 
     /// Writes key-value pairs from IndexTable to a BytesMut buffer.
-    /// Returns the populated buffer.
+    ///
+    /// Removed entries are persisted with `WalPosition::INVALID` as the
+    /// on-disk payload; `deserialize_index_entries` decodes them back into
+    /// `Removed`. Callers that want to strip tombstones (e.g. writing the
+    /// deepest LSM level) should call `clean_self()` on the table first.
     pub fn serialize_index_entries(&self, ks: &KeySpaceDesc, out: &mut BytesMut) {
         self.serialize_index_entries_with_visitor(ks, out, &mut ());
     }
@@ -562,16 +583,17 @@ impl IndexTable {
         if self.flat.is_empty() {
             // Fast path: only BTreeMap entries.
             for (key, value) in self.data.iter() {
-                if value.is_removed() {
-                    continue;
-                }
-                self.write_key_val(ks, out, visitor, key, value.into_update_position());
+                let pos = if value.is_removed() {
+                    WalPosition::INVALID
+                } else {
+                    value.into_update_position()
+                };
+                self.write_key_val(ks, out, visitor, key, pos);
             }
             return;
         }
 
         // Merge-sort flat and BTreeMap entries; BTreeMap overrides flat for the same key.
-        // Removed entries from either source are skipped (tombstones are not written on disk).
         let flat = &self.flat[..];
 
         // Keep a single stateful FlatIter alive for O(N) sequential traversal.
@@ -589,38 +611,35 @@ impl IndexTable {
                 (Some((fk, _)), Some((bk, _))) => fk.as_slice().cmp(bk.as_ref()),
             };
 
-            match cmp {
+            let (key, iwp, advance_flat, advance_btree) = match cmp {
                 Ordering::Less => {
-                    // Flat key is smaller (or btree is empty): output flat entry if not Removed.
                     let (fk, fiwp) = cur_flat.take().unwrap();
-                    if !fiwp.is_removed() {
-                        self.write_key_val(
-                            ks,
-                            out,
-                            visitor,
-                            fk.as_slice(),
-                            fiwp.into_update_position(),
-                        );
-                    }
-                    cur_flat = flat_iter.next().map(|(k, iwp)| (k.to_vec(), iwp));
+                    (fk, fiwp, true, false)
                 }
                 Ordering::Equal => {
                     // Same key: BTreeMap overrides flat; advance both.
                     cur_flat = flat_iter.next().map(|(k, iwp)| (k.to_vec(), iwp));
                     let (bk, bv) = cur_btree.take().unwrap();
-                    cur_btree = btree_it.next();
-                    if !bv.is_removed() {
-                        self.write_key_val(ks, out, visitor, bk, bv.into_update_position());
-                    }
+                    (bk.to_vec(), *bv, false, true)
                 }
                 Ordering::Greater => {
-                    // BTreeMap key is smaller (or flat is empty): output btree entry if not Removed.
                     let (bk, bv) = cur_btree.take().unwrap();
-                    cur_btree = btree_it.next();
-                    if !bv.is_removed() {
-                        self.write_key_val(ks, out, visitor, bk, bv.into_update_position());
-                    }
+                    (bk.to_vec(), *bv, false, true)
                 }
+            };
+
+            let pos = if iwp.is_removed() {
+                WalPosition::INVALID
+            } else {
+                iwp.into_update_position()
+            };
+            self.write_key_val(ks, out, visitor, &key, pos);
+
+            if advance_flat {
+                cur_flat = flat_iter.next().map(|(k, iwp)| (k.to_vec(), iwp));
+            }
+            if advance_btree {
+                cur_btree = btree_it.next();
             }
         }
     }
@@ -702,7 +721,8 @@ impl IndexTable {
     }
 
     /// Append `(key, WalPosition)` pairs as a variable-length flat section into `out`.
-    /// All entries are stored as clean (the on-disk index never persists tombstones).
+    /// `WalPosition::INVALID` entries are written as tombstones (when the caller
+    /// wants to preserve them); otherwise all entries are stored as clean.
     /// Writes directly into the caller's buffer, avoiding a separate allocation.
     pub(super) fn append_flat_varlen_section(
         entries: Vec<(Bytes, WalPosition)>,
@@ -710,14 +730,14 @@ impl IndexTable {
     ) {
         let iwp_entries: Vec<(Bytes, IndexWalPosition)> = entries
             .into_iter()
-            .map(|(k, pos)| (k, IndexWalPosition::new_clean(pos)))
+            .map(|(k, pos)| (k, IndexWalPosition::from_disk(pos)))
             .collect();
         append_flat_varlen(&iwp_entries, out);
     }
 
-    /// Builds an IndexTable from an iterator of clean (key, WalPosition) pairs.
-    /// All entries are marked as clean. Used when deserializing from the on-disk
-    /// variable-length key format where tombstones are never persisted.
+    /// Builds an IndexTable from an iterator of (key, WalPosition) pairs loaded
+    /// from disk. A position of `WalPosition::INVALID` indicates a persisted
+    /// tombstone; all other positions are marked clean.
     #[doc(hidden)] // Used by lookup_header.rs for varlen index deserialization
     pub(crate) fn from_clean_entries(
         entries: impl IntoIterator<Item = (Bytes, WalPosition)>,
@@ -726,7 +746,7 @@ impl IndexTable {
         let mut key_bytes = 0usize;
         for (k, v) in entries {
             key_bytes += k.len();
-            data.insert(k, IndexWalPosition::new_clean(v));
+            data.insert(k, IndexWalPosition::from_disk(v));
         }
         IndexTable {
             data,
@@ -742,6 +762,11 @@ impl IndexTable {
     /// - ks: KeySpaceDesc to determine element sizes
     /// - b: Source bytes
     ///   Returns the deserialized IndexTable
+    ///
+    /// Entries whose on-disk position is `WalPosition::INVALID` are decoded as
+    /// Removed tombstones (see `serialize_index_entries` with
+    /// `preserve_tombstones = true`). The two-level LSM needs on-disk
+    /// tombstones in L0 to shadow keys still present in L1.
     pub fn deserialize_index_entries(ks: &KeySpaceDesc, bytes: Bytes) -> Self {
         let mut bytes = SliceBuf::new(bytes);
         let mut data = BTreeMap::new();
@@ -755,10 +780,8 @@ impl IndexTable {
             };
             let value = WalPosition::read_from_buf(&mut bytes);
             key_bytes += key.len();
-            if data
-                .insert(key, IndexWalPosition::new_clean(value))
-                .is_some()
-            {
+            let iwp = IndexWalPosition::from_disk(value);
+            if data.insert(key, iwp).is_some() {
                 panic!("Duplicate keys detected in index");
             }
         }
@@ -1133,6 +1156,23 @@ impl IndexWalPosition {
             offset: w.offset(),
             len: w.frame_len_u32(),
             kind: IndexEntryKind::Removed,
+        }
+    }
+
+    /// Constructs an IndexWalPosition from a WAL position read off disk.
+    /// `WalPosition::INVALID` is the on-disk marker for a tombstone; any other
+    /// position is treated as a clean entry. The offset/len of a tombstone
+    /// decoded this way is `u64::MAX`/`u32::MAX` — preserving the sentinel so
+    /// `into_wal_position()` reports INVALID on subsequent reads.
+    fn from_disk(w: WalPosition) -> Self {
+        if w == WalPosition::INVALID {
+            Self {
+                offset: w.offset(),
+                len: w.frame_len_u32(),
+                kind: IndexEntryKind::Removed,
+            }
+        } else {
+            Self::new_clean(w)
         }
     }
 
@@ -1887,6 +1927,60 @@ mod tests {
         assert_eq!(self_table.get(&[1]), Some(WalPosition::test_value(10)));
         assert_eq!(self_table.get(&[2]), Some(WalPosition::test_value(25)));
         assert_eq!(self_table.get(&[3]), Some(WalPosition::test_value(35)));
+    }
+
+    #[test]
+    fn test_merge_dirty_and_clean_preserves_tombstones() {
+        // Regression for two-level LSM: tombstones in `dirty` must survive
+        // into the merged output so they shadow deeper-level entries in the
+        // new L0. Before the fix, tombstones were dropped whenever
+        // `self.flat.is_empty()` — which is always the case for tables loaded
+        // from disk via `deserialize_index_entries`, causing phantom keys to
+        // resurrect from L1 under aggressive promotion.
+
+        // self: loaded-from-disk L0 shape (entries in `data`, flat empty).
+        let mut self_table = IndexTable::default();
+        self_table.insert(vec![1].into(), WalPosition::test_value(10));
+        self_table.insert(vec![2].into(), WalPosition::test_value(20));
+        self_table
+            .data
+            .values_mut()
+            .for_each(|v| *v = v.as_clean_modified());
+        assert!(self_table.flat.is_empty());
+
+        // dirty overlay: tombstone for [2], tombstone for [9] (no matching
+        // entry in self — still must survive to shadow any deeper level).
+        let mut dirty = IndexTable::default();
+        dirty.remove(vec![2].into(), WalPosition::test_value(25));
+        dirty.remove(vec![9].into(), WalPosition::test_value(35));
+
+        self_table.merge_dirty_and_clean(&dirty);
+
+        // Live entry untouched.
+        assert_eq!(self_table.get(&[1]), Some(WalPosition::test_value(10)));
+        // Tombstone preserved in-place of the live entry — get() yields INVALID.
+        assert_eq!(self_table.get(&[2]), Some(WalPosition::INVALID));
+        assert!(
+            self_table
+                .data
+                .get(&Bytes::from(vec![2]))
+                .unwrap()
+                .is_removed()
+        );
+        // Standalone tombstone preserved (would shadow a deeper-level entry).
+        assert_eq!(self_table.get(&[9]), Some(WalPosition::INVALID));
+        assert!(
+            self_table
+                .data
+                .get(&Bytes::from(vec![9]))
+                .unwrap()
+                .is_removed()
+        );
+
+        // clean_self() then strips tombstones — the deepest-level contract.
+        self_table.clean_self();
+        assert!(!self_table.data.contains_key(&Bytes::from(vec![2])));
+        assert!(!self_table.data.contains_key(&Bytes::from(vec![9])));
     }
 
     #[test]

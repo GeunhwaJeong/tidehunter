@@ -3,6 +3,7 @@ use std::ops::Range;
 
 use minibytes::Bytes;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use super::lookup_header::LookupHeaderIndex;
 use super::uniform_lookup::UniformLookupIndex;
@@ -50,12 +51,48 @@ impl IndexIterCache {
     }
 }
 
+/// Per-level iterator caches — one `IndexIterCache` slot per LSM level in a
+/// cell. The k-way merge in `LargeTable::next_in_cell` walks multiple on-disk
+/// blobs (L0, L1, ...) and each needs its own cache slot to avoid thrashing.
+///
+/// The inline SmallVec capacity of 2 covers the common case (pre- and
+/// post-promote — L0 only, or L0+L1).
+#[derive(Default)]
+pub struct IndexIterCaches {
+    slots: SmallVec<[Option<IndexIterCache>; 2]>,
+}
+
+impl IndexIterCaches {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drops all cached buffers. Called when the iterator moves to a new cell
+    /// or changes bounds/direction.
+    pub fn clear(&mut self) {
+        self.slots.clear();
+    }
+
+    /// Returns a mutable reference to the cache slot for the given level,
+    /// growing the underlying vec as needed.
+    pub fn slot_mut(&mut self, level: usize) -> &mut Option<IndexIterCache> {
+        if level >= self.slots.len() {
+            self.slots.resize_with(level + 1, || None);
+        }
+        &mut self.slots[level]
+    }
+}
+
 pub const HEADER_ELEMENTS: usize = 128;
 pub const HEADER_ELEMENT_SIZE: usize = 8;
 pub const HEADER_SIZE: usize = HEADER_ELEMENTS * HEADER_ELEMENT_SIZE;
 pub const PREFIX_LENGTH: usize = 8; // prefix of key used to estimate position in file, in bytes
 
 pub trait IndexFormat {
+    /// Serialize `table` as an on-disk index blob. Any `Removed` entries in
+    /// `table` are persisted as tombstones (INVALID WalPosition). Callers that
+    /// want to strip tombstones (deepest LSM level) should call
+    /// `IndexTable::clean_self` first.
     fn serialize_index(&self, table: &IndexTable, ks: &KeySpaceDesc) -> Bytes;
     fn deserialize_index(&self, ks: &KeySpaceDesc, b: Bytes) -> IndexTable;
     fn lookup_unloaded(

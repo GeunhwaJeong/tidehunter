@@ -223,8 +223,14 @@ impl KsContext {
     /// See `docs/two_level_lsm_design.md` §3 — optimal `M ≈ √(2N/D)`; 8 is a
     /// conservative default that wins at cell sizes ≥ ~64k keys and doesn't
     /// lose much at smaller sizes.
+    ///
+    /// Resolution order: per-ks override → global `Config::l0_max_entries` →
+    /// `max_dirty_keys * 8` fallback.
     pub fn l0_max_entries(&self) -> usize {
-        self.max_dirty_keys().saturating_mul(8)
+        self.ks_config
+            .l0_max_entries()
+            .or(self.config.l0_max_entries)
+            .unwrap_or_else(|| self.max_dirty_keys().saturating_mul(8))
     }
 
     /// Returns fixed key size or None if variable keys are configured for this key space.
