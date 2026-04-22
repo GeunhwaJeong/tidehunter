@@ -730,23 +730,27 @@ impl IndexTable {
         append_flat_varlen(&iwp_entries, out);
     }
 
-    /// Builds an IndexTable from an iterator of (key, WalPosition) pairs loaded
-    /// from disk. A position of `WalPosition::INVALID` indicates a persisted
-    /// tombstone; all other positions are marked clean.
+    /// Builds a varlen IndexTable from an iterator of (key, WalPosition) pairs
+    /// loaded from disk. A position of `WalPosition::INVALID` indicates a
+    /// persisted tombstone; all other positions are marked clean. The entries
+    /// are sorted before being packed into the flat buffer — the varlen blob
+    /// layout writes each micro-cell section sorted internally, but the caller
+    /// concatenates sections in micro-cell-index order, so the combined stream
+    /// is not globally sorted.
     #[doc(hidden)] // Used by lookup_header.rs for varlen index deserialization
     pub(crate) fn from_clean_entries(
         entries: impl IntoIterator<Item = (Bytes, WalPosition)>,
     ) -> Self {
-        let mut data = BTreeMap::new();
-        let mut key_bytes = 0usize;
-        for (k, v) in entries {
-            key_bytes += k.len();
-            data.insert(k, IndexWalPosition::from_disk(v));
-        }
+        let mut entries: Vec<(Bytes, IndexWalPosition)> = entries
+            .into_iter()
+            .map(|(k, v)| (k, IndexWalPosition::from_disk(v)))
+            .collect();
+        entries.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+        let flat = build_flat_bytes(entries, None);
         IndexTable {
-            data,
-            key_bytes,
-            flat: Bytes::default(),
+            data: BTreeMap::new(),
+            key_bytes: 0,
+            flat,
             key_size: None,
             dirty_count: 0,
         }
