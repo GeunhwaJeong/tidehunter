@@ -155,21 +155,36 @@ impl IndexTable {
     /// below. Callers producing the deepest level (no further level below)
     /// should call `clean_self()` after this to strip tombstones.
     pub fn merge_dirty_and_clean(&mut self, dirty: &Self) {
+        self.merge_dirty(dirty, /* promote_to_clean */ true);
+    }
+
+    /// Merges dirty IndexTable into a loaded IndexTable, preserving dirty states
+    pub fn merge_dirty_no_clean(&mut self, dirty: &Self) {
+        self.merge_dirty(dirty, /* promote_to_clean */ false);
+    }
+
+    /// Merges `dirty` into `self`. When `promote_to_clean` is true, non-removed
+    /// entries are demoted Modified→Clean via `as_clean_modified` (the flush path:
+    /// these entries are about to become clean on disk). Tombstones are preserved
+    /// as-is in both modes — callers producing the deepest level still need to
+    /// call `clean_self()` afterwards to strip them.
+    fn merge_dirty(&mut self, dirty: &Self, promote_to_clean: bool) {
         // todo implement this efficiently taking into account both self and dirty are sorted
         for (k, v) in dirty.data.iter() {
             // Strict check for concurrent_test and unit tests
             #[cfg(any(debug_assertions, feature = "test_methods"))]
-            if let Some(found) = self.data.get(k)
+            if promote_to_clean
+                && let Some(found) = self.data.get(k)
                 && found.offset > v.offset
             {
                 // This can't happen - this would mean we somehow have written an
                 // older entry in a dirty set.
                 panic!("found.offset {} > v.offset {}", found.offset, v.offset);
             }
-            let incoming = if v.is_removed() {
-                *v
-            } else {
+            let incoming = if promote_to_clean && !v.is_removed() {
                 v.as_clean_modified()
+            } else {
+                *v
             };
             if self.data.insert(k.clone(), incoming).is_none() {
                 self.key_bytes += k.len();
@@ -183,37 +198,13 @@ impl IndexTable {
             }
             // Zero-copy: k is a subslice of dirty.flat, so slice_ref avoids a heap allocation.
             let key = dirty.flat.slice_to_bytes(k);
-            let incoming = if v.is_removed() {
-                v
-            } else {
+            let incoming = if promote_to_clean && !v.is_removed() {
                 v.as_clean_modified()
+            } else {
+                v
             };
             let len = key.len();
             if self.data.insert(key, incoming).is_none() {
-                self.key_bytes += len;
-            }
-        }
-        self.dirty_count = self.count_dirty_slow();
-    }
-
-    /// Merges dirty IndexTable into a loaded IndexTable, preserving dirty states
-    pub fn merge_dirty_no_clean(&mut self, dirty: &Self) {
-        // todo implement this efficiently taking into account both self and dirty are sorted
-        for (k, v) in dirty.data.iter() {
-            if self.data.insert(k.clone(), *v).is_none() {
-                self.key_bytes += k.len();
-            }
-        }
-        // Also merge flat entries (present when promote_to_flat has been called on dirty).
-        // BTreeMap entries already processed above take priority; skip those keys.
-        for (k, v) in FlatIter::new(&dirty.flat, dirty.key_size) {
-            if dirty.data.contains_key(k) {
-                continue;
-            }
-            // Zero-copy: k is a subslice of dirty.flat, so slice_ref avoids a heap allocation.
-            let key = dirty.flat.slice_to_bytes(k);
-            let len = key.len();
-            if self.data.insert(key, v).is_none() {
                 self.key_bytes += len;
             }
         }
@@ -336,6 +327,28 @@ impl IndexTable {
         } else {
             self.dirty_count = self.dirty_count.saturating_sub((-dirty_delta) as usize);
         }
+    }
+
+    /// Rebuild the flat buffer by walking existing entries through `keep`. The
+    /// closure returns `None` to drop the entry or `Some(new_iwp)` to keep it
+    /// (optionally with a rewritten position — e.g. Modified→Clean).
+    ///
+    /// `dirty_count` is **not** adjusted here — callers are expected to either
+    /// set it (`clean_self`: goes to 0) or recompute via `count_dirty_slow`
+    /// (`retain_above_position`, `compact_with`) since the accurate delta
+    /// depends on caller context.
+    fn retain_flat<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&[u8], IndexWalPosition) -> Option<IndexWalPosition>,
+    {
+        if self.flat.is_empty() {
+            return;
+        }
+        let old_flat = std::mem::take(&mut self.flat);
+        let kept: Vec<(Bytes, IndexWalPosition)> = FlatIter::new(&old_flat, self.key_size)
+            .filter_map(|(k, iwp)| keep(k, iwp).map(|new_iwp| (Bytes::from(k.to_vec()), new_iwp)))
+            .collect();
+        self.flat = build_flat_bytes(kept, self.key_size);
     }
 
     pub fn get(&self, k: &[u8]) -> Option<WalPosition> {
@@ -807,24 +820,26 @@ impl IndexTable {
         // A Removed tombstone in `data` shadows any flat entry for the same key;
         // both sides must be dropped together, otherwise the shadowed flat entry
         // survives as a stale record.
-        let old_flat = std::mem::take(&mut self.flat);
-        let tombstoned: HashSet<&[u8]> = self
+        //
+        // Collect tombstone keys as owned Bytes so the closure below doesn't
+        // hold a borrow of `self.data` across the `retain_flat` call.
+        let tombstoned: HashSet<Bytes> = self
             .data
             .iter()
             .filter(|(_, v)| matches!(v.kind, IndexEntryKind::Removed))
-            .map(|(k, _)| k.as_ref())
+            .map(|(k, _)| k.clone())
             .collect();
 
         // Rebuild flat: convert Modified→Clean, drop Removed (in flat or shadowed by data).
-        let kept: Vec<(Bytes, IndexWalPosition)> = FlatIter::new(&old_flat, self.key_size)
-            .filter(|(k, iwp)| !iwp.is_removed() && !tombstoned.contains(*k))
-            .map(|(k, mut iwp)| {
+        self.retain_flat(|k, mut iwp| {
+            if iwp.is_removed() || tombstoned.contains(k) {
+                None
+            } else {
                 iwp.kind = IndexEntryKind::Clean;
-                (Bytes::from(k.to_vec()), iwp)
-            })
-            .collect();
+                Some(iwp)
+            }
+        });
         drop(tombstoned);
-        self.flat = build_flat_bytes(kept, self.key_size);
 
         // Clean BTreeMap: Modified→Clean, drop Removed (shadowed flat entries
         // were filtered out above).
@@ -836,10 +851,9 @@ impl IndexTable {
             }
             IndexEntryKind::Removed => false,
         });
-        // The flat rebuild above removed flat dirty entries without updating dirty_count.
-        // retain correctly handled BTreeMap changes, but dirty_count is still off by the
-        // flat dirty entries that were dropped. Setting to 0 is correct since all remaining
-        // entries are Clean after this call.
+        // All remaining entries are Clean after this call — bypass the slow
+        // recount. `retain_flat` intentionally doesn't touch dirty_count; `retain`
+        // above tracked BTreeMap changes but didn't see the flat dirty drops.
         self.dirty_count = 0;
     }
 
@@ -864,13 +878,7 @@ impl IndexTable {
 
     /// Retain only entries with offset >= last_processed. Applied to both flat and BTreeMap.
     pub fn retain_above_position(&mut self, last_processed: u64) {
-        // Rebuild flat keeping entries with offset >= cutoff.
-        let old_flat = std::mem::take(&mut self.flat);
-        let kept: Vec<(Bytes, IndexWalPosition)> = FlatIter::new(&old_flat, self.key_size)
-            .filter(|(_, iwp)| iwp.offset >= last_processed)
-            .map(|(k, iwp)| (Bytes::from(k.to_vec()), iwp))
-            .collect();
-        self.flat = build_flat_bytes(kept, self.key_size);
+        self.retain_flat(|_, iwp| (iwp.offset >= last_processed).then_some(iwp));
         self.retain(|_, v| v.offset >= last_processed);
         // flat was rebuilt; recount since retain only tracked BTreeMap changes.
         self.dirty_count = self.count_dirty_slow();
@@ -922,14 +930,13 @@ impl IndexTable {
 
         self.retain(|k, _| to_retain.contains(k));
 
-        if !self.flat.is_empty() {
-            let retained: Vec<(Bytes, IndexWalPosition)> = FlatIter::new(&self.flat, self.key_size)
-                .filter(|(_, iwp)| !iwp.is_removed())
-                .filter(|(k, _)| to_retain.contains(&Bytes::from(k.to_vec())))
-                .map(|(k, iwp)| (Bytes::from(k.to_vec()), iwp))
-                .collect();
-            self.flat = build_flat_bytes(retained, self.key_size);
-        }
+        self.retain_flat(|k, iwp| {
+            if iwp.is_removed() || !to_retain.contains(k) {
+                None
+            } else {
+                Some(iwp)
+            }
+        });
         // flat was rebuilt; recount since retain only tracked BTreeMap changes.
         self.dirty_count = self.count_dirty_slow();
     }

@@ -97,6 +97,20 @@ enum LargeTableEntryState {
     DirtyLoaded,
 }
 
+/// Output of `LargeTableEntry::read_plan` — tells the read path what to walk.
+/// `Empty` is a distinct variant because the two call sites (`get`,
+/// `next_in_cell`) need to bail on Empty in different ways.
+pub(crate) enum ReadPlan {
+    Empty,
+    Walk {
+        /// True when `self.data` carries content the caller should consult
+        /// before or alongside on-disk levels.
+        has_inmemory: bool,
+        /// Populated on-disk level positions, freshest first.
+        level_positions: SmallVec<[WalPosition; 2]>,
+    },
+}
+
 struct KsTable {
     context: KsContext,
     rows: ShardedMutex<Row>,
@@ -471,30 +485,24 @@ impl LargeTable {
         // until it finds either a hit or a tombstone (INVALID). We build the
         // reader list while holding the mutex — otherwise a concurrent
         // relocation could delete the backing blob before we open it.
-        let level_positions: SmallVec<[WalPosition; 2]> = match entry.state {
-            LargeTableEntryState::Empty => {
+        //
+        // For Loaded/DirtyLoaded/DirtyUnloaded (has_inmemory), probe
+        // `entry.data` first: a hit wins (a valid position returns Found;
+        // an INVALID/Removed means a tombstone that shadows deeper levels).
+        // A miss must fall through to the on-disk levels.
+        let level_positions = match entry.read_plan() {
+            ReadPlan::Empty => {
                 return Ok(context.report_lookup_result(None, LookupSource::Cache));
             }
-            LargeTableEntryState::Loaded | LargeTableEntryState::DirtyLoaded => {
-                // `maybe_load` only folds L0 into `entry.data`; L1+ stay on disk
-                // (see `maybe_load` doc comment). `entry.data` is authoritative
-                // for L0 content (+ dirty overlay when DirtyLoaded), so a hit
-                // here wins — a valid position returns Found, an INVALID/Removed
-                // means an L0 tombstone that shadows L1. A miss must fall
-                // through to the on-disk L1+ levels.
-                if let Some(found) = entry.get(k) {
+            ReadPlan::Walk {
+                has_inmemory,
+                level_positions,
+            } => {
+                if has_inmemory && let Some(found) = entry.get(k) {
                     return Ok(context.report_lookup_result(found.valid(), LookupSource::Cache));
                 }
-                entry.levels().iter_below_l0().collect()
+                level_positions
             }
-            LargeTableEntryState::DirtyUnloaded => {
-                // The dirty overlay may have the answer without touching disk.
-                if let Some(found) = entry.get(k) {
-                    return Ok(context.report_lookup_result(found.valid(), LookupSource::Cache));
-                }
-                entry.levels().iter().collect()
-            }
-            LargeTableEntryState::Unloaded => entry.levels().iter().collect(),
         };
         if level_positions.is_empty() {
             // No on-disk levels left to consult (e.g., Loaded cell with just
@@ -971,27 +979,15 @@ impl LargeTable {
             entry.maybe_load(loader)?;
         }
 
-        // Determine which positions to walk on disk and whether `entry.data`
-        // carries an in-memory overlay.
-        //
-        // - `Loaded` / `DirtyLoaded`: `maybe_load` folded L0 into `entry.data`,
-        //   so walk levels **below L0** and treat `entry.data` as the freshest
-        //   (in-memory) source for the k-way merge.
-        // - `Unloaded`: `entry.data` is empty; walk every populated level.
-        // - `DirtyUnloaded`: `entry.data` holds the dirty overlay (no L0
-        //   content); walk every populated level, overlay wins on ties.
-        // - `Empty`: nothing to return.
-        let (has_inmemory, level_positions): (bool, SmallVec<[WalPosition; 2]>) = match entry.state
-        {
-            LargeTableEntryState::Empty => {
+        let (has_inmemory, level_positions) = match entry.read_plan() {
+            ReadPlan::Empty => {
                 caches.clear();
                 return Ok(None);
             }
-            LargeTableEntryState::Loaded | LargeTableEntryState::DirtyLoaded => {
-                (true, entry.levels().iter_below_l0().collect())
-            }
-            LargeTableEntryState::Unloaded => (false, entry.levels().iter().collect()),
-            LargeTableEntryState::DirtyUnloaded => (true, entry.levels().iter().collect()),
+            ReadPlan::Walk {
+                has_inmemory,
+                level_positions,
+            } => (has_inmemory, level_positions),
         };
 
         if level_positions.is_empty() && !has_inmemory {
@@ -1594,6 +1590,35 @@ impl LargeTableEntry {
         self.data.get(k)
     }
 
+    /// Derive what the read path needs from this entry: whether `self.data`
+    /// participates as an in-memory overlay, and which on-disk level positions
+    /// to consult. Shared by `get()` (miss-chain) and `next_in_cell` (k-way
+    /// merge) so the state→plan mapping lives in one place.
+    ///
+    /// - `Empty`: caller bails out immediately (the how differs per call site).
+    /// - `Loaded | DirtyLoaded`: `maybe_load` folded L0 into `self.data`, so
+    ///   walk levels **below L0** and treat `self.data` as the overlay.
+    /// - `Unloaded`: `self.data` is empty; walk every populated level.
+    /// - `DirtyUnloaded`: `self.data` holds only the dirty overlay (no L0
+    ///   content); walk every populated level, overlay wins on ties.
+    pub(crate) fn read_plan(&self) -> ReadPlan {
+        match self.state {
+            LargeTableEntryState::Empty => ReadPlan::Empty,
+            LargeTableEntryState::Loaded | LargeTableEntryState::DirtyLoaded => ReadPlan::Walk {
+                has_inmemory: true,
+                level_positions: self.levels.iter_below_l0().collect(),
+            },
+            LargeTableEntryState::Unloaded => ReadPlan::Walk {
+                has_inmemory: false,
+                level_positions: self.levels.iter().collect(),
+            },
+            LargeTableEntryState::DirtyUnloaded => ReadPlan::Walk {
+                has_inmemory: true,
+                level_positions: self.levels.iter().collect(),
+            },
+        }
+    }
+
     /// See IndexTable::next_entry for documentation.
     pub fn next_entry(
         &self,
@@ -1687,7 +1712,20 @@ impl LargeTableEntry {
             .with_label_values(&[self.context.name()])
             .inc();
         if forced_relocation && !self.state.is_dirty() {
-            // Clean entry needing relocation: re-read from old position and re-write
+            // Clean entry needing relocation: re-read from old position and re-write.
+            //
+            // TODO(levels-generic): ForceRelocate rewrites a single on-disk blob
+            // and the matching `update_relocated_position` overwrites the whole
+            // `levels` with the flusher's single-slot response. For a multi-level
+            // entry (e.g. `[L0, L1]`) that silently drops the L1 slot. Until the
+            // relocation path becomes level-aware, require at-most-one populated
+            // level here — for `[L0]` and `[INVALID, L1]` the round-trip preserves
+            // content. See docs/two_level_lsm_design.md.
+            assert!(
+                self.levels.is_single_level(),
+                "force-relocate on multi-level entry not yet supported (levels = {:?})",
+                self.levels,
+            );
             let old_position = self
                 .wal_position()
                 .valid()
@@ -1721,6 +1759,13 @@ impl LargeTableEntry {
         // in that case, just update the on-disk levels. The dirty overlay remains valid.
         // TODO(levels-generic): force-relocate rewrites the sole on-disk blob today;
         // with L0 + L1, only the level that was relocated should be replaced.
+        // The request site (`request_async_snapshot_flush`) enforces single-level
+        // entries so an `[L0, L1]` shape can't reach here and lose L1 on overwrite.
+        debug_assert!(
+            new_levels.is_single_level(),
+            "force-relocate must produce at-most-one populated level (got {:?})",
+            new_levels,
+        );
         match self.state {
             LargeTableEntryState::Unloaded => {
                 self.levels = new_levels;
@@ -1841,11 +1886,19 @@ impl LargeTableEntry {
                 // Some entries remain (newer than last_processed), keep state as DirtyLoaded
                 self.state = LargeTableEntryState::DirtyLoaded;
             } else {
-                // All entries are processed — tombstones (Removed entries) must be cleaned up
-                // before entering Loaded state. In Loaded state, get() does not filter INVALID
-                // positions, so leaving Removed entries would cause WalPosition::INVALID to be
-                // returned to callers and trigger a crash in Wal::read.
-                self.data.make_mut().clean_self();
+                // All entries are processed — if nothing on-disk sits below L0,
+                // strip tombstones from `self.data` (in Loaded state `self.data`
+                // is authoritative for L0; a tombstone against nothing is dead
+                // weight and is canonicalised away to keep the Loaded overlay
+                // in clean form).
+                //
+                // With an L1 below, tombstones in `self.data` shadow L1 entries
+                // on reads — dropping them here would let L1 entries resurface
+                // (the flusher keeps tombstones in the new L0 blob under the
+                // same invariant; see `flusher.rs` "deepest level" comment).
+                if self.levels.iter_below_l0().next().is_none() {
+                    self.data.make_mut().clean_self();
+                }
                 self.report_loaded_keys_count();
                 self.state = LargeTableEntryState::Loaded;
             }

@@ -256,13 +256,8 @@ impl IndexFlusherThread {
         // apply sees the full key set. The subsequent promote branch still
         // re-loads L1 from disk; the duplication is acceptable on the
         // relocation path — correctness first, optimize later.
-        if relocation_updates.is_some()
-            && let Some(l1_pos) = existing_l1
-        {
-            let l1_loaded = loader
-                .load(&ctx.ks_config, l1_pos)
-                .expect("Failed to load L1 index for relocation update");
-            let mut combined = l1_loaded;
+        if relocation_updates.is_some() && existing_l1.is_some() {
+            let mut combined = Self::load_l1_or_default(loader, ctx, existing_l1);
             // `merged_l0` is the fresher overlay (L0 + dirty) — it wins on
             // overlapping keys, so treat it as the "dirty" side.
             combined.merge_dirty_and_clean(&merged_l0);
@@ -298,12 +293,7 @@ impl IndexFlusherThread {
             // Promote: merge the freshly-built L0 with the existing L1 (if
             // any). `merge_dirty_and_clean` lets `merged_l0` win on overlap
             // by treating it as the "dirty" overlay.
-            let mut new_l1 = match existing_l1 {
-                Some(pos) => loader
-                    .load(&ctx.ks_config, pos)
-                    .expect("Failed to load L1 index in flusher thread"),
-                None => IndexTable::default(),
-            };
+            let mut new_l1 = Self::load_l1_or_default(loader, ctx, existing_l1);
             new_l1.merge_dirty_and_clean(&merged_l0);
             Self::run_compactor(ctx, &mut new_l1);
             // L1 is the deepest level — nothing below to shadow, so drop
@@ -345,6 +335,23 @@ impl IndexFlusherThread {
         };
 
         Some((original_index, new_levels))
+    }
+
+    /// Load the L1 blob at `l1`, or return an empty `IndexTable` when `l1` is
+    /// `None`. The `expect` here matches the other flusher `load` call sites —
+    /// a failure indicates a corrupt or missing blob and isn't recoverable on
+    /// this thread.
+    fn load_l1_or_default<L: Loader>(
+        loader: &L,
+        ctx: &KsContext,
+        l1: Option<WalPosition>,
+    ) -> IndexTable {
+        match l1 {
+            Some(pos) => loader
+                .load(&ctx.ks_config, pos)
+                .expect("Failed to load L1 index in flusher thread"),
+            None => IndexTable::default(),
+        }
     }
 
     // todo - result of compactor is not applied to in-memory index for DirtyLoaded
