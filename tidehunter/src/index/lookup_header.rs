@@ -542,30 +542,91 @@ fn binary_search_varlen(buffer: &[u8], key: &[u8], metrics: &Metrics) -> Option<
 }
 
 /// Deserialize a variable-length key index blob written by `LookupHeaderIndex::serialize_index`.
-/// The per-micro-cell section format is identical to the in-memory flat buffer, so
-/// `flat_varlen_iter` can be used directly without manual offset-table parsing.
+///
+/// Each on-disk micro-cell section already has the exact in-memory varlen
+/// flat-buffer layout (`[count][offsets][entries]`, same writer both sides).
+/// We splice the sections into one unified flat buffer: raw-copy every
+/// section's entries bytes, rewrite its offset table with a cumulative
+/// offset, and wrap them in a single `[total_count][offsets * total_count]`
+/// header. No per-entry decode, no (key, pos) intermediate Vec, no sort.
+///
+/// **Sortedness.** Sections are written in micro-cell-index order, and
+/// `LookupHeaderIndex::key_micro_cell` is a monotonic function of the first
+/// 4 bytes of the key's index prefix. Keys in micro-cell M have strictly
+/// smaller first-4-byte prefix than keys in micro-cell M+1 (rescale is a
+/// deterministic total function — two keys with the same prefix_u32 always
+/// land in the same micro-cell), so cross-section concatenation is globally
+/// sorted. Within a section, entries are already sorted by the writer.
+///
+/// **Tombstones.** The raw-copy path preserves on-disk tombstones verbatim:
+/// `[key][offset=u64::MAX][encoded_len=0x8000_0000]` round-trips as
+/// `IndexEntryKind::Removed`, matching the serializer's intent. The old
+/// decode-and-rebuild path routed tombstones through
+/// `WalPosition::into_update_position` which dropped the kind bits and
+/// reconstructed them as `Clean` — a latent bug that would have surfaced
+/// once two-level LSM started persisting tombstones in varlen L0 indices.
 fn deserialize_varlen_index(b: Bytes) -> IndexTable {
-    let mut entries: Vec<(Bytes, WalPosition)> = Vec::new();
-    let b_ptr = b.as_ptr() as usize;
+    // First pass: gather non-empty sections and totals.
+    let mut sections: Vec<(usize, usize, usize)> = Vec::new(); // (from, to, count)
+    let mut total_count: usize = 0;
+    let mut total_entry_bytes: usize = 0;
+
     for mc in 0..HEADER_ELEMENTS {
         let hs = mc * HEADER_ELEMENT_SIZE;
         let from = u32::from_be_bytes(b[hs..hs + 4].try_into().unwrap()) as usize;
         let to = u32::from_be_bytes(b[hs + 4..hs + 8].try_into().unwrap()) as usize;
         // from=0 is an unambiguous empty sentinel: all data starts at offsets
-        // >= HEADER_SIZE (1024), so a micro-cell with from=0 was never written.
+        // >= HEADER_SIZE, so a micro-cell with from=0 was never written.
         if from == 0 && to == 0 {
             continue;
         }
-        for (key_slice, pos) in IndexTable::flat_varlen_iter(&b[from..to]) {
-            // key_slice borrows from the sub-slice &b[from..to], which is a
-            // contiguous region of the same backing allocation as `b`.  We
-            // recover the byte offset within `b` via pointer arithmetic so we
-            // can hand out zero-copy Bytes sub-slices sharing `b`'s refcount.
-            let key_abs = key_slice.as_ptr() as usize - b_ptr;
-            entries.push((b.slice(key_abs..key_abs + key_slice.len()), pos));
+
+        let section = &b[from..to];
+        let count = u32::from_be_bytes(section[0..4].try_into().unwrap()) as usize;
+        if count == 0 {
+            continue;
         }
+        let entries_start = 4 + 4 * count;
+        let entries_bytes = (to - from) - entries_start;
+
+        sections.push((from, to, count));
+        total_count += count;
+        total_entry_bytes += entries_bytes;
     }
-    IndexTable::from_clean_entries(entries)
+
+    if total_count == 0 {
+        return IndexTable::from_varlen_flat_bytes(Bytes::default());
+    }
+
+    // Output: [total_count: u32][offsets: u32 * total_count][entries_concat].
+    let header_size = 4 + 4 * total_count;
+    let mut out: Vec<u8> = Vec::with_capacity(header_size + total_entry_bytes);
+    out.extend_from_slice(&(total_count as u32).to_be_bytes());
+
+    // Write offsets with cumulative byte adjustment. Section-local offsets are
+    // relative to each section's entries start; unified offsets are relative
+    // to the unified entries start (immediately after the offset table).
+    let mut cum_entry_bytes: u32 = 0;
+    for &(from, to, count) in &sections {
+        let section = &b[from..to];
+        for i in 0..count {
+            let pos = 4 + 4 * i;
+            let off_local = u32::from_be_bytes(section[pos..pos + 4].try_into().unwrap());
+            let off_global = off_local + cum_entry_bytes;
+            out.extend_from_slice(&off_global.to_be_bytes());
+        }
+        let entries_start = 4 + 4 * count;
+        let entries_bytes = (to - from) - entries_start;
+        cum_entry_bytes += entries_bytes as u32;
+    }
+
+    // Raw-copy each section's entries bytes.
+    for &(from, to, count) in &sections {
+        let entries_start = 4 + 4 * count;
+        out.extend_from_slice(&b[from + entries_start..to]);
+    }
+
+    IndexTable::from_varlen_flat_bytes(Bytes::from(out))
 }
 
 pub struct IndexTableHeaderBuilder<'a> {
@@ -708,6 +769,64 @@ mod tests {
             deserialized.get(&[255, 255, 255]),
         );
         assert_eq!(None, deserialized.get(&[0, 99]));
+    }
+
+    /// Regression test: tombstones in varlen serialized blobs must survive
+    /// deserialize/serialize round-trips. The two-level LSM relies on L0
+    /// preserving `Removed` entries so they can shadow keys still present in
+    /// L1. An earlier implementation decoded flat entries via
+    /// `into_update_position`, which produced `{u64::MAX, 0}` for a tombstone
+    /// — not equal to `WalPosition::INVALID`'s `{u64::MAX, u32::MAX}`
+    /// sentinel — and `from_disk` then re-encoded them as Clean entries
+    /// pointing at offset `u64::MAX`, silently losing the tombstone.
+    #[test]
+    fn test_varlen_tombstone_roundtrip() {
+        let (shape, ks_id) = KeyShape::new_single_config_indexing(
+            KeyIndexing::variable_length(),
+            1,
+            KeyType::uniform(1),
+            Default::default(),
+        );
+        let ks = shape.ks(ks_id);
+        let index_format = LookupHeaderIndex;
+
+        // Populate across several micro-cells so the streaming deserialize
+        // exercises multi-section splice.
+        let mut table = IndexTable::default();
+        for b in 0u8..=31 {
+            table.insert(
+                Bytes::from(vec![b]),
+                WalPosition::test_value(b as u64 + 100),
+            );
+        }
+        // Remove half of them — these produce Removed-kind entries in the
+        // table and serialize as on-disk tombstones.
+        for b in (0u8..=31).step_by(2) {
+            table.remove(
+                Bytes::from(vec![b]),
+                WalPosition::test_value(9000 + b as u64),
+            );
+        }
+
+        let serialized = index_format.serialize_index(&table, ks);
+        let deserialized = index_format.deserialize_index(ks, serialized);
+
+        for b in 0u8..=31 {
+            let got = deserialized.get(&[b]);
+            if b % 2 == 0 {
+                assert_eq!(
+                    got,
+                    Some(WalPosition::INVALID),
+                    "key [{b}] should be a tombstone after round-trip",
+                );
+            } else {
+                assert_eq!(
+                    got,
+                    Some(WalPosition::test_value(b as u64 + 100)),
+                    "key [{b}] should survive as a live entry",
+                );
+            }
+        }
     }
 
     #[test]

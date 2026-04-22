@@ -730,12 +730,6 @@ impl IndexTable {
         (found_key == key).then(|| iwp.into_update_position())
     }
 
-    /// Iterate `(key_slice, WalPosition)` pairs from a variable-length flat section.
-    /// `key_slice` borrows from `buffer`.
-    pub(super) fn flat_varlen_iter(buffer: &[u8]) -> impl Iterator<Item = (&[u8], WalPosition)> {
-        FlatIter::new(buffer, None).map(|(k, iwp)| (k, iwp.into_update_position()))
-    }
-
     /// Append `(key, WalPosition)` pairs as a variable-length flat section into `out`.
     /// `WalPosition::INVALID` entries are written as tombstones (when the caller
     /// wants to preserve them); otherwise all entries are stored as clean.
@@ -751,23 +745,13 @@ impl IndexTable {
         append_flat_varlen(&iwp_entries, out);
     }
 
-    /// Builds a varlen IndexTable from an iterator of (key, WalPosition) pairs
-    /// loaded from disk. A position of `WalPosition::INVALID` indicates a
-    /// persisted tombstone; all other positions are marked clean. The entries
-    /// are sorted before being packed into the flat buffer — the varlen blob
-    /// layout writes each micro-cell section sorted internally, but the caller
-    /// concatenates sections in micro-cell-index order, so the combined stream
-    /// is not globally sorted.
+    /// Constructs a flat-backed IndexTable by wrapping a pre-built varlen flat
+    /// buffer. The caller is responsible for the bytes being well-formed
+    /// (`[count: u32][offsets: u32 * count][entries]` — see
+    /// `build_flat_bytes`/`append_flat_varlen`) and for the entries being
+    /// sorted by key. `data` is empty, `dirty_count` is 0.
     #[doc(hidden)] // Used by lookup_header.rs for varlen index deserialization
-    pub(crate) fn from_clean_entries(
-        entries: impl IntoIterator<Item = (Bytes, WalPosition)>,
-    ) -> Self {
-        let mut entries: Vec<(Bytes, IndexWalPosition)> = entries
-            .into_iter()
-            .map(|(k, v)| (k, IndexWalPosition::from_disk(v)))
-            .collect();
-        entries.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
-        let flat = build_flat_bytes(entries, None);
+    pub(crate) fn from_varlen_flat_bytes(flat: Bytes) -> Self {
         IndexTable {
             data: BTreeMap::new(),
             key_bytes: 0,
