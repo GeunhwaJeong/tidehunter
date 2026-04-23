@@ -859,9 +859,7 @@ impl LargeTable {
         let mut replay_from: Option<u64> = None;
         // Collect all cells from all rows into one BTreeMap
         let mut ks_data = BTreeMap::new();
-        const SNAPSHOT_ROW_SLEEP: Duration = Duration::from_millis(2);
         for mutex in ks_table.rows.mutexes() {
-            thread::sleep(SNAPSHOT_ROW_SLEEP);
             let mut row = mutex.lock();
             for entry in row.entries.iter_mut() {
                 // Important - read last_processed_wal_position before promote_pending.
@@ -1186,17 +1184,22 @@ impl LargeTable {
         f(entry)
     }
 
-    /// Pass 1 of the two-pass snapshot flush: iterate all entries and queue async flushes
-    /// for dirty entries and forced-relocation entries. No IO is performed under cell locks.
+    /// Pass 1 of the two-pass snapshot flush: iterate all entries, queue async flushes
+    /// for dirty entries whose `last_processed` is at or below `threshold_position`,
+    /// and accumulate live-byte counts per index WAL file from current on-disk levels.
     ///
-    /// See docs/snapshot_mechanism.md for the full two-pass protocol, correctness argument,
-    /// and the relationship between `threshold_position` and `replay_from` bounds.
-    pub(crate) fn prefetch_flushes_for_snapshot<L: Loader>(
+    /// The accumulator captures pre-flush levels — files written by the queued flushes
+    /// land past the WAL position recorded by the caller before pass 1 began, so they
+    /// are excluded by `RelocateFiles::from_accumulator`'s `exclude_from` filter.
+    ///
+    /// No IO is performed under cell locks.
+    pub(crate) fn flush_and_accumulate<L: Loader>(
         &self,
         loader: &L,
-        relocate_files: &RelocateFiles,
+        layout: &WalLayout,
         threshold_position: u64,
-    ) {
+    ) -> HashMap<WalFileId, u64> {
+        let mut accumulator: HashMap<WalFileId, u64> = HashMap::new();
         for ks_table in self.table.iter() {
             for mutex in ks_table.rows.mutexes() {
                 let mut row = mutex.lock();
@@ -1205,16 +1208,48 @@ impl LargeTable {
                     // See also comments in unload_if_ks_enabled.
                     let loader_last_processed = loader.last_processed_wal_position();
                     entry.promote_pending();
-                    entry.request_async_snapshot_flush(
+                    for pos in entry.levels.iter() {
+                        let file_id = layout.locate_file(pos.offset());
+                        *accumulator.entry(file_id).or_insert(0) += pos.frame_len() as u64;
+                    }
+                    entry.request_flush_if_behind(
                         &self.flusher,
                         loader_last_processed,
-                        relocate_files,
                         threshold_position,
                     );
                 }
                 // row lock released immediately — no IO under lock
             }
         }
+        accumulator
+    }
+
+    /// Pass 2 of the two-pass snapshot flush: queue force-relocation flushes for
+    /// entries with positions in low-occupancy files, wait for completion, then
+    /// build the snapshot.
+    pub(crate) fn relocate_and_snapshot<L: Loader>(
+        &self,
+        loader: &L,
+        relocate_files: &RelocateFiles,
+    ) -> LargeTableSnapshot {
+        if !relocate_files.is_empty() {
+            for ks_table in self.table.iter() {
+                for mutex in ks_table.rows.mutexes() {
+                    let mut row = mutex.lock();
+                    for entry in row.entries.iter_mut() {
+                        let loader_last_processed = loader.last_processed_wal_position();
+                        entry.promote_pending();
+                        entry.request_force_relocate(
+                            &self.flusher,
+                            loader_last_processed,
+                            relocate_files,
+                        );
+                    }
+                }
+            }
+            self.flusher.barrier();
+        }
+        self.snapshot(loader)
     }
 
     #[cfg(test)]
@@ -1663,55 +1698,75 @@ impl LargeTableEntry {
         Ok(())
     }
 
-    /// Queues an async flush for this entry if it needs flushing for a snapshot.
-    /// Called during pass 1 of the two-pass snapshot flush mechanism.
+    /// Pass 1 helper: queues a normal async flush if this entry is dirty and its
+    /// `last_processed` is at or below `threshold_position`.
     /// No IO is performed — flushes are dispatched asynchronously.
-    pub fn request_async_snapshot_flush(
+    pub fn request_flush_if_behind(
         &mut self,
         flusher: &IndexFlusher,
         loader_last_processed: LastProcessed,
-        relocate_files: &RelocateFiles,
         threshold_position: u64,
     ) {
-        // Skip if already has a pending flush in flight
         if self.pending_last_processed.is_some() {
             return;
         }
-        // Trigger relocation if *any* populated level lives in a low-occupancy
-        // index file. We check every level (not just the freshest) because a
-        // post-promote `[L0, L1]` cell may have an ancient L1 in a sparse file
-        // even when L0 is fresh.
-        let forced_relocation = relocate_files.contains_any(self.levels.iter());
-        if forced_relocation {
-            self.context
-                .metrics
-                .snapshot_forced_relocation
-                .with_label_values(&[self.context.name()])
-                .inc();
-        }
-        if !forced_relocation && !self.state.is_dirty() {
+        if !self.state.is_dirty() {
             return;
         }
-        if !forced_relocation {
-            // Only flush dirty entries at or below threshold
-            let should_flush = self.last_processed.as_u64() <= threshold_position;
-            if !should_flush {
-                return;
-            }
+        if self.last_processed.as_u64() > threshold_position {
+            return;
         }
-
         self.pending_last_processed = Some(loader_last_processed);
-
         self.context
             .metrics
             .snapshot_force_unload
             .with_label_values(&[self.context.name()])
             .inc();
-        if forced_relocation && !self.state.is_dirty() {
-            // Clean entry needing relocation: hand the current levels to the
-            // flusher, which loads both L0 and L1, merges L0 on top of L1,
-            // and writes the result as a single-level blob. The cell is
-            // collapsed back to `[L0]` regardless of its pre-flush shape.
+        let flush_kind = self
+            .flush_kind()
+            .expect("entry must be dirty here (state checked above)");
+        flusher.request_flush(self.context.id(), self.cell.clone(), flush_kind);
+    }
+
+    /// Pass 2 helper: queues a force-relocation flush if any populated level lives
+    /// in a low-occupancy file. For dirty entries we issue a normal flush instead —
+    /// the new flush will naturally land past the relocation cutoff.
+    /// No IO is performed — flushes are dispatched asynchronously.
+    pub fn request_force_relocate(
+        &mut self,
+        flusher: &IndexFlusher,
+        loader_last_processed: LastProcessed,
+        relocate_files: &RelocateFiles,
+    ) {
+        if self.pending_last_processed.is_some() {
+            return;
+        }
+        // Check every populated level (not just the freshest): a `[L0, L1]` cell
+        // may have an ancient L1 in a sparse file even when L0 is fresh.
+        if !relocate_files.contains_any(self.levels.iter()) {
+            return;
+        }
+        self.context
+            .metrics
+            .snapshot_forced_relocation
+            .with_label_values(&[self.context.name()])
+            .inc();
+        self.pending_last_processed = Some(loader_last_processed);
+        self.context
+            .metrics
+            .snapshot_force_unload
+            .with_label_values(&[self.context.name()])
+            .inc();
+        if self.state.is_dirty() {
+            // Dirty entry: a normal flush of the dirty overlay lands at a fresh
+            // position past the relocation cutoff, achieving relocation.
+            let flush_kind = self
+                .flush_kind()
+                .expect("entry must be dirty here (state checked above)");
+            flusher.request_flush(self.context.id(), self.cell.clone(), flush_kind);
+        } else {
+            // Clean entry: hand the current levels to the flusher, which loads
+            // and merges them into a single-level blob at a fresh position.
             debug_assert!(
                 !self.levels.is_empty(),
                 "forced relocation requires at least one populated level",
@@ -1721,14 +1776,6 @@ impl LargeTableEntry {
                 self.cell.clone(),
                 FlushKind::ForceRelocate(self.levels.clone()),
             );
-        } else {
-            // Dirty entry (with or without forced relocation): normal flush merges
-            // the dirty overlay. For forced relocation of dirty entries, the new flush
-            // position will naturally be past force_relocate_below, achieving relocation.
-            let flush_kind = self
-                .flush_kind()
-                .expect("entry must be dirty for non-relocation async snapshot flush");
-            flusher.request_flush(self.context.id(), self.cell.clone(), flush_kind);
         }
     }
 
@@ -2180,51 +2227,6 @@ impl LargeTableContainer<SnapshotEntryData> {
     /// one position per level.
     pub fn iter_valid_val_positions(&self) -> impl Iterator<Item = WalPosition> + '_ {
         self.iter_cells().flat_map(|entry| entry.levels().iter())
-    }
-
-    /// Identifies index WAL files whose live-byte occupancy is below
-    /// `min_occupancy_pct` of `wal_file_size` (i.e. mostly dead) and that are
-    /// candidates for force-relocation.
-    ///
-    /// Each `WalPosition` carries the frame length, so live bytes are summed
-    /// directly from the snapshot — no I/O required. The most recently written
-    /// file (the one with the highest file id seen in the snapshot) is excluded:
-    /// the writer is still appending to it, so its low occupancy is transient.
-    ///
-    /// Returns a set of `WalFileId`s whose live occupancy is below the threshold.
-    /// `min_occupancy_pct == 0` disables relocation and yields an empty set.
-    pub fn compute_relocate_files(
-        &self,
-        layout: &WalLayout,
-        min_occupancy_pct: u8,
-    ) -> HashSet<WalFileId> {
-        if min_occupancy_pct == 0 {
-            return HashSet::new();
-        }
-        let mut alive_bytes: HashMap<WalFileId, u64> = HashMap::new();
-        let mut max_file_id: Option<WalFileId> = None;
-        for pos in self.iter_valid_val_positions() {
-            let file_id = layout.locate_file(pos.offset());
-            *alive_bytes.entry(file_id).or_insert(0) += pos.frame_len() as u64;
-            max_file_id = Some(max_file_id.map_or(file_id, |m| m.max(file_id)));
-        }
-        let threshold_bytes = layout
-            .wal_file_size
-            .saturating_mul(min_occupancy_pct as u64)
-            / 100;
-        alive_bytes
-            .into_iter()
-            .filter_map(|(file_id, bytes)| {
-                if Some(file_id) == max_file_id {
-                    return None;
-                }
-                if bytes < threshold_bytes {
-                    Some(file_id)
-                } else {
-                    None
-                }
-            })
-            .collect()
     }
 }
 
@@ -2766,61 +2768,6 @@ mod tests {
             assert_eq!(key.as_ref(), 50_u64.to_be_bytes()); // Should skip over the deleted 40
             assert_eq!(pos, WalPosition::test_value(5));
         }
-    }
-
-    #[test]
-    fn test_compute_relocate_files() {
-        use crate::wal::layout::WalLayout;
-        use crate::wal::position::WalPosition;
-        // Build positions across 4 files, file size 1000.
-        // File 0 (offsets 0..1000):  one position with frame_len 100  → 10% occupancy → low.
-        // File 1 (offsets 1000..2000): one position with frame_len 500 → 50% occupancy → keep.
-        // File 2 (offsets 2000..3000): one position with frame_len  50 →  5% occupancy → low,
-        //                              but it's the max-file-id slot so excluded.
-        // (No file 3 — keep the test compact.)
-        let layout = WalLayout::new_simple(1000);
-        let make = |off: u64, len: u32| WalPosition::new(off, len);
-        let entries: BTreeMap<CellId, SnapshotEntryData> = vec![
-            (
-                CellId::Integer(0),
-                SnapshotEntryData::from_levels(
-                    IndexLevels::single(make(100, 100)),
-                    LastProcessed::new_test(0),
-                ),
-            ),
-            (
-                CellId::Integer(1),
-                SnapshotEntryData::from_levels(
-                    IndexLevels::single(make(1500, 500)),
-                    LastProcessed::new_test(0),
-                ),
-            ),
-            (
-                CellId::Integer(2),
-                SnapshotEntryData::from_levels(
-                    IndexLevels::single(make(2500, 50)),
-                    LastProcessed::new_test(0),
-                ),
-            ),
-        ]
-        .into_iter()
-        .collect();
-        let container = LargeTableContainer {
-            data: vec![entries],
-        };
-
-        // 15% threshold: file 0 (10%) is low, file 1 (50%) is fine, file 2 (5%) excluded as max.
-        let low = container.compute_relocate_files(&layout, 15);
-        let expected: HashSet<WalFileId> = [layout.locate_file(100)].into_iter().collect();
-        assert_eq!(low, expected);
-
-        // Threshold 0 disables the mechanism.
-        let off = container.compute_relocate_files(&layout, 0);
-        assert!(off.is_empty());
-
-        // Empty container → empty set.
-        let empty: LargeTableContainer<SnapshotEntryData> = LargeTableContainer { data: vec![] };
-        assert!(empty.compute_relocate_files(&layout, 50).is_empty());
     }
 
     #[test]

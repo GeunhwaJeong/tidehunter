@@ -5,11 +5,10 @@ use crate::metrics::Metrics;
 use crate::wal::layout::WalLayout;
 use crate::wal::position::WalFileId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// On-disk control-region format version.
 ///
@@ -47,26 +46,11 @@ pub struct ControlRegion {
 pub(crate) struct ControlRegionStore {
     path: PathBuf,
     last_position: u64,
-    relocate_cfg: RelocateConfig,
-    /// Index WAL files whose live-byte occupancy is below
-    /// `relocate_cfg.min_occupancy_pct`. Computed from the most recently
-    /// stored snapshot; consumed by the next snapshot's prefetch pass to
-    /// trigger force-relocation of cells with positions in these files.
-    relocate_files: Arc<RelocateFiles>,
 }
 
-/// Inputs for occupancy-based force-relocation. Held by `ControlRegionStore`
-/// so it can recompute `relocate_files` whenever a new snapshot is stored.
-#[derive(Clone)]
-pub(crate) struct RelocateConfig {
-    pub layout: WalLayout,
-    pub min_occupancy_pct: u8,
-}
-
-/// Snapshot-derived set of index WAL files that should be force-relocated on
-/// the next snapshot because their live-byte occupancy is below threshold.
-/// Owns the `WalLayout` used to compute it so membership can be tested
-/// directly against a `WalPosition`.
+/// Set of index WAL files that should be force-relocated because their
+/// live-byte occupancy is below threshold. Owns the `WalLayout` used to
+/// compute it so membership can be tested directly against a `WalPosition`.
 pub struct RelocateFiles {
     files: HashSet<WalFileId>,
     layout: WalLayout,
@@ -75,6 +59,45 @@ pub struct RelocateFiles {
 impl RelocateFiles {
     pub(crate) fn new(files: HashSet<WalFileId>, layout: WalLayout) -> Self {
         Self { files, layout }
+    }
+
+    /// Builds a `RelocateFiles` from a per-file live-bytes accumulator.
+    ///
+    /// A file is selected for relocation when its live bytes are below
+    /// `wal_file_size * min_occupancy_pct / 100`. Files whose id is at or
+    /// above the file id holding `exclude_from` are skipped — those files
+    /// were created during or after the snapshot pass that built the
+    /// accumulator, so their occupancy is transient.
+    ///
+    /// `min_occupancy_pct == 0` disables relocation and yields an empty set.
+    pub(crate) fn from_accumulator(
+        alive_bytes: HashMap<WalFileId, u64>,
+        layout: WalLayout,
+        min_occupancy_pct: u8,
+        exclude_from: u64,
+    ) -> Self {
+        if min_occupancy_pct == 0 {
+            return Self::new(HashSet::new(), layout);
+        }
+        let exclude_from_file = layout.locate_file(exclude_from);
+        let threshold_bytes = layout
+            .wal_file_size
+            .saturating_mul(min_occupancy_pct as u64)
+            / 100;
+        let files = alive_bytes
+            .into_iter()
+            .filter_map(|(file_id, bytes)| {
+                if file_id >= exclude_from_file {
+                    return None;
+                }
+                if bytes < threshold_bytes {
+                    Some(file_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Self::new(files, layout)
     }
 
     /// Returns true if `pos` lives in one of the low-occupancy files.
@@ -91,6 +114,10 @@ impl RelocateFiles {
             return false;
         }
         positions.any(|p| self.contains(&p))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
     }
 }
 
@@ -246,20 +273,10 @@ impl ControlRegion {
 }
 
 impl ControlRegionStore {
-    pub fn new(
-        path: PathBuf,
-        control_region: &ControlRegion,
-        relocate_cfg: RelocateConfig,
-    ) -> Self {
-        let files = control_region
-            .snapshot
-            .compute_relocate_files(&relocate_cfg.layout, relocate_cfg.min_occupancy_pct);
-        let relocate_files = Arc::new(RelocateFiles::new(files, relocate_cfg.layout.clone()));
+    pub fn new(path: PathBuf, control_region: &ControlRegion) -> Self {
         Self {
             path,
             last_position: control_region.last_position,
-            relocate_cfg,
-            relocate_files,
         }
     }
 
@@ -275,11 +292,6 @@ impl ControlRegionStore {
             "control region last_position regressed: new={last_position} < old={}",
             self.last_position,
         );
-        let files = snapshot.compute_relocate_files(
-            &self.relocate_cfg.layout,
-            self.relocate_cfg.min_occupancy_pct,
-        );
-        let relocate_files = Arc::new(RelocateFiles::new(files, self.relocate_cfg.layout.clone()));
         let control_region = ControlRegion::new(snapshot, last_position, key_shape);
         // V2 layout: sentinel + version + bincode payload. See the comment
         // on `CONTROL_REGION_V2_SENTINEL` for the rationale.
@@ -308,7 +320,6 @@ impl ControlRegionStore {
             )
         });
         self.last_position = last_position;
-        self.relocate_files = relocate_files;
     }
 
     /// The path to the control region file
@@ -318,10 +329,6 @@ impl ControlRegionStore {
 
     pub fn last_position(&self) -> u64 {
         self.last_position
-    }
-
-    pub fn relocate_files(&self) -> Arc<RelocateFiles> {
-        self.relocate_files.clone()
     }
 }
 
@@ -430,14 +437,7 @@ mod tests {
         );
         cr.last_position = 100;
 
-        let mut store = ControlRegionStore::new(
-            path.clone(),
-            &cr,
-            RelocateConfig {
-                layout: WalLayout::new_simple(4096),
-                min_occupancy_pct: 0,
-            },
-        );
+        let mut store = ControlRegionStore::new(path.clone(), &cr);
         store.store(cr.snapshot, cr.last_position, &shape, &Metrics::new());
 
         let read_cr = ControlRegion::read(&path, &shape).unwrap();
@@ -502,5 +502,40 @@ mod tests {
             .get(&CellId::Integer(1))
             .expect("cell 1 present");
         assert!(cell1.levels.is_empty(), "INVALID ⇒ empty level list");
+    }
+
+    #[test]
+    fn test_relocate_files_from_accumulator() {
+        let layout = WalLayout::new_simple(1000);
+        let file = |off: u64| layout.locate_file(off);
+
+        // 4 files (ids 0..=3) with varying live-byte counts.
+        // wal_file_size = 1000, threshold pct = 15 ⇒ threshold_bytes = 150.
+        // file 0: 100 bytes  → low.
+        // file 1: 500 bytes  → keep.
+        // file 2:  50 bytes  → low.
+        // file 3: 200 bytes  → keep.
+        let mut acc: HashMap<WalFileId, u64> = HashMap::new();
+        acc.insert(file(100), 100);
+        acc.insert(file(1500), 500);
+        acc.insert(file(2500), 50);
+        acc.insert(file(3500), 200);
+
+        // Without exclusion (set exclude_from past every file), files 0 and 2 are flagged.
+        let rf = RelocateFiles::from_accumulator(acc.clone(), layout.clone(), 15, u64::MAX);
+        assert!(rf.contains(&WalPosition::new(100, 1)));
+        assert!(!rf.contains(&WalPosition::new(1500, 1)));
+        assert!(rf.contains(&WalPosition::new(2500, 1)));
+        assert!(!rf.contains(&WalPosition::new(3500, 1)));
+
+        // exclude_from inside file 2 ⇒ files 2 and 3 dropped from candidates.
+        let rf = RelocateFiles::from_accumulator(acc.clone(), layout.clone(), 15, 2200);
+        assert!(rf.contains(&WalPosition::new(100, 1)));
+        assert!(!rf.contains(&WalPosition::new(2500, 1)));
+        assert!(!rf.contains(&WalPosition::new(3500, 1)));
+
+        // pct == 0 disables the mechanism.
+        let rf = RelocateFiles::from_accumulator(acc, layout, 0, u64::MAX);
+        assert!(rf.is_empty());
     }
 }

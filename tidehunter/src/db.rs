@@ -2,7 +2,7 @@ use crate::batch::{PendingOp, RelocatedWriteBatch, WriteBatch, WriteBatchWrite};
 use crate::cell::CellId;
 use crate::config::Config;
 use crate::context::{DbOpKind, KsContext, KsContextVec, ReadType, WalEntryKind};
-use crate::control::{ControlRegion, ControlRegionStore, RelocateConfig};
+use crate::control::{ControlRegion, ControlRegionStore, RelocateFiles};
 use crate::crc::IntoBytesFixed;
 use crate::flusher::IndexFlusher;
 use crate::index::index_format::{IndexFormat, IndexIterCaches};
@@ -68,15 +68,8 @@ impl Db {
         Self::maybe_create_config_file(&path, &config)?;
         let wal = Wal::open(&path, config.wal_layout(WalKind::Replay), metrics.clone())?;
         let indexes = Wal::open(&path, config.wal_layout(WalKind::Index), metrics.clone())?;
-        let relocate_cfg = RelocateConfig {
-            layout: indexes.layout().clone(),
-            min_occupancy_pct: config.index_min_occupancy_pct,
-        };
-        let (control_region_store, control_region) = Self::read_or_create_control_region(
-            path.join(CONTROL_REGION_FILE),
-            &key_shape,
-            relocate_cfg,
-        )?;
+        let (control_region_store, control_region) =
+            Self::read_or_create_control_region(path.join(CONTROL_REGION_FILE), &key_shape)?;
 
         // Create channels for flusher threads first
         let (flusher_senders, flusher_receivers) = (0..config.num_flusher_threads)
@@ -295,10 +288,9 @@ impl Db {
     fn read_or_create_control_region(
         path: PathBuf,
         key_shape: &KeyShape,
-        relocate_cfg: RelocateConfig,
     ) -> Result<(ControlRegionStore, ControlRegion), DbError> {
         let control_region = ControlRegion::read_or_create(&path, key_shape);
-        let control_region_store = ControlRegionStore::new(path, &control_region, relocate_cfg);
+        let control_region_store = ControlRegionStore::new(path, &control_region);
         Ok((control_region_store, control_region))
     }
 
@@ -891,15 +883,30 @@ impl Db {
     }
 
     pub(crate) fn rebuild_control_region_from(&self, threshold_position: u64) -> DbResult<u64> {
-        let relocate_files = self.control_region_store.lock().relocate_files();
+        // Capture index writer position before pass 1 so files created by the
+        // pass-1 flushes (and pass-2 force-relocations) are excluded from the
+        // relocation candidate set built from the accumulator.
+        let pre_snapshot_index_pos = self.index_writer.position();
+        let layout = self.indexes.layout().clone();
 
-        // Pass 1: trigger async flushes for dirty/relocatable entries — no IO under cell locks
-        self.large_table
-            .prefetch_flushes_for_snapshot(self, &relocate_files, threshold_position);
-        // Wait for all queued flushes to complete before taking the snapshot
+        // Pass 1: queue async flushes for dirty entries past threshold and accumulate
+        // per-file live bytes from current on-disk levels — no IO under cell locks.
+        let alive_bytes = self
+            .large_table
+            .flush_and_accumulate(self, &layout, threshold_position);
+        // Wait for pass 1 flushes to complete before computing relocation candidates
+        // and starting pass 2.
         self.large_table.flusher.barrier();
 
-        // Pass 2: take snapshot (entries are mostly clean after the barrier)
+        let relocate_files = RelocateFiles::from_accumulator(
+            alive_bytes,
+            layout,
+            self.config.index_min_occupancy_pct,
+            pre_snapshot_index_pos,
+        );
+
+        // Pass 2: queue force-relocations for entries in low-occupancy files,
+        // wait for them, then build the snapshot.
         let mut crs = self.control_region_store.lock();
         let _timer = self
             .metrics
@@ -907,7 +914,9 @@ impl Db {
             .clone()
             .mcs_timer();
         let _snapshot_timer = self.metrics.snapshot_lock_time_mcs.clone().mcs_timer();
-        let snapshot = self.large_table.snapshot(self);
+        let snapshot = self
+            .large_table
+            .relocate_and_snapshot(self, &relocate_files);
         let min_index_position = snapshot.data.iter_valid_val_positions().min();
         if let Some(min_index_position) = min_index_position {
             self.index_writer.gc(min_index_position.offset())?;

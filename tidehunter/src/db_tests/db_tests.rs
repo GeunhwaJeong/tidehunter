@@ -3034,30 +3034,15 @@ fn test_force_relocate_dirty_entry_preserves_data() {
             "updated value should be readable before snapshot"
         );
 
-        let forced_relocation_before = metrics
-            .snapshot_forced_relocation
-            .with_label_values(&["rare"])
-            .get();
-
-        // --- Phase 4: Snapshot — triggers forced relocation ---
-        // The rare entry's on-disk position is in an old index file that's
-        // mostly dead (bulk entries' blobs have moved to newer files), so its
-        // file occupancy is below `index_min_occupancy_pct` and ForceRelocate
-        // is requested. With the bug, ForceRelocate copies the stale on-disk
-        // index and advances last_processed past the dirty write's WAL position.
+        // --- Phase 4: Snapshot ---
+        // The rare entry is dirty going into the snapshot. In the two-pass
+        // design, pass 1 issues a normal flush of the dirty overlay (preserving
+        // the new value) before pass 2 ever considers force-relocation. So
+        // the historical bug — ForceRelocate copying the stale on-disk index
+        // and dropping the dirty overlay — is structurally impossible here.
+        // The crash-recovery check below verifies the dirty write survives.
         db.force_rebuild_control_region()
             .expect("final snapshot failed");
-
-        let forced_relocation_after = metrics
-            .snapshot_forced_relocation
-            .with_label_values(&["rare"])
-            .get();
-
-        // Verify forced relocation actually happened for the rare entry
-        assert!(
-            forced_relocation_after > forced_relocation_before,
-            "forced relocation should have been triggered for the rare entry"
-        );
 
         // Verify value is still correct in memory after snapshot
         let val = db.get(ks_rare, &rare_key).expect("get failed");
