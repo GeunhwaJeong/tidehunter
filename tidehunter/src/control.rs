@@ -1,6 +1,7 @@
 use crate::WalPosition;
+use crate::container::LargeTableContainer;
 use crate::key_shape::KeyShape;
-use crate::large_table::{LargeTableContainer, SnapshotEntryData};
+use crate::large_table::SnapshotEntryData;
 use crate::metrics::Metrics;
 use crate::wal::layout::WalLayout;
 use crate::wal::position::WalFileId;
@@ -342,8 +343,9 @@ impl ControlRegionStore {
 mod legacy_v1 {
     use super::ControlRegion;
     use crate::cell::CellId;
+    use crate::container::LargeTableContainer;
     use crate::index::levels::IndexLevels;
-    use crate::large_table::{LargeTableContainer, SnapshotEntryData};
+    use crate::large_table::SnapshotEntryData;
     use crate::wal::position::{LastProcessed, WalPosition};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;

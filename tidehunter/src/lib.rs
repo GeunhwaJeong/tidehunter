@@ -1,6 +1,8 @@
 pub mod batch;
 mod cell;
 pub mod config;
+#[doc(hidden)] // Used by tools/tideconsole for control region inspection
+pub mod container;
 mod context;
 #[doc(hidden)] // Used by tools/tideconsole for control region inspection
 pub mod control;
