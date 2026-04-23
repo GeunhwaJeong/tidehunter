@@ -69,8 +69,29 @@ pub enum LookupSource {
     Lru,
     Bloom,
     Cache,
-    Lookup,
+    /// On-disk lookup that was resolved at L0 (the freshest blob) — either
+    /// hit, tombstone-shadowed, or missed on a single-level cell.
+    #[strum(serialize = "index_0")]
+    Index0,
+    /// On-disk lookup that walked past L0 and resolved at L1 (hit or miss).
+    /// Non-zero `index_1` counts indicate the two-level LSM is being
+    /// exercised on the read path.
+    #[strum(serialize = "index_1")]
+    Index1,
     Prefix,
+}
+
+impl LookupSource {
+    /// Maps the level at which a miss-chain walk terminated to a
+    /// `LookupSource`. Levels beyond 1 are folded into `Index1` — the
+    /// flusher currently produces at most two levels, so this is only hit
+    /// if the schema grows.
+    pub fn for_level(level: usize) -> Self {
+        match level {
+            0 => LookupSource::Index0,
+            _ => LookupSource::Index1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, EnumIter, EnumCount, AsRefStr, FromRepr)]

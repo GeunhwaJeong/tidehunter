@@ -1229,14 +1229,19 @@ fn test_bloom_filter() {
     for i in 1000..2000u64 {
         assert!(!db.exists(ks, &i.to_be_bytes()).unwrap());
     }
-    let found = metrics
+    let cache = metrics
         .lookup_result
         .with_label_values(&["k", "found", "cache"])
-        .get()
-        + metrics
-            .lookup_result
-            .with_label_values(&["k", "found", "lookup"])
-            .get();
+        .get();
+    let i0 = metrics
+        .lookup_result
+        .with_label_values(&["k", "found", "index_0"])
+        .get();
+    let i1 = metrics
+        .lookup_result
+        .with_label_values(&["k", "found", "index_1"])
+        .get();
+    let found = cache + i0 + i1;
     let not_found_bloom = metrics
         .lookup_result
         .with_label_values(&["k", "not_found", "bloom"])
@@ -2288,7 +2293,11 @@ fn test_bloom_filter_restore() {
         .get()
         + metrics
             .lookup_result
-            .with_label_values(&["k", "found", "lookup"])
+            .with_label_values(&["k", "found", "index_0"])
+            .get()
+        + metrics
+            .lookup_result
+            .with_label_values(&["k", "found", "index_1"])
             .get();
     let not_found_bloom = metrics
         .lookup_result
@@ -2448,8 +2457,12 @@ fn test_variable_length_keys_many() {
 
         let on_disk_found = metrics
             .lookup_result
-            .with_label_values(&["root", "found", "lookup"])
-            .get();
+            .with_label_values(&["root", "found", "index_0"])
+            .get()
+            + metrics
+                .lookup_result
+                .with_label_values(&["root", "found", "index_1"])
+                .get();
         let cache_found = metrics
             .lookup_result
             .with_label_values(&["root", "found", "cache"])
@@ -2471,8 +2484,12 @@ fn test_variable_length_keys_many() {
         // loop above), so they all land in the on-disk not_found bucket.
         let on_disk_not_found = metrics
             .lookup_result
-            .with_label_values(&["root", "not_found", "lookup"])
-            .get();
+            .with_label_values(&["root", "not_found", "index_0"])
+            .get()
+            + metrics
+                .lookup_result
+                .with_label_values(&["root", "not_found", "index_1"])
+                .get();
         assert_eq!(
             ABSENT_KEYS.len() as u64,
             on_disk_not_found,

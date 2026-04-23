@@ -68,7 +68,15 @@ pub enum FlushKind {
         current_levels: IndexLevels,
         loaded: bool,
     },
-    ForceRelocate(WalPosition),
+    /// Re-write a clean entry's on-disk blobs past `force_relocate_below`.
+    ///
+    /// The flusher collapses all populated levels into a single new blob
+    /// (L0 wins on overlap). The output is always single-level; callers
+    /// that care about level-specific rewriting must add a richer variant
+    /// — today collapse-on-relocate trades a one-time WAF penalty (L1
+    /// rewritten even when only L0 was below cutoff) for a simpler code
+    /// path and a reduced level count afterwards.
+    ForceRelocate(IndexLevels),
 }
 
 impl IndexFlusher {
@@ -200,8 +208,10 @@ impl IndexFlusherThread {
         // state; we honour the sentinel (empty L0 slot after a prior promote)
         // so post-promote cells start a fresh L0 with just the overlay.
         //
-        // `ForceRelocate` still addresses a single blob — TODO(levels-generic)
-        // below tracks generalizing it to per-level relocation.
+        // `ForceRelocate` collapses L0 + L1 into a single blob so the output
+        // is always single-level (`existing_l1 = None`). Downstream this means
+        // the non-promote branch will `clean_self` (since no L1 sits below)
+        // and emit `IndexLevels::single(new_pos)`.
         let (original_index, mut merged_l0, existing_l1) = match &command.flush_kind {
             FlushKind::Flush {
                 dirty,
@@ -231,20 +241,29 @@ impl IndexFlusherThread {
                 };
                 (dirty.clone(), merged, current_levels.l1())
             }
-            FlushKind::ForceRelocate(position) => {
-                // TODO(levels-generic): force-relocate still rewrites a single
-                // blob. In two-level mode we rewrite whichever level the
-                // caller addressed and pretend it's L0 for now. When
-                // relocation becomes per-level-aware this branch should
-                // carry the source level.
+            FlushKind::ForceRelocate(levels) => {
+                // Collapse L0 + L1 into a single blob. Start from L1 (the
+                // deeper level) and merge L0 on top so L0 wins on overlap,
+                // matching the read-path precedence. The result is handed
+                // downstream as `merged_l0` with `existing_l1 = None`, so
+                // the non-promote branch writes it as a single level and
+                // strips tombstones (since nothing sits below it).
+                //
+                // Force-relocate runs on clean entries only (see
+                // `request_async_snapshot_flush`), so there is no dirty
+                // overlay to worry about here.
                 ctx.metrics
                     .unload
                     .with_label_values(&["force_relocate"])
                     .inc();
-                let disk_index = loader
-                    .load(&ctx.ks_config, *position)
-                    .expect("Failed to load index for forced relocation");
-                let arc_index = Arc::new(disk_index);
+                let mut merged = Self::load_l1_or_default(loader, ctx, levels.l1());
+                if let Some(l0_pos) = levels.l0() {
+                    let l0 = loader
+                        .load(&ctx.ks_config, l0_pos)
+                        .expect("Failed to load L0 for forced relocation");
+                    merged.merge_dirty_and_clean(&l0);
+                }
+                let arc_index = Arc::new(merged);
                 (arc_index.clone(), IndexTable::clone(&arc_index), None)
             }
         };

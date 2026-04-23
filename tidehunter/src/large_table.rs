@@ -524,31 +524,33 @@ impl LargeTable {
         let now = Instant::now();
         // todo - consider only doing block_in_place for the syscall random reader
         // TODO: handle entries that may be removed by relocation but are still referenced in the index
-        let (result, read_type) = runtime::block_in_place(|| {
+        let (result, read_type, terminal_level) = runtime::block_in_place(|| {
             // `index_readers` is non-empty (guarded by the `level_positions.is_empty()`
             // check above), and the loop reassigns `last_read_type` on every iteration
             // before the early-return branches can fire — so the init is just a seed.
             let mut last_read_type = index_readers[0].read_type();
-            for reader in &index_readers {
+            let mut last_level = 0usize;
+            for (level, reader) in index_readers.iter().enumerate() {
                 last_read_type = reader.read_type();
+                last_level = level;
                 match ks
                     .index_format()
                     .lookup_unloaded(ks, reader, k, &self.metrics)
                 {
                     // Valid hit — return it.
-                    Some(pos) if pos.is_valid() => return (Some(pos), last_read_type),
+                    Some(pos) if pos.is_valid() => return (Some(pos), last_read_type, level),
                     // On-disk tombstone shadows any key in deeper levels.
-                    Some(_) => return (None, last_read_type),
+                    Some(_) => return (None, last_read_type, level),
                     // Miss on this level — continue to the next one.
                     None => {}
                 }
             }
-            (None, last_read_type)
+            (None, last_read_type, last_level)
         });
         context
             .lookup_mcs_histogram(read_type)
             .observe(now.elapsed().as_micros() as f64);
-        Ok(context.report_lookup_result(result, LookupSource::Lookup))
+        Ok(context.report_lookup_result(result, LookupSource::for_level(terminal_level)))
     }
 
     fn fp_lookup_after_lock_drop_if_needed(&self) {
@@ -1673,10 +1675,15 @@ impl LargeTableEntry {
         if self.pending_last_processed.is_some() {
             return;
         }
-        let forced_relocation = if let (Some(index_wal_position), Some(force_relocate_below)) =
-            (self.wal_position().valid(), force_relocate_below)
+        // Trigger relocation if *any* populated level sits below the cutoff —
+        // `levels.oldest()` picks the deepest-populated slot, which has the
+        // smallest offset and is the one most likely to be stale. Looking at
+        // the freshest level only (as `wal_position()` would) would miss a
+        // post-promote `[L0, L1]` cell where L1 is ancient but L0 is fresh.
+        let forced_relocation = if let (Some(oldest), Some(force_relocate_below)) =
+            (self.levels.oldest(), force_relocate_below)
         {
-            index_wal_position < force_relocate_below
+            oldest < force_relocate_below
         } else {
             false
         };
@@ -1706,28 +1713,18 @@ impl LargeTableEntry {
             .with_label_values(&[self.context.name()])
             .inc();
         if forced_relocation && !self.state.is_dirty() {
-            // Clean entry needing relocation: re-read from old position and re-write.
-            //
-            // TODO(levels-generic): ForceRelocate rewrites a single on-disk blob
-            // and the matching `update_relocated_position` overwrites the whole
-            // `levels` with the flusher's single-slot response. For a multi-level
-            // entry (e.g. `[L0, L1]`) that silently drops the L1 slot. Until the
-            // relocation path becomes level-aware, require at-most-one populated
-            // level here — for `[L0]` and `[INVALID, L1]` the round-trip preserves
-            // content. See docs/two_level_lsm_design.md.
-            assert!(
-                self.levels.is_single_level(),
-                "force-relocate on multi-level entry not yet supported (levels = {:?})",
-                self.levels,
+            // Clean entry needing relocation: hand the current levels to the
+            // flusher, which loads both L0 and L1, merges L0 on top of L1,
+            // and writes the result as a single-level blob. The cell is
+            // collapsed back to `[L0]` regardless of its pre-flush shape.
+            debug_assert!(
+                !self.levels.is_empty(),
+                "forced relocation requires at least one populated level",
             );
-            let old_position = self
-                .wal_position()
-                .valid()
-                .expect("forced relocation entry must have valid wal position");
             flusher.request_flush(
                 self.context.id(),
                 self.cell.clone(),
-                FlushKind::ForceRelocate(old_position),
+                FlushKind::ForceRelocate(self.levels.clone()),
             );
         } else {
             // Dirty entry (with or without forced relocation): normal flush merges
@@ -1746,11 +1743,13 @@ impl LargeTableEntry {
     pub fn update_relocated_position(&mut self, new_levels: IndexLevels) {
         self.commit_pending_last_processed();
         // Update levels. New writes may have arrived making the entry dirty —
-        // in that case, just update the on-disk levels. The dirty overlay remains valid.
-        // TODO(levels-generic): force-relocate rewrites the sole on-disk blob today;
-        // with L0 + L1, only the level that was relocated should be replaced.
-        // The request site (`request_async_snapshot_flush`) enforces single-level
-        // entries so an `[L0, L1]` shape can't reach here and lose L1 on overwrite.
+        // in that case, just update the on-disk levels. The dirty overlay
+        // remains valid.
+        //
+        // Force-relocate collapses all populated levels into a single new
+        // blob, so `new_levels` is always single-level here. Overwriting
+        // `self.levels` wholesale is intentional: any pre-flush L1 was
+        // consumed into the collapsed output.
         debug_assert!(
             new_levels.is_single_level(),
             "force-relocate must produce at-most-one populated level (got {:?})",

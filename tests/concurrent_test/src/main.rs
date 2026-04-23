@@ -667,6 +667,37 @@ fn main() {
         .with_label_values(&["index"])
         .get();
     println!("  index_gc_position: {index_gc_position}");
+
+    // Two-level LSM visibility: did the run actually exercise L1?
+    // `index_0` / `index_1` break down the on-disk read path; a non-zero
+    // `index_1` (for either Found or NotFound) means lookups fell through L0.
+    for ks in ["main", "secondary"] {
+        let l0_bytes = shared_metrics
+            .l0_bytes_written
+            .with_label_values(&[ks])
+            .get();
+        let l1_bytes = shared_metrics
+            .l1_bytes_written
+            .with_label_values(&[ks])
+            .get();
+        let promotes = shared_metrics.promote_total.with_label_values(&[ks]).get();
+        let mut read_index_0 = 0u64;
+        let mut read_index_1 = 0u64;
+        for result in ["found", "not_found"] {
+            read_index_0 += shared_metrics
+                .lookup_result
+                .with_label_values(&[ks, result, "index_0"])
+                .get();
+            read_index_1 += shared_metrics
+                .lookup_result
+                .with_label_values(&[ks, result, "index_1"])
+                .get();
+        }
+        println!(
+            "  lsm[{ks}]: l0_bytes={l0_bytes} l1_bytes={l1_bytes} promotes={promotes} \
+             reads_index_0={read_index_0} reads_index_1={read_index_1}"
+        );
+    }
     drop(db_read);
 
     println!("\nTest passed successfully!");
