@@ -2,10 +2,14 @@ use crate::WalPosition;
 use crate::key_shape::KeyShape;
 use crate::large_table::{LargeTableContainer, SnapshotEntryData};
 use crate::metrics::Metrics;
+use crate::wal::layout::WalLayout;
+use crate::wal::position::WalFileId;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// On-disk control-region format version.
 ///
@@ -43,7 +47,51 @@ pub struct ControlRegion {
 pub(crate) struct ControlRegionStore {
     path: PathBuf,
     last_position: u64,
-    force_relocation_position: Option<WalPosition>,
+    relocate_cfg: RelocateConfig,
+    /// Index WAL files whose live-byte occupancy is below
+    /// `relocate_cfg.min_occupancy_pct`. Computed from the most recently
+    /// stored snapshot; consumed by the next snapshot's prefetch pass to
+    /// trigger force-relocation of cells with positions in these files.
+    relocate_files: Arc<RelocateFiles>,
+}
+
+/// Inputs for occupancy-based force-relocation. Held by `ControlRegionStore`
+/// so it can recompute `relocate_files` whenever a new snapshot is stored.
+#[derive(Clone)]
+pub(crate) struct RelocateConfig {
+    pub layout: WalLayout,
+    pub min_occupancy_pct: u8,
+}
+
+/// Snapshot-derived set of index WAL files that should be force-relocated on
+/// the next snapshot because their live-byte occupancy is below threshold.
+/// Owns the `WalLayout` used to compute it so membership can be tested
+/// directly against a `WalPosition`.
+pub struct RelocateFiles {
+    files: HashSet<WalFileId>,
+    layout: WalLayout,
+}
+
+impl RelocateFiles {
+    pub(crate) fn new(files: HashSet<WalFileId>, layout: WalLayout) -> Self {
+        Self { files, layout }
+    }
+
+    /// Returns true if `pos` lives in one of the low-occupancy files.
+    pub fn contains(&self, pos: &WalPosition) -> bool {
+        if self.files.is_empty() {
+            return false;
+        }
+        self.files.contains(&self.layout.locate_file(pos.offset()))
+    }
+
+    /// Returns true if any position in `positions` lives in a low-occupancy file.
+    pub fn contains_any(&self, mut positions: impl Iterator<Item = WalPosition>) -> bool {
+        if self.files.is_empty() {
+            return false;
+        }
+        positions.any(|p| self.contains(&p))
+    }
 }
 
 impl ControlRegion {
@@ -197,16 +245,21 @@ impl ControlRegion {
     }
 }
 
-const FORCE_RELOCATION_PCT: usize = 99;
-
 impl ControlRegionStore {
-    pub fn new(path: PathBuf, control_region: &ControlRegion) -> Self {
+    pub fn new(
+        path: PathBuf,
+        control_region: &ControlRegion,
+        relocate_cfg: RelocateConfig,
+    ) -> Self {
+        let files = control_region
+            .snapshot
+            .compute_relocate_files(&relocate_cfg.layout, relocate_cfg.min_occupancy_pct);
+        let relocate_files = Arc::new(RelocateFiles::new(files, relocate_cfg.layout.clone()));
         Self {
             path,
             last_position: control_region.last_position,
-            force_relocation_position: control_region
-                .snapshot
-                .pct_wal_position(FORCE_RELOCATION_PCT),
+            relocate_cfg,
+            relocate_files,
         }
     }
 
@@ -222,7 +275,11 @@ impl ControlRegionStore {
             "control region last_position regressed: new={last_position} < old={}",
             self.last_position,
         );
-        let force_relocation_position = snapshot.pct_wal_position(FORCE_RELOCATION_PCT);
+        let files = snapshot.compute_relocate_files(
+            &self.relocate_cfg.layout,
+            self.relocate_cfg.min_occupancy_pct,
+        );
+        let relocate_files = Arc::new(RelocateFiles::new(files, self.relocate_cfg.layout.clone()));
         let control_region = ControlRegion::new(snapshot, last_position, key_shape);
         // V2 layout: sentinel + version + bincode payload. See the comment
         // on `CONTROL_REGION_V2_SENTINEL` for the rationale.
@@ -251,7 +308,7 @@ impl ControlRegionStore {
             )
         });
         self.last_position = last_position;
-        self.force_relocation_position = force_relocation_position;
+        self.relocate_files = relocate_files;
     }
 
     /// The path to the control region file
@@ -263,8 +320,8 @@ impl ControlRegionStore {
         self.last_position
     }
 
-    pub fn force_relocation_position(&self) -> Option<WalPosition> {
-        self.force_relocation_position
+    pub fn relocate_files(&self) -> Arc<RelocateFiles> {
+        self.relocate_files.clone()
     }
 }
 
@@ -373,7 +430,14 @@ mod tests {
         );
         cr.last_position = 100;
 
-        let mut store = ControlRegionStore::new(path.clone(), &cr);
+        let mut store = ControlRegionStore::new(
+            path.clone(),
+            &cr,
+            RelocateConfig {
+                layout: WalLayout::new_simple(4096),
+                min_occupancy_pct: 0,
+            },
+        );
         store.store(cr.snapshot, cr.last_position, &shape, &Metrics::new());
 
         let read_cr = ControlRegion::read(&path, &shape).unwrap();

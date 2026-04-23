@@ -43,6 +43,12 @@ pub struct Config {
     /// Maximum percentage of disk space that relocation can reclaim in a single run (0-100)
     #[serde(default = "default_relocation_max_reclaim_pct")]
     pub relocation_max_reclaim_pct: u8,
+    /// Minimum live-byte occupancy (percent of `wal_file_size`) for an index WAL file to be
+    /// kept as-is. Files below this threshold (excluding the most recently written file) get
+    /// their cells force-relocated on the next snapshot, freeing the file for GC. 0 disables
+    /// occupancy-based force-relocation entirely.
+    #[serde(default = "default_index_min_occupancy_pct")]
+    pub index_min_occupancy_pct: u8,
     /// Enable Tidehunter runtime metrics collection
     #[serde(default = "default_metrics_enabled")]
     pub metrics_enabled: bool,
@@ -79,6 +85,10 @@ fn default_relocation_max_reclaim_pct() -> u8 {
     5
 }
 
+fn default_index_min_occupancy_pct() -> u8 {
+    15
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -96,6 +106,7 @@ impl Default for Config {
             wal_file_size: 10 * (1 << 30), // 10Gb
             relocation_strategy: RelocationStrategy::default(),
             relocation_max_reclaim_pct: default_relocation_max_reclaim_pct(),
+            index_min_occupancy_pct: default_index_min_occupancy_pct(),
             metrics_enabled: true,
             commit_pool_size: 0,
             num_pending_promotion_threads: default_num_pending_promotion_threads(),
@@ -122,6 +133,7 @@ impl Config {
             relocation_strategy: RelocationStrategy::default(),
             metrics_enabled: true,
             relocation_max_reclaim_pct: 100,
+            index_min_occupancy_pct: default_index_min_occupancy_pct(),
             commit_pool_size: 0,
             num_pending_promotion_threads: default_num_pending_promotion_threads(),
             open_lock_retry_timeout: default_open_lock_retry_timeout(),

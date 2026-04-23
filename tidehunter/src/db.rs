@@ -2,7 +2,7 @@ use crate::batch::{PendingOp, RelocatedWriteBatch, WriteBatch, WriteBatchWrite};
 use crate::cell::CellId;
 use crate::config::Config;
 use crate::context::{DbOpKind, KsContext, KsContextVec, ReadType, WalEntryKind};
-use crate::control::{ControlRegion, ControlRegionStore};
+use crate::control::{ControlRegion, ControlRegionStore, RelocateConfig};
 use crate::crc::IntoBytesFixed;
 use crate::flusher::IndexFlusher;
 use crate::index::index_format::{IndexFormat, IndexIterCaches};
@@ -66,10 +66,17 @@ impl Db {
         let lock = DbLock::acquire(&path, config.open_lock_retry_timeout)?;
         Self::maybe_create_shape_file(&path, &key_shape)?;
         Self::maybe_create_config_file(&path, &config)?;
-        let (control_region_store, control_region) =
-            Self::read_or_create_control_region(path.join(CONTROL_REGION_FILE), &key_shape)?;
         let wal = Wal::open(&path, config.wal_layout(WalKind::Replay), metrics.clone())?;
         let indexes = Wal::open(&path, config.wal_layout(WalKind::Index), metrics.clone())?;
+        let relocate_cfg = RelocateConfig {
+            layout: indexes.layout().clone(),
+            min_occupancy_pct: config.index_min_occupancy_pct,
+        };
+        let (control_region_store, control_region) = Self::read_or_create_control_region(
+            path.join(CONTROL_REGION_FILE),
+            &key_shape,
+            relocate_cfg,
+        )?;
 
         // Create channels for flusher threads first
         let (flusher_senders, flusher_receivers) = (0..config.num_flusher_threads)
@@ -288,9 +295,10 @@ impl Db {
     fn read_or_create_control_region(
         path: PathBuf,
         key_shape: &KeyShape,
+        relocate_cfg: RelocateConfig,
     ) -> Result<(ControlRegionStore, ControlRegion), DbError> {
         let control_region = ControlRegion::read_or_create(&path, key_shape);
-        let control_region_store = ControlRegionStore::new(path, &control_region);
+        let control_region_store = ControlRegionStore::new(path, &control_region, relocate_cfg);
         Ok((control_region_store, control_region))
     }
 
@@ -883,14 +891,11 @@ impl Db {
     }
 
     pub(crate) fn rebuild_control_region_from(&self, threshold_position: u64) -> DbResult<u64> {
-        let force_relocate_below = self.control_region_store.lock().force_relocation_position();
+        let relocate_files = self.control_region_store.lock().relocate_files();
 
         // Pass 1: trigger async flushes for dirty/relocatable entries — no IO under cell locks
-        self.large_table.prefetch_flushes_for_snapshot(
-            self,
-            force_relocate_below,
-            threshold_position,
-        );
+        self.large_table
+            .prefetch_flushes_for_snapshot(self, &relocate_files, threshold_position);
         // Wait for all queued flushes to complete before taking the snapshot
         self.large_table.flusher.barrier();
 

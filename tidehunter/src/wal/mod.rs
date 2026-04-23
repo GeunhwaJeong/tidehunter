@@ -360,6 +360,10 @@ impl Wal {
         self.layout.wal_file_size
     }
 
+    pub fn layout(&self) -> &WalLayout {
+        &self.layout
+    }
+
     /// Returns the file descriptor of the wal file
     #[cfg(test)]
     pub(crate) fn file(&self) -> File {

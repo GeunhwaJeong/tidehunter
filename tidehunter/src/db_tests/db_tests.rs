@@ -2827,6 +2827,109 @@ fn db_test_snapshot_unload_threshold() {
 ///    The buggy code uses ForceRelocate which copies the stale on-disk index
 ///    (missing the dirty write) and advances `last_processed` past the dirty write.
 /// 5. Simulate crash recovery (drop + reopen). The dirty write should be present.
+/// Validates the file-occupancy index GC path end-to-end.
+///
+/// Tiny index files (8 KiB) guarantee that a moderate number of flushes fills
+/// several files, and that each file's live bytes sit well below the configured
+/// threshold. With `index_min_occupancy_pct` disabled (0), low-occupancy files
+/// accumulate and `min_wal_position` stays pinned. With the threshold enabled,
+/// ForceRelocate fires during snapshots and drains the old files so the GC
+/// watermark advances.
+///
+/// The comparison is the core correctness signal: same workload, same knobs —
+/// the only difference is whether occupancy-based relocation runs.
+#[test]
+fn test_index_gc_low_occupancy_files_relocated() {
+    fn run(min_occupancy_pct: u8) -> (u64, u64) {
+        let dir = tempdir::TempDir::new("test_index_gc_low_occupancy").unwrap();
+        let mut config = Config::small();
+        config.frag_size = 8 * 1024;
+        config.wal_file_size = 8 * 1024;
+        config.index_min_occupancy_pct = min_occupancy_pct;
+        config.snapshot_unload_threshold = 0;
+        config.max_dirty_keys = 100_000;
+        let config = Arc::new(config);
+
+        let mut builder = KeyShapeBuilder::new();
+        // "rare" — written once and never again. Its blob sits in the earliest
+        // index file and pins `min_wal_position` unless ForceRelocate moves it.
+        let ks_rare = builder.add_key_space("rare", 8, 1, KeyType::uniform(1));
+        let ks_bulk = builder.add_key_space("bulk", 8, 4, KeyType::uniform(4));
+        let key_shape = builder.build();
+
+        let metrics = Metrics::new();
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            metrics.clone(),
+        )
+        .expect("open failed");
+
+        let bulk_key = |i: u32| -> Vec<u8> {
+            let mut k = [0u8; 8];
+            k[..4].copy_from_slice(&i.to_be_bytes());
+            k.to_vec()
+        };
+        let rare_key = 0u64.to_be_bytes().to_vec();
+
+        db.insert(ks_rare, rare_key.clone(), vec![0x11; 16])
+            .expect("insert rare");
+
+        let num_bulk: u32 = 64;
+        let step = u32::MAX / num_bulk;
+
+        // Several rounds of rewrite-then-snapshot. Bulk cells get re-flushed
+        // every round, so their blobs keep moving into the newest file; rare
+        // is never touched and stays in whatever file it was first flushed to.
+        for round in 0..4u8 {
+            for i in 0..num_bulk {
+                db.insert(ks_bulk, bulk_key(i * step), vec![round; 16])
+                    .expect("insert bulk");
+            }
+            db.wal_writer.wal_tracker_barrier();
+            db.force_rebuild_control_region().expect("snapshot");
+        }
+
+        // Sanity: rare's original value and the last-round bulk values survive.
+        let v = db.get(ks_rare, &rare_key).expect("get rare");
+        assert_eq!(v.as_deref(), Some(&[0x11; 16][..]));
+        for i in 0..num_bulk {
+            let v = db.get(ks_bulk, &bulk_key(i * step)).expect("get bulk");
+            assert_eq!(v.as_deref(), Some(&[3u8; 16][..]));
+        }
+
+        // Wait for the mapper thread to process any pending GC messages.
+        thread::sleep(Duration::from_millis(200));
+
+        let forced = metrics
+            .snapshot_forced_relocation
+            .with_label_values(&["rare"])
+            .get();
+        (db.indexes.min_wal_position(), forced)
+    }
+
+    let (min_pos_off, forced_off) = run(0);
+    let (min_pos_on, forced_on) = run(99);
+
+    assert_eq!(
+        min_pos_off, 0,
+        "with occupancy GC disabled, rare blob pins file 0 and min_wal_position stays at 0",
+    );
+    assert_eq!(
+        forced_off, 0,
+        "with occupancy GC disabled, ForceRelocate should never fire for rare",
+    );
+    assert!(
+        min_pos_on > 0,
+        "with occupancy GC enabled, rare should be relocated and min_wal_position should advance; got {min_pos_on}",
+    );
+    assert!(
+        forced_on > 0,
+        "with occupancy GC enabled, ForceRelocate should fire for rare; got {forced_on}",
+    );
+}
+
 #[test]
 fn test_force_relocate_dirty_entry_preserves_data() {
     let dir = tempdir::TempDir::new("test_force_relocate_dirty").unwrap();
@@ -2835,6 +2938,12 @@ fn test_force_relocate_dirty_entry_preserves_data() {
     config.snapshot_unload_threshold = 0;
     // Prevent automatic inline flushing due to dirty key limits
     config.max_dirty_keys = 100_000;
+    // Tiny index files so the per-file occupancy GC fires quickly: each round
+    // of bulk flushes spans multiple files, leaving the rare entry's blob in
+    // an old file by itself (≪ threshold).
+    config.frag_size = 8 * 1024;
+    config.wal_file_size = 8 * 1024;
+    config.index_min_occupancy_pct = 99;
     let config = Arc::new(config);
 
     // "rare" keyspace: 1 cell — the rarely-updated entry
@@ -2931,10 +3040,11 @@ fn test_force_relocate_dirty_entry_preserves_data() {
             .get();
 
         // --- Phase 4: Snapshot — triggers forced relocation ---
-        // The rare entry's on-disk position is always the lowest in the snapshot
-        // (flushed first), so it falls below force_relocate_below (99th percentile).
-        // With the bug, ForceRelocate copies the stale on-disk index and advances
-        // last_processed past the dirty write's WAL position.
+        // The rare entry's on-disk position is in an old index file that's
+        // mostly dead (bulk entries' blobs have moved to newer files), so its
+        // file occupancy is below `index_min_occupancy_pct` and ForceRelocate
+        // is requested. With the bug, ForceRelocate copies the stale on-disk
+        // index and advances last_processed past the dirty write's WAL position.
         db.force_rebuild_control_region()
             .expect("final snapshot failed");
 

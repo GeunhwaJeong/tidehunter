@@ -1,6 +1,7 @@
 use crate::cell::{CellId, CellIdBytesContainer};
 use crate::config::Config;
 use crate::context::{KsContext, LookupResult, LookupSource};
+use crate::control::RelocateFiles;
 use crate::flusher::{FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread};
 use crate::index::index_format::{Direction, IndexFormat, IndexIterCaches};
 use crate::index::index_table::IndexTable;
@@ -16,7 +17,8 @@ use crate::primitives::sharded_mutex::ShardedMutex;
 use crate::relocation::updates::RelocationUpdates;
 use crate::runtime;
 use crate::wal::WalRandomRead;
-use crate::wal::position::{LastProcessed, WalPosition};
+use crate::wal::layout::WalLayout;
+use crate::wal::position::{LastProcessed, WalFileId, WalPosition};
 use crate::wal::tracker::WalGuard;
 use bloom::{ASMS, BloomFilter};
 use lru::LruCache;
@@ -1192,7 +1194,7 @@ impl LargeTable {
     pub(crate) fn prefetch_flushes_for_snapshot<L: Loader>(
         &self,
         loader: &L,
-        force_relocate_below: Option<WalPosition>,
+        relocate_files: &RelocateFiles,
         threshold_position: u64,
     ) {
         for ks_table in self.table.iter() {
@@ -1206,7 +1208,7 @@ impl LargeTable {
                     entry.request_async_snapshot_flush(
                         &self.flusher,
                         loader_last_processed,
-                        force_relocate_below,
+                        relocate_files,
                         threshold_position,
                     );
                 }
@@ -1668,25 +1670,18 @@ impl LargeTableEntry {
         &mut self,
         flusher: &IndexFlusher,
         loader_last_processed: LastProcessed,
-        force_relocate_below: Option<WalPosition>,
+        relocate_files: &RelocateFiles,
         threshold_position: u64,
     ) {
         // Skip if already has a pending flush in flight
         if self.pending_last_processed.is_some() {
             return;
         }
-        // Trigger relocation if *any* populated level sits below the cutoff —
-        // `levels.oldest()` picks the deepest-populated slot, which has the
-        // smallest offset and is the one most likely to be stale. Looking at
-        // the freshest level only (as `wal_position()` would) would miss a
-        // post-promote `[L0, L1]` cell where L1 is ancient but L0 is fresh.
-        let forced_relocation = if let (Some(oldest), Some(force_relocate_below)) =
-            (self.levels.oldest(), force_relocate_below)
-        {
-            oldest < force_relocate_below
-        } else {
-            false
-        };
+        // Trigger relocation if *any* populated level lives in a low-occupancy
+        // index file. We check every level (not just the freshest) because a
+        // post-promote `[L0, L1]` cell may have an ancient L1 in a sparse file
+        // even when L0 is fresh.
+        let forced_relocation = relocate_files.contains_any(self.levels.iter());
         if forced_relocation {
             self.context
                 .metrics
@@ -2187,32 +2182,49 @@ impl LargeTableContainer<SnapshotEntryData> {
         self.iter_cells().flat_map(|entry| entry.levels().iter())
     }
 
-    /// Returns a given percentile across valid wal positions in the container.
+    /// Identifies index WAL files whose live-byte occupancy is below
+    /// `min_occupancy_pct` of `wal_file_size` (i.e. mostly dead) and that are
+    /// candidates for force-relocation.
     ///
-    /// In other words, for a given pct,
-    /// returns WalPosition so that pct% of wal positions in the container
-    /// are above the returned WalPosition.
+    /// Each `WalPosition` carries the frame length, so live bytes are summed
+    /// directly from the snapshot — no I/O required. The most recently written
+    /// file (the one with the highest file id seen in the snapshot) is excluded:
+    /// the writer is still appending to it, so its low occupancy is transient.
     ///
-    /// Returns None if the container is empty or does not contain any valid wal positions.
-    pub fn pct_wal_position(&self, pct: usize) -> Option<WalPosition> {
-        // Collect all valid WAL positions
-        let mut positions: Vec<WalPosition> = self.iter_valid_val_positions().collect();
-
-        if positions.is_empty() {
-            return None;
+    /// Returns a set of `WalFileId`s whose live occupancy is below the threshold.
+    /// `min_occupancy_pct == 0` disables relocation and yields an empty set.
+    pub fn compute_relocate_files(
+        &self,
+        layout: &WalLayout,
+        min_occupancy_pct: u8,
+    ) -> HashSet<WalFileId> {
+        if min_occupancy_pct == 0 {
+            return HashSet::new();
         }
-
-        // Sort positions in descending order (higher positions first)
-        positions.sort_by(|a, b| b.cmp(a));
-
-        // Calculate the index for the percentile
-        // pct% of positions should be above the returned position
-        let index = (positions.len() * pct) / 100;
-
-        // Clamp index to valid range
-        let index = index.min(positions.len() - 1);
-
-        Some(positions[index])
+        let mut alive_bytes: HashMap<WalFileId, u64> = HashMap::new();
+        let mut max_file_id: Option<WalFileId> = None;
+        for pos in self.iter_valid_val_positions() {
+            let file_id = layout.locate_file(pos.offset());
+            *alive_bytes.entry(file_id).or_insert(0) += pos.frame_len() as u64;
+            max_file_id = Some(max_file_id.map_or(file_id, |m| m.max(file_id)));
+        }
+        let threshold_bytes = layout
+            .wal_file_size
+            .saturating_mul(min_occupancy_pct as u64)
+            / 100;
+        alive_bytes
+            .into_iter()
+            .filter_map(|(file_id, bytes)| {
+                if Some(file_id) == max_file_id {
+                    return None;
+                }
+                if bytes < threshold_bytes {
+                    Some(file_id)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -2757,72 +2769,58 @@ mod tests {
     }
 
     #[test]
-    fn test_pct_wal_position() {
-        // Create a container with various WAL positions
-        let mut entries = BTreeMap::new();
-        for i in 0..5 {
-            let position_value = (i + 1) * 100;
-            entries.insert(
-                CellId::Integer(i),
+    fn test_compute_relocate_files() {
+        use crate::wal::layout::WalLayout;
+        use crate::wal::position::WalPosition;
+        // Build positions across 4 files, file size 1000.
+        // File 0 (offsets 0..1000):  one position with frame_len 100  → 10% occupancy → low.
+        // File 1 (offsets 1000..2000): one position with frame_len 500 → 50% occupancy → keep.
+        // File 2 (offsets 2000..3000): one position with frame_len  50 →  5% occupancy → low,
+        //                              but it's the max-file-id slot so excluded.
+        // (No file 3 — keep the test compact.)
+        let layout = WalLayout::new_simple(1000);
+        let make = |off: u64, len: u32| WalPosition::new(off, len);
+        let entries: BTreeMap<CellId, SnapshotEntryData> = vec![
+            (
+                CellId::Integer(0),
                 SnapshotEntryData::from_levels(
-                    IndexLevels::single(WalPosition::test_value(position_value as u64)),
-                    LastProcessed::new_test(position_value as u64),
+                    IndexLevels::single(make(100, 100)),
+                    LastProcessed::new_test(0),
                 ),
-            );
-        }
+            ),
+            (
+                CellId::Integer(1),
+                SnapshotEntryData::from_levels(
+                    IndexLevels::single(make(1500, 500)),
+                    LastProcessed::new_test(0),
+                ),
+            ),
+            (
+                CellId::Integer(2),
+                SnapshotEntryData::from_levels(
+                    IndexLevels::single(make(2500, 50)),
+                    LastProcessed::new_test(0),
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
         let container = LargeTableContainer {
             data: vec![entries],
         };
 
-        // Test various percentiles
-        // 0% - all positions are above this, should return the highest position
-        assert_eq!(
-            container.pct_wal_position(0),
-            Some(WalPosition::test_value(500))
-        );
+        // 15% threshold: file 0 (10%) is low, file 1 (50%) is fine, file 2 (5%) excluded as max.
+        let low = container.compute_relocate_files(&layout, 15);
+        let expected: HashSet<WalFileId> = [layout.locate_file(100)].into_iter().collect();
+        assert_eq!(low, expected);
 
-        // 20% - 20% of positions (1 out of 5) should be above this
-        // Positions sorted: [500, 400, 300, 200, 100]
-        // Index = 5 * 20 / 100 = 1, so position at index 1 is 400
-        assert_eq!(
-            container.pct_wal_position(20),
-            Some(WalPosition::test_value(400))
-        );
+        // Threshold 0 disables the mechanism.
+        let off = container.compute_relocate_files(&layout, 0);
+        assert!(off.is_empty());
 
-        // 50% - 50% of positions should be above this (median)
-        // Index = 5 * 50 / 100 = 2, so position at index 2 is 300
-        assert_eq!(
-            container.pct_wal_position(50),
-            Some(WalPosition::test_value(300))
-        );
-
-        // 80% - 80% of positions should be above this
-        // Index = 5 * 80 / 100 = 4, so position at index 4 is 100
-        assert_eq!(
-            container.pct_wal_position(80),
-            Some(WalPosition::test_value(100))
-        );
-
-        // 100% - all positions should be above this, but clamped to last valid index
-        // Index = 5 * 100 / 100 = 5, clamped to 4, so position is 100
-        assert_eq!(
-            container.pct_wal_position(100),
-            Some(WalPosition::test_value(100))
-        );
-
-        // Test with empty container
-        let empty_container = LargeTableContainer::<SnapshotEntryData> { data: vec![] };
-        assert_eq!(empty_container.pct_wal_position(50), None);
-
-        // Test with container having only invalid positions
-        let invalid_container = LargeTableContainer {
-            data: vec![
-                vec![(CellId::Integer(0), SnapshotEntryData::empty())]
-                    .into_iter()
-                    .collect(),
-            ],
-        };
-        assert_eq!(invalid_container.pct_wal_position(50), None);
+        // Empty container → empty set.
+        let empty: LargeTableContainer<SnapshotEntryData> = LargeTableContainer { data: vec![] };
+        assert!(empty.compute_relocate_files(&layout, 50).is_empty());
     }
 
     #[test]
