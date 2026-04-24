@@ -9,8 +9,8 @@
 //! after a promote, L0 is empty and L1 holds the merged blob. To represent
 //! that unambiguously (without depending on size-based classification at
 //! read-time) we store `WalPosition::INVALID` as a sentinel for empty
-//! interior slots, and trim trailing INVALIDs so `len()` reflects the
-//! highest populated schema slot plus one.
+//! interior slots. Trailing INVALIDs do not occur — all constructors
+//! produce canonical form and `set()` only accepts valid positions.
 use crate::wal::position::WalPosition;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -21,9 +21,9 @@ use smallvec::SmallVec;
 /// - `positions[0]` is the L0 slot, `positions[1]` is L1, etc.
 /// - An entry of `WalPosition::INVALID` means "this level slot exists in the
 ///   schema but currently holds no blob" (e.g., L0 right after a promote).
-/// - Trailing INVALIDs are trimmed: `[L0, INVALID]` and `[L0]` are not both
-///   valid representations of "L0 only"; only `[L0]` is. Interior INVALIDs
-///   — typically `[INVALID, L1]` post-promote — are preserved.
+/// - No trailing INVALIDs: `[L0]` is the only form of "L0 only"; `[L0, INVALID]`
+///   never occurs. Interior INVALIDs — typically `[INVALID, L1]` post-promote —
+///   are valid and preserved.
 /// - The empty list represents a cell that has never been flushed.
 ///
 /// The `SmallVec` inline capacity of 2 means the common case (up to two
@@ -84,8 +84,7 @@ impl IndexLevels {
     }
 
     /// Number of schema slots currently tracked (including empty interior slots).
-    /// Not the same as the number of populated blobs — see `populated_len` if
-    /// that's what you want.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.positions.len()
     }
@@ -95,11 +94,6 @@ impl IndexLevels {
     /// Skips empty interior slots: for `[INVALID, L1]`, this returns `Some(L1)`.
     pub fn latest(&self) -> Option<WalPosition> {
         self.positions.iter().copied().find(|p| p.is_valid())
-    }
-
-    /// Returns the oldest populated level (highest-index non-INVALID).
-    pub fn oldest(&self) -> Option<WalPosition> {
-        self.positions.iter().copied().rev().find(|p| p.is_valid())
     }
 
     /// Iterates **populated** levels from freshest (L0) to oldest, skipping
@@ -120,11 +114,6 @@ impl IndexLevels {
             .filter(|p| p.is_valid())
     }
 
-    /// Consumes the level list and yields populated positions.
-    pub fn into_iter_owned(self) -> impl Iterator<Item = WalPosition> {
-        self.positions.into_iter().filter(|p| p.is_valid())
-    }
-
     /// Returns the position at a specific level slot, if populated.
     /// INVALID slot or out-of-bounds both return `None`.
     pub fn get(&self, level: usize) -> Option<WalPosition> {
@@ -141,10 +130,9 @@ impl IndexLevels {
         self.get(1)
     }
 
-    /// Replaces (or appends) the position at `level`. `position` must be valid;
-    /// use `clear(level)` to mark a slot empty.
+    /// Replaces (or appends) the position at `level`. `position` must be valid.
     ///
-    /// Panics if `level > len()` — callers must fill levels contiguously.
+    /// Panics if `level` skips past the end — callers must fill levels contiguously.
     pub fn set(&mut self, level: usize, position: WalPosition) {
         debug_assert!(position.is_valid());
         assert!(
@@ -159,55 +147,11 @@ impl IndexLevels {
         }
     }
 
-    /// Marks the slot at `level` as empty (stores INVALID).
-    /// If the cleared slot is the last populated one, trailing INVALIDs are
-    /// trimmed so the vec stays in canonical form.
-    pub fn clear(&mut self, level: usize) {
-        if level >= self.positions.len() {
-            return;
-        }
-        self.positions[level] = WalPosition::INVALID;
-        self.trim_trailing_invalid();
-    }
-
-    /// Drops the blob at level `level` and **shifts** subsequent levels down by
-    /// one. This changes the schema meaning of older slots — prefer `clear()`
-    /// to leave the slot empty. No-op if `level >= len()`.
-    pub fn remove(&mut self, level: usize) {
-        if level < self.positions.len() {
-            self.positions.remove(level);
-            self.trim_trailing_invalid();
-        }
-    }
-
-    /// Truncates the level list to `len` entries.
-    pub fn truncate(&mut self, len: usize) {
-        self.positions.truncate(len);
-        self.trim_trailing_invalid();
-    }
-
     /// True when at most one slot is populated (post-promote `[INVALID, L1]`
     /// counts as single-level since only L1 holds data). Used by call sites
     /// that need to assert the L0-only or L1-only invariant explicitly.
     pub fn is_single_level(&self) -> bool {
         self.iter().count() <= 1
-    }
-
-    fn trim_trailing_invalid(&mut self) {
-        while self
-            .positions
-            .last()
-            .map(|p| !p.is_valid())
-            .unwrap_or(false)
-        {
-            self.positions.pop();
-        }
-    }
-}
-
-impl From<WalPosition> for IndexLevels {
-    fn from(position: WalPosition) -> Self {
-        Self::single(position)
     }
 }
 
@@ -237,7 +181,6 @@ mod tests {
         assert!(!lvls.is_empty());
         assert_eq!(lvls.len(), 1);
         assert_eq!(lvls.latest(), Some(pos(42)));
-        assert_eq!(lvls.oldest(), Some(pos(42)));
         assert_eq!(lvls.l0(), Some(pos(42)));
         assert_eq!(lvls.l1(), None);
         assert!(lvls.is_single_level());
@@ -255,7 +198,6 @@ mod tests {
         lvls.set(1, pos(2));
         assert_eq!(lvls.len(), 2);
         assert_eq!(lvls.latest(), Some(pos(1)));
-        assert_eq!(lvls.oldest(), Some(pos(2)));
         assert_eq!(lvls.l0(), Some(pos(1)));
         assert_eq!(lvls.l1(), Some(pos(2)));
         assert!(!lvls.is_single_level());
@@ -271,7 +213,6 @@ mod tests {
         assert_eq!(lvls.l0(), None);
         assert_eq!(lvls.l1(), Some(pos(99)));
         assert_eq!(lvls.latest(), Some(pos(99)));
-        assert_eq!(lvls.oldest(), Some(pos(99)));
         assert!(lvls.is_single_level());
         let collected: Vec<_> = lvls.iter().collect();
         assert_eq!(collected, vec![pos(99)]);
@@ -286,47 +227,9 @@ mod tests {
     }
 
     #[test]
-    fn clear_l0_with_l1_keeps_sentinel() {
-        let mut lvls = IndexLevels::single(pos(1));
-        lvls.set(1, pos(2));
-        lvls.clear(0);
-        // Interior INVALID is preserved — [INVALID, L1].
-        assert_eq!(lvls.len(), 2);
-        assert_eq!(lvls.l0(), None);
-        assert_eq!(lvls.l1(), Some(pos(2)));
-    }
-
-    #[test]
-    fn clear_l1_trims() {
-        let mut lvls = IndexLevels::single(pos(1));
-        lvls.set(1, pos(2));
-        lvls.clear(1);
-        // Trailing INVALID trimmed — back to [L0].
-        assert_eq!(lvls.len(), 1);
-        assert_eq!(lvls.l0(), Some(pos(1)));
-    }
-
-    #[test]
-    fn clear_last_trims_to_empty() {
-        let mut lvls = IndexLevels::single(pos(1));
-        lvls.clear(0);
-        assert_eq!(lvls.len(), 0);
-        assert!(lvls.is_empty());
-    }
-
-    #[test]
     #[should_panic]
     fn set_past_end_panics() {
         let mut lvls = IndexLevels::new();
         lvls.set(1, pos(1));
-    }
-
-    #[test]
-    fn remove_shifts() {
-        let mut lvls = IndexLevels::single(pos(1));
-        lvls.set(1, pos(2));
-        lvls.remove(0);
-        assert_eq!(lvls.len(), 1);
-        assert_eq!(lvls.latest(), Some(pos(2)));
     }
 }
