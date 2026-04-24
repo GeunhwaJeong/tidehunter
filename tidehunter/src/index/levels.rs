@@ -15,6 +15,13 @@ use crate::wal::position::WalPosition;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
+/// Inline SmallVec capacity used by all per-level containers (the level list
+/// itself, plus matching buffers of readers/caches built alongside it in
+/// `large_table` and `index_format`). Sized to the two-level default policy
+/// so the common case — L0 only, or L0+L1 — never allocates. Not a hard cap:
+/// SmallVec spills to the heap if a cell ever carries more levels.
+pub const INLINE_LEVELS: usize = 2;
+
 /// Ordered list of on-disk index-blob positions for one cell, freshest first.
 ///
 /// Invariants:
@@ -25,12 +32,9 @@ use smallvec::SmallVec;
 ///   never occurs. Interior INVALIDs — typically `[INVALID, L1]` post-promote —
 ///   are valid and preserved.
 /// - The empty list represents a cell that has never been flushed.
-///
-/// The `SmallVec` inline capacity of 2 means the common case (up to two
-/// levels) never allocates.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexLevels {
-    positions: SmallVec<[WalPosition; 2]>,
+    positions: SmallVec<[WalPosition; INLINE_LEVELS]>,
 }
 
 impl IndexLevels {

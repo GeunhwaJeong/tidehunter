@@ -337,9 +337,9 @@ impl ControlRegionStore {
 /// V1 control regions.
 ///
 /// V1 stored a single `WalPosition` per cell. V2 stores an `IndexLevels`
-/// (`SmallVec<[WalPosition; 2]>`). The migration maps every valid single
-/// position to a one-element level list; `WalPosition::INVALID` maps to an
-/// empty list.
+/// (a `SmallVec` of per-level `WalPosition`s, inline capacity `INLINE_LEVELS`).
+/// The migration maps every valid single position to a one-element level
+/// list; `WalPosition::INVALID` maps to an empty list.
 mod legacy_v1 {
     use super::ControlRegion;
     use crate::cell::CellId;

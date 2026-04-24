@@ -6,7 +6,7 @@ use crate::control::RelocateFiles;
 use crate::flusher::{FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread};
 use crate::index::index_format::{Direction, IndexFormat, IndexIterCaches};
 use crate::index::index_table::IndexTable;
-use crate::index::levels::IndexLevels;
+use crate::index::levels::{INLINE_LEVELS, IndexLevels};
 use crate::index::pending_table::{CommittedChange, PendingTable, Transaction};
 use crate::index::utils::{NextEntryResult, merge_levels_next_entry};
 use crate::iterators::IteratorResult;
@@ -110,7 +110,7 @@ pub(crate) enum ReadPlan {
         /// before or alongside on-disk levels.
         has_inmemory: bool,
         /// Populated on-disk level positions, freshest first.
-        level_positions: SmallVec<[WalPosition; 2]>,
+        level_positions: SmallVec<[WalPosition; INLINE_LEVELS]>,
     },
 }
 
@@ -505,7 +505,7 @@ impl LargeTable {
         // Allocate index readers **before** dropping the mutex — this ensures
         // that we can read from the index even if a relocation is concurrently
         // deleting the underlying blobs. See also test_concurrent_index_reclaim.
-        let mut index_readers: SmallVec<[_; 2]> = SmallVec::new();
+        let mut index_readers: SmallVec<[_; INLINE_LEVELS]> = SmallVec::new();
         for pos in &level_positions {
             index_readers.push(loader.index_reader(*pos)?);
         }
@@ -1000,7 +1000,7 @@ impl LargeTable {
         let direction = Direction::from_bool(reverse);
         // Open one reader per populated level — done before releasing the
         // row mutex below (same rationale as `get()`).
-        let mut readers: SmallVec<[WalRandomRead; 2]> = SmallVec::new();
+        let mut readers: SmallVec<[WalRandomRead; INLINE_LEVELS]> = SmallVec::new();
         for position in level_positions.iter() {
             readers.push(loader.index_reader(*position)?);
         }

@@ -5,6 +5,7 @@ use minibytes::Bytes;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
+use super::levels::INLINE_LEVELS;
 use super::lookup_header::LookupHeaderIndex;
 use super::uniform_lookup::UniformLookupIndex;
 use crate::metrics::{Metrics, TimerExt};
@@ -55,11 +56,10 @@ impl IndexIterCache {
 /// cell. The k-way merge in `LargeTable::next_in_cell` walks multiple on-disk
 /// blobs (L0, L1, ...) and each needs its own cache slot to avoid thrashing.
 ///
-/// The inline SmallVec capacity of 2 covers the common case (pre- and
-/// post-promote — L0 only, or L0+L1).
+/// Inline capacity is `INLINE_LEVELS`, matching the two-level default policy.
 #[derive(Default)]
 pub struct IndexIterCaches {
-    slots: SmallVec<[Option<IndexIterCache>; 2]>,
+    slots: SmallVec<[Option<IndexIterCache>; INLINE_LEVELS]>,
 }
 
 impl IndexIterCaches {
