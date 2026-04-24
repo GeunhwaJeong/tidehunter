@@ -245,6 +245,16 @@ impl LargeTable {
                                 // level. With a single level this loads one blob; with
                                 // multiple levels it unions keys across all blobs, which
                                 // matches the read-path union semantics.
+                                //
+                                // TODO: a key that was flushed to L1 as a real entry and
+                                // later tombstoned in L0 still shows up in L1's `keys()`
+                                // (tombstones are filtered per-level, not across levels),
+                                // so it ends up in the bloom even though it's logically
+                                // deleted. Harmless false positive — read-path still
+                                // returns None via the L0-wins rule — but wastes bloom
+                                // capacity on dead keys. A future pass could merge levels
+                                // (L0 tombstones shadow deeper entries) before feeding
+                                // the bloom, trading init CPU for a tighter filter.
                                 for position in entry_data.levels().iter() {
                                     let data = loader.load(&context.ks_config, position).expect(
                                         "Failed to load an index entry to reconstruct bloom filter",
