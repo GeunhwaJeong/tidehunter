@@ -100,20 +100,6 @@ enum LargeTableEntryState {
     DirtyLoaded,
 }
 
-/// Output of `LargeTableEntry::read_plan` — tells the read path what to walk.
-/// `Empty` is a distinct variant because the two call sites (`get`,
-/// `next_in_cell`) need to bail on Empty in different ways.
-pub(crate) enum ReadPlan {
-    Empty,
-    Walk {
-        /// True when `self.data` carries content the caller should consult
-        /// before or alongside on-disk levels.
-        has_inmemory: bool,
-        /// Populated on-disk level positions, freshest first.
-        level_positions: SmallVec<[WalPosition; INLINE_LEVELS]>,
-    },
-}
-
 struct KsTable {
     context: KsContext,
     rows: ShardedMutex<Row>,
@@ -484,29 +470,22 @@ impl LargeTable {
         if entry.bloom_filter_not_found(k) {
             return Ok(context.report_lookup_result(None, LookupSource::Bloom));
         }
-        // In the two-level LSM, the read path must walk every populated level
-        // until it finds either a hit or a tombstone (INVALID). We build the
-        // reader list while holding the mutex — otherwise a concurrent
+        if entry.state == LargeTableEntryState::Empty {
+            return Ok(context.report_lookup_result(None, LookupSource::Cache));
+        }
+        // Probe the in-memory overlay first. For Loaded/DirtyLoaded, `entry.data`
+        // holds L0 + overlay and a hit wins (valid position = Found; INVALID =
+        // tombstone shadowing deeper levels). For DirtyUnloaded it holds just
+        // the overlay. Unloaded has empty data by invariant but `entry.get`
+        // panics there, so skip it.
+        if entry.state != LargeTableEntryState::Unloaded
+            && let Some(found) = entry.get(k)
+        {
+            return Ok(context.report_lookup_result(found.valid(), LookupSource::Cache));
+        }
+        // Build the reader list while holding the mutex — otherwise a concurrent
         // relocation could delete the backing blob before we open it.
-        //
-        // For Loaded/DirtyLoaded/DirtyUnloaded (has_inmemory), probe
-        // `entry.data` first: a hit wins (a valid position returns Found;
-        // an INVALID/Removed means a tombstone that shadows deeper levels).
-        // A miss must fall through to the on-disk levels.
-        let level_positions = match entry.read_plan() {
-            ReadPlan::Empty => {
-                return Ok(context.report_lookup_result(None, LookupSource::Cache));
-            }
-            ReadPlan::Walk {
-                has_inmemory,
-                level_positions,
-            } => {
-                if has_inmemory && let Some(found) = entry.get(k) {
-                    return Ok(context.report_lookup_result(found.valid(), LookupSource::Cache));
-                }
-                level_positions
-            }
-        };
+        let level_positions = entry.disk_levels_to_walk();
         if level_positions.is_empty() {
             // No on-disk levels left to consult (e.g., Loaded cell with just
             // `[L0]` — entry.data is authoritative and already missed).
@@ -982,16 +961,14 @@ impl LargeTable {
             entry.maybe_load(loader)?;
         }
 
-        let (has_inmemory, level_positions) = match entry.read_plan() {
-            ReadPlan::Empty => {
-                caches.clear();
-                return Ok(None);
-            }
-            ReadPlan::Walk {
-                has_inmemory,
-                level_positions,
-            } => (has_inmemory, level_positions),
-        };
+        if entry.state == LargeTableEntryState::Empty {
+            caches.clear();
+            return Ok(None);
+        }
+        // `has_inmemory` gates `entry.next_entry()`, which panics on Unloaded
+        // (data is empty there by invariant).
+        let has_inmemory = entry.state != LargeTableEntryState::Unloaded;
+        let level_positions = entry.disk_levels_to_walk();
 
         if level_positions.is_empty() && !has_inmemory {
             // No on-disk blobs and nothing in memory.
@@ -1624,32 +1601,15 @@ impl LargeTableEntry {
         self.data.get(k)
     }
 
-    /// Derive what the read path needs from this entry: whether `self.data`
-    /// participates as an in-memory overlay, and which on-disk level positions
-    /// to consult. Shared by `get()` (miss-chain) and `next_in_cell` (k-way
-    /// merge) so the state→plan mapping lives in one place.
-    ///
-    /// - `Empty`: caller bails out immediately (the how differs per call site).
-    /// - `Loaded | DirtyLoaded`: `maybe_load` folded L0 into `self.data`, so
-    ///   walk levels **below L0** and treat `self.data` as the overlay.
-    /// - `Unloaded`: `self.data` is empty; walk every populated level.
-    /// - `DirtyUnloaded`: `self.data` holds only the dirty overlay (no L0
-    ///   content); walk every populated level, overlay wins on ties.
-    pub(crate) fn read_plan(&self) -> ReadPlan {
+    /// On-disk level positions the read path still needs to consult after
+    /// probing `self.data`. For Loaded/DirtyLoaded, `maybe_load` folded L0
+    /// into `self.data`, so only L1+ remain; everything else walks all levels.
+    pub(crate) fn disk_levels_to_walk(&self) -> SmallVec<[WalPosition; INLINE_LEVELS]> {
         match self.state {
-            LargeTableEntryState::Empty => ReadPlan::Empty,
-            LargeTableEntryState::Loaded | LargeTableEntryState::DirtyLoaded => ReadPlan::Walk {
-                has_inmemory: true,
-                level_positions: self.levels.iter_below_l0().collect(),
-            },
-            LargeTableEntryState::Unloaded => ReadPlan::Walk {
-                has_inmemory: false,
-                level_positions: self.levels.iter().collect(),
-            },
-            LargeTableEntryState::DirtyUnloaded => ReadPlan::Walk {
-                has_inmemory: true,
-                level_positions: self.levels.iter().collect(),
-            },
+            LargeTableEntryState::Loaded | LargeTableEntryState::DirtyLoaded => {
+                self.levels.iter_below_l0().collect()
+            }
+            _ => self.levels.iter().collect(),
         }
     }
 
