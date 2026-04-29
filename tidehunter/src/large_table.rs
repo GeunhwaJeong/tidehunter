@@ -129,11 +129,10 @@ enum Entries {
 /// Snapshot data for a single entry: the list of on-disk index blobs
 /// (`levels`) plus the durable WAL frontier (`last_processed`).
 ///
-/// `levels` is stored as an `IndexLevels` so the schema admits multi-level
-/// LSM layouts (see `docs/two_level_lsm_design.md`). The **runtime** still
-/// only populates a single level today; places that assume `levels.len() ≤ 1`
-/// carry `TODO(levels-generic):` markers. Backward compatibility with the
-/// legacy `{ position, last_processed }` on-disk format is handled by the
+/// `levels` is an `IndexLevels` — see `index::levels` for slot semantics
+/// (L0 freshest, L1 cold, `WalPosition::INVALID` sentinels for empty
+/// interior slots). Backward compatibility with the legacy
+/// `{ position, last_processed }` on-disk format is handled by the
 /// control-region reader, not by this struct.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[doc(hidden)] // Used by tools/tideconsole for control region inspection
@@ -152,11 +151,6 @@ impl SnapshotEntryData {
     }
 
     /// Returns the on-disk index blobs for this cell as an `IndexLevels`.
-    ///
-    /// Today this is at most one blob (the legacy single-level case).
-    /// Callers that need "walk every on-disk blob for this cell" should
-    /// always go through this method so that multi-level code paths work
-    /// unchanged once the runtime populates L0 + L1.
     pub fn levels(&self) -> &IndexLevels {
         &self.levels
     }
@@ -2026,21 +2020,7 @@ impl LargeTableEntry {
         )
     }
 
-    /// Returns the "primary" on-disk WAL position for this cell —
-    /// `levels.latest()` projected to `WalPosition::INVALID` when the cell has
-    /// never been flushed.
-    ///
-    /// TODO(levels-generic): callers that use this as "the" on-disk blob need
-    /// to be re-examined once the runtime populates multiple levels. Today
-    /// this is exact; tomorrow it's the freshest level (L0) and the caller
-    /// may need to look at older levels too.
-    pub fn wal_position(&self) -> WalPosition {
-        self.levels.latest().unwrap_or(WalPosition::INVALID)
-    }
-
-    /// Returns the full list of on-disk blob positions for this cell. Prefer
-    /// this accessor (over `wal_position()`) in read/iteration paths so the
-    /// code is already level-generic.
+    /// Returns the on-disk index blobs for this cell.
     pub fn levels(&self) -> &IndexLevels {
         &self.levels
     }
