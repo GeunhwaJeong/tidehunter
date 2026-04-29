@@ -47,7 +47,7 @@ fn var_flat_read_entry_offset(flat: &[u8], idx: usize) -> usize {
 /// `IndexWalPosition::from_disk` normalises that to `0` so the encoding here stays lossless.
 #[inline]
 pub(super) fn encode_kind_in_len(len: u32, kind: IndexEntryKind) -> u32 {
-    debug_assert!(
+    assert!(
         len < (1 << 30),
         "encode_kind_in_len: len must be < 2^30 (got 0x{len:08x}) — kind bits collide",
     );
