@@ -121,6 +121,17 @@ struct Row {
     entries: Entries,
 }
 
+/// Captured under the row mutex by `LargeTable::prepare_walk` so the
+/// merge loop in `execute_walk` can run without holding the lock. The
+/// `Arc<IndexTable>` snapshot of the in-memory overlay is stable for
+/// the duration of the walk: any concurrent writer triggers `ArcCow`
+/// copy-on-write rather than mutating this `Arc`'s contents.
+struct WalkPlan {
+    data: Arc<IndexTable>,
+    level_positions: SmallVec<[WalPosition; INLINE_LEVELS]>,
+    readers: SmallVec<[WalRandomRead; INLINE_LEVELS]>,
+}
+
 enum Entries {
     Array(usize /*num_mutexes*/, Box<[LargeTableEntry]>),
     Tree(BTreeMap<CellIdBytesContainer, LargeTableEntry>),
@@ -889,128 +900,210 @@ impl LargeTable {
     ) -> Result<Option<IteratorResult<GetResult>>, L::Error> {
         let ks_table = self.ks_rows(&context.ks_config);
         loop {
-            let next_in_cell = {
-                let row = context.ks_config.mutex_for_cell(&cell);
-                let mut row = ks_table.lock(row, &context.large_table_contention);
-                Self::next_in_cell(loader, &mut row, &cell, prev_key, reverse, caches)?
-                // drop row mutex as required by Self::next_cell called below
+            // Phase 1 (under row lock): advance the per-cell state machine and
+            // capture an `Arc<IndexTable>` snapshot of the in-memory overlay
+            // along with the open readers we need for the on-disk levels.
+            let mutex_idx = context.ks_config.mutex_for_cell(&cell);
+            let plan = {
+                let mut row = ks_table.lock(mutex_idx, &context.large_table_contention);
+                Self::prepare_walk(loader, &mut row, &cell, caches)?
             };
-            if let Some((key, value)) = next_in_cell {
+
+            // Phase 2 (no lock): k-way merge across the snapshot and the
+            // on-disk readers. Disk I/O happens here without holding the row
+            // mutex, so other cells in the same shard aren't blocked.
+            let walk_result = match plan {
+                Some(plan) => Self::execute_walk(
+                    &plan,
+                    &context.ks_config,
+                    &context.metrics,
+                    prev_key.take(),
+                    reverse,
+                    caches,
+                ),
+                None => None,
+            };
+
+            if let Some((key, val)) = walk_result {
+                // Phase 3: re-acquire the row lock briefly to consult the
+                // per-entry LRU. Skipped entirely when no LRU is configured.
+                // If the entry was removed between phases, fall back to a
+                // WAL read.
+                let value = if context.ks_config.value_cache_size().is_some() {
+                    let mut row = ks_table.lock(mutex_idx, &context.large_table_contention);
+                    if let Some(entry) = row.try_entry_mut(&cell) {
+                        Self::lru_or_wal(entry, &key, val)
+                    } else {
+                        GetResult::WalPosition(val)
+                    }
+                } else {
+                    GetResult::WalPosition(val)
+                };
                 return Ok(Some(IteratorResult {
                     cell: Some(cell),
                     key,
                     value,
                 }));
-            } else {
-                prev_key = None;
-                // Moving to a new cell — the cached buffers are no longer valid.
-                caches.clear();
-                let Some(next_cell) = self.next_cell(context, &cell, reverse) else {
-                    return Ok(None);
-                };
-                if let Some(end_cell_exclusive) = end_cell_exclusive {
-                    if reverse {
-                        if &next_cell <= end_cell_exclusive {
-                            return Ok(None);
-                        }
-                    } else if &next_cell >= end_cell_exclusive {
+            }
+
+            prev_key = None;
+            // Moving to a new cell — the cached buffers are no longer valid.
+            caches.clear();
+            let Some(next_cell) = self.next_cell(context, &cell, reverse) else {
+                return Ok(None);
+            };
+            if let Some(end_cell_exclusive) = end_cell_exclusive {
+                if reverse {
+                    if &next_cell <= end_cell_exclusive {
                         return Ok(None);
                     }
+                } else if &next_cell >= end_cell_exclusive {
+                    return Ok(None);
                 }
-                cell = next_cell;
             }
+            cell = next_cell;
         }
     }
 
-    fn next_in_cell<L: Loader>(
+    /// Phase 1 of an iterator step: advance the entry's state machine and
+    /// build a `WalkPlan` capturing everything Phase 2 needs (snapshot of
+    /// the in-memory overlay, level positions, open readers). Caller must
+    /// hold the row mutex; on `Ok(None)` there is nothing to walk in this
+    /// cell.
+    fn prepare_walk<L: Loader>(
         loader: &L,
         row: &mut Row,
         cell: &CellId,
-        mut prev_key: Option<Bytes>,
-        reverse: bool,
         caches: &mut IndexIterCaches,
-    ) -> Result<Option<(Bytes, GetResult)>, L::Error> {
-        fn lru_or_wal(entry: &mut LargeTableEntry, key: &[u8], pos: WalPosition) -> GetResult {
-            if let Some(lru) = &mut entry.value_lru
-                && let Some((full_key, value)) = lru.get(key)
-            {
-                GetResult::Value(full_key.clone(), value.clone())
-            } else {
-                GetResult::WalPosition(pos)
-            }
-        }
+    ) -> Result<Option<WalkPlan>, L::Error> {
         let Some(entry) = row.try_entry_mut(cell) else {
             return Ok(None);
         };
-
         entry.promote_pending();
-
         if !entry.context.ks_config.unloaded_iterator_enabled() {
             entry.maybe_load(loader)?;
         }
-
         if entry.state == LargeTableEntryState::Empty {
             caches.clear();
             return Ok(None);
         }
-        // `has_inmemory` gates `entry.next_entry()`, which panics on Unloaded
-        // (data is empty there by invariant).
-        let has_inmemory = entry.state != LargeTableEntryState::Unloaded;
         let level_positions = entry.disk_levels_to_walk();
-
-        if level_positions.is_empty() && !has_inmemory {
-            // No on-disk blobs and nothing in memory.
+        if level_positions.is_empty() && entry.state == LargeTableEntryState::Unloaded {
+            // No on-disk blobs and (by invariant) nothing in memory.
             caches.clear();
             return Ok(None);
         }
-        let direction = Direction::from_bool(reverse);
-        // Open one reader per populated level — done before releasing the
-        // row mutex below (same rationale as `get()`).
+        // Open readers before we drop the row mutex — same rationale as
+        // `get()`: a concurrent relocation must not delete the backing blob
+        // out from under us.
         let mut readers: SmallVec<[WalRandomRead; INLINE_LEVELS]> = SmallVec::new();
         for position in level_positions.iter() {
             readers.push(loader.index_reader(*position)?);
         }
+        // `clone_shared` migrates the `ArcCow` from `Owned` to `Shared` and
+        // hands us an `Arc<IndexTable>`. Subsequent writers go through
+        // `make_mut` which copy-on-writes, so the snapshot is stable across
+        // the lock-released walk in Phase 2.
+        let data = entry.data.clone_shared();
+        Ok(Some(WalkPlan {
+            data,
+            level_positions,
+            readers,
+        }))
+    }
 
-        let result = runtime::block_in_place(|| {
-            let format = entry.context.ks_config.index_format();
+    /// Phase 2 of an iterator step: k-way merge across the in-memory snapshot
+    /// and the on-disk levels in `plan`. Runs without the row mutex held.
+    /// Returns `None` when the cell yields no further entry in `direction`,
+    /// otherwise the (key, position) of the next entry.
+    fn execute_walk(
+        plan: &WalkPlan,
+        ks_config: &KeySpaceDesc,
+        metrics: &Metrics,
+        mut prev_key: Option<Bytes>,
+        reverse: bool,
+        caches: &mut IndexIterCaches,
+    ) -> Option<(Bytes, WalPosition)> {
+        let direction = Direction::from_bool(reverse);
+        runtime::block_in_place(|| {
+            let format = ks_config.index_format();
             loop {
-                let in_memory_next = if has_inmemory {
-                    entry.next_entry(prev_key.clone(), reverse)
-                } else {
-                    None
-                };
-
+                let in_memory_next = plan.data.next_entry(prev_key.clone(), reverse);
                 let mut candidates: SmallVec<[Option<(Bytes, WalPosition)>; 3]> = SmallVec::new();
                 candidates.push(in_memory_next);
-                for (level_idx, (position, reader)) in
-                    level_positions.iter().zip(readers.iter()).enumerate()
+                for (level_idx, (position, reader)) in plan
+                    .level_positions
+                    .iter()
+                    .zip(plan.readers.iter())
+                    .enumerate()
                 {
                     let cache_slot = caches.slot_mut(level_idx);
                     let on_disk_next = format.next_entry_unloaded(
-                        &entry.context.ks_config,
+                        ks_config,
                         reader,
                         prev_key.as_deref(),
                         direction,
-                        &entry.context.metrics,
+                        metrics,
                         *position,
                         cache_slot,
                     );
                     candidates.push(on_disk_next);
                 }
-
                 match merge_levels_next_entry(candidates, direction) {
                     NextEntryResult::NotFound => return None,
-                    NextEntryResult::Found(key, val) => {
-                        let get_result = lru_or_wal(entry, &key, val);
-                        return Some((key, get_result));
-                    }
-                    NextEntryResult::SkipDeleted(skip_key) => {
-                        prev_key = Some(skip_key);
-                    }
+                    NextEntryResult::Found(key, val) => return Some((key, val)),
+                    NextEntryResult::SkipDeleted(skip_key) => prev_key = Some(skip_key),
                 }
             }
-        });
-        Ok(result)
+        })
+    }
+
+    /// Phase 3 of an iterator step: probe the per-entry value LRU for `key`
+    /// to short-circuit a WAL read. Returns `Value(full_key, value)` on hit,
+    /// `WalPosition(pos)` on miss (caller will read the WAL).
+    fn lru_or_wal(entry: &mut LargeTableEntry, key: &[u8], pos: WalPosition) -> GetResult {
+        if let Some(lru) = &mut entry.value_lru
+            && let Some((full_key, value)) = lru.get(key)
+        {
+            GetResult::Value(full_key.clone(), value.clone())
+        } else {
+            GetResult::WalPosition(pos)
+        }
+    }
+
+    /// Test-only convenience that runs all three phases against an
+    /// already-locked `Row`. Production iteration releases the row mutex
+    /// between phases (see `next_entry`); the unit tests below construct
+    /// `Row` values directly and don't model that release.
+    #[cfg(test)]
+    fn next_in_cell<L: Loader>(
+        loader: &L,
+        row: &mut Row,
+        cell: &CellId,
+        prev_key: Option<Bytes>,
+        reverse: bool,
+        caches: &mut IndexIterCaches,
+    ) -> Result<Option<(Bytes, GetResult)>, L::Error> {
+        let Some(plan) = Self::prepare_walk(loader, row, cell, caches)? else {
+            return Ok(None);
+        };
+        let walk_result = Self::execute_walk(
+            &plan,
+            &row.context.ks_config,
+            &row.context.metrics,
+            prev_key,
+            reverse,
+            caches,
+        );
+        let Some((key, val)) = walk_result else {
+            return Ok(None);
+        };
+        let get_result = if let Some(entry) = row.try_entry_mut(cell) {
+            Self::lru_or_wal(entry, &key, val)
+        } else {
+            GetResult::WalPosition(val)
+        };
+        Ok(Some((key, get_result)))
     }
 
     /// See Db::next_cell for documentation
