@@ -963,15 +963,6 @@ impl LargeTable {
             caches.clear();
             return Ok(None);
         }
-        // Loaded/DirtyLoaded don't rely on per-level caches (entry.data is
-        // walked in-process), but unloaded readers do. Clear before use so
-        // stale cache slots from a prior state don't mislead the current walk.
-        if !matches!(
-            entry.state,
-            LargeTableEntryState::Unloaded | LargeTableEntryState::DirtyUnloaded
-        ) {
-            caches.clear();
-        }
         let direction = Direction::from_bool(reverse);
         // Open one reader per populated level — done before releasing the
         // row mutex below (same rationale as `get()`).
@@ -979,23 +970,23 @@ impl LargeTable {
         for position in level_positions.iter() {
             readers.push(loader.index_reader(*position)?);
         }
-        let format = entry.context.ks_config.index_format();
 
-        loop {
-            let in_memory_next = if has_inmemory {
-                entry.next_entry(prev_key.clone(), reverse)
-            } else {
-                None
-            };
+        let result = runtime::block_in_place(|| {
+            let format = entry.context.ks_config.index_format();
+            loop {
+                let in_memory_next = if has_inmemory {
+                    entry.next_entry(prev_key.clone(), reverse)
+                } else {
+                    None
+                };
 
-            let mut candidates: SmallVec<[Option<(Bytes, WalPosition)>; 3]> = SmallVec::new();
-            candidates.push(in_memory_next);
-            for (level_idx, (position, reader)) in
-                level_positions.iter().zip(readers.iter()).enumerate()
-            {
-                let cache_slot = caches.slot_mut(level_idx);
-                let on_disk_next = runtime::block_in_place(|| {
-                    format.next_entry_unloaded(
+                let mut candidates: SmallVec<[Option<(Bytes, WalPosition)>; 3]> = SmallVec::new();
+                candidates.push(in_memory_next);
+                for (level_idx, (position, reader)) in
+                    level_positions.iter().zip(readers.iter()).enumerate()
+                {
+                    let cache_slot = caches.slot_mut(level_idx);
+                    let on_disk_next = format.next_entry_unloaded(
                         &entry.context.ks_config,
                         reader,
                         prev_key.as_deref(),
@@ -1003,22 +994,23 @@ impl LargeTable {
                         &entry.context.metrics,
                         *position,
                         cache_slot,
-                    )
-                });
-                candidates.push(on_disk_next);
-            }
+                    );
+                    candidates.push(on_disk_next);
+                }
 
-            match merge_levels_next_entry(candidates, direction) {
-                NextEntryResult::NotFound => return Ok(None),
-                NextEntryResult::Found(key, val) => {
-                    let get_result = lru_or_wal(entry, &key, val);
-                    return Ok(Some((key, get_result)));
-                }
-                NextEntryResult::SkipDeleted(skip_key) => {
-                    prev_key = Some(skip_key);
+                match merge_levels_next_entry(candidates, direction) {
+                    NextEntryResult::NotFound => return None,
+                    NextEntryResult::Found(key, val) => {
+                        let get_result = lru_or_wal(entry, &key, val);
+                        return Some((key, get_result));
+                    }
+                    NextEntryResult::SkipDeleted(skip_key) => {
+                        prev_key = Some(skip_key);
+                    }
                 }
             }
-        }
+        });
+        Ok(result)
     }
 
     /// See Db::next_cell for documentation
