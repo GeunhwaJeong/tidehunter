@@ -496,7 +496,6 @@ impl LargeTable {
         drop(row);
 
         self.fp.fp_lookup_after_lock_drop();
-        self.fp_lookup_after_lock_drop_if_needed();
         let now = Instant::now();
         // todo - consider only doing block_in_place for the syscall random reader
         // TODO: handle entries that may be removed by relocation but are still referenced in the index
@@ -527,11 +526,6 @@ impl LargeTable {
             .lookup_mcs_histogram(read_type)
             .observe(now.elapsed().as_micros() as f64);
         Ok(context.report_lookup_result(result, LookupSource::for_level(terminal_level)))
-    }
-
-    fn fp_lookup_after_lock_drop_if_needed(&self) {
-        // Placeholder hook, matches the structure used by the single-level
-        // get path. Keeps the miss-chain call site self-contained.
     }
 
     fn entry_mut<'a>(&self, row: &'a mut Row, cell: &CellId) -> &'a mut LargeTableEntry {
