@@ -2434,6 +2434,10 @@ fn test_variable_length_keys_many() {
             db.insert(ks, key.clone(), vec![i as u8]).unwrap();
         }
 
+        // Wait for the WAL tracker to catch up before flushing — otherwise
+        // each flush captures a stale `last_processed` and `retain_unprocessed`
+        // leaves recent inserts in `self.data`, leaving cells DirtyUnloaded.
+        db.wal_writer.wal_tracker_barrier();
         db.large_table.flusher.barrier();
         db.force_rebuild_control_region().unwrap();
 
