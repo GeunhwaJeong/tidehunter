@@ -16,7 +16,7 @@ impl Latch {
 impl Latch {
     // This call blocks until the associated LatchGuard is dropped
     pub fn latch(&self) {
-        let _ = self.0.lock();
+        drop(self.0.lock());
     }
 }
 

@@ -389,10 +389,10 @@ pub mod test {
         for _ in 0..ITERATIONS {
             let key = rng.gen_range(target_range.clone());
             let pos = rng.next_u64();
-            if let Some(existing) = index.get(&k32(key)) {
-                if existing > w(pos) {
-                    continue;
-                }
+            if let Some(existing) = index.get(&k32(key))
+                && existing > w(pos)
+            {
+                continue;
             }
             index.insert(k32(key), w(pos));
         }
@@ -421,7 +421,7 @@ pub mod test {
         let element_size = 16; // 4-byte key + 12-byte value
 
         // Create a sorted set of keys
-        let keys = vec![
+        let keys = [
             vec![1, 2, 3, 4],
             vec![5, 6, 7, 8],
             vec![10, 11, 12, 13],
@@ -510,8 +510,8 @@ pub mod test {
 
         // Create an index with sorted entries
         let mut table = IndexTable::default();
-        for i in 1..6 {
-            let key = (i as u64 * 10).to_be_bytes().to_vec();
+        for i in 1..6u64 {
+            let key = (i * 10).to_be_bytes().to_vec();
             table.insert(Bytes::from(key), WalPosition::test_value(i));
         }
 

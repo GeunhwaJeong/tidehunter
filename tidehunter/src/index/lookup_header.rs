@@ -866,9 +866,9 @@ mod tests {
 
         // Adding keys that should span across micro cells
         // The exact distribution depends on key_micro_cell function behavior
-        for i in 0..20 {
+        for i in 0..20u64 {
             // Create keys with increasing values spread across the key space
-            let key_value = i as u64 * (u64::MAX / 20);
+            let key_value = i * (u64::MAX / 20);
             let key = key_value.to_be_bytes().to_vec();
             table.insert(Bytes::from(key), WalPosition::test_value(i));
         }

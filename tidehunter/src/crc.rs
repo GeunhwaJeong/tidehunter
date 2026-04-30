@@ -135,6 +135,16 @@ impl AsRef<[u8]> for CrcFrame {
     }
 }
 
+impl IntoBytesFixed for Vec<u8> {
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn write_into_bytes(&self, buf: &mut BytesMut) {
+        buf.put_slice(self);
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -168,15 +178,5 @@ mod test {
             CrcFrame::read_from_bytes(&bytes, 8),
             Err(CrcReadError::CrcMismatch)
         );
-    }
-}
-
-impl IntoBytesFixed for Vec<u8> {
-    fn len(&self) -> usize {
-        self.len()
-    }
-
-    fn write_into_bytes(&self, buf: &mut BytesMut) {
-        buf.put_slice(self);
     }
 }

@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 pub(crate) struct FailPoint {
-    fp: Box<dyn Fn() -> () + Send + Sync + 'static>,
+    fp: Box<dyn Fn() + Send + Sync + 'static>,
 }
 
 impl Default for FailPoint {

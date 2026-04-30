@@ -703,11 +703,7 @@ mod tests {
         let mut all_writes = HashSet::new();
         let mut jhs = Vec::with_capacity(threads as usize);
         for thread in 0..threads {
-            all_writes.extend(
-                (0..writes_per_thread)
-                    .into_iter()
-                    .map(|w| (thread << 16) + w),
-            );
+            all_writes.extend((0..writes_per_thread).map(|w| (thread << 16) + w));
             let wal_writer = wal_writer.clone();
             let jh = thread::spawn(move || {
                 for write in 0..writes_per_thread {

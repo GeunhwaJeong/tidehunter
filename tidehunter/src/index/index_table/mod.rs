@@ -2545,12 +2545,10 @@ mod tests {
         // entries: (14+1) + (14+2) + (14+3) + (14+5) = 15+16+17+19 = 67
         assert_eq!(new_flat.len(), 20 + 67);
     }
-}
 
-// Helper for tests only.
-#[cfg(test)]
-impl IndexWalPosition {
-    fn is_modified(&self) -> bool {
-        self.kind == IndexEntryKind::Modified
+    impl IndexWalPosition {
+        fn is_modified(&self) -> bool {
+            self.kind == IndexEntryKind::Modified
+        }
     }
 }

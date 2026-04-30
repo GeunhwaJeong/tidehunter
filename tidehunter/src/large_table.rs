@@ -2467,8 +2467,8 @@ mod tests {
 
         // Create test data for our disk index
         let mut disk_index = IndexTable::default();
-        for i in 1..6 {
-            let key = (i as u64 * 10).to_be_bytes().to_vec();
+        for i in 1..6u64 {
+            let key = (i * 10).to_be_bytes().to_vec();
             disk_index.insert(Bytes::from(key), WalPosition::test_value(i));
         }
         // We now have keys [10, 20, 30, 40, 50] in the on-disk index
@@ -2792,7 +2792,7 @@ mod tests {
 
         // Insert a key into each cell to make them non-empty
         for cell_bytes in &test_cells {
-            let (mut row, cell) = table.row(&context, cell_bytes);
+            let (mut row, cell) = table.row(context, cell_bytes);
             let (entry, _) = row.entry_mut(&cell);
 
             // Create a key for this cell (prefix + random bytes)
@@ -2817,7 +2817,7 @@ mod tests {
 
         for _ in 0..10 {
             // Safety limit
-            match table.next_cell(&context, &current_cell, false) {
+            match table.next_cell(context, &current_cell, false) {
                 Some(next_cell) => {
                     let bytes = next_cell.assume_bytes_id();
                     visited_cells.push(bytes.to_vec());
@@ -2841,7 +2841,7 @@ mod tests {
 
         for _ in 0..10 {
             // Safety limit
-            match table.next_cell(&context, &current_cell, true) {
+            match table.next_cell(context, &current_cell, true) {
                 Some(next_cell) => {
                     let bytes = next_cell.assume_bytes_id();
                     visited_cells_reverse.push(bytes.to_vec());
@@ -2873,7 +2873,7 @@ mod tests {
         // Test iteration from a specific cell (not the start/end)
         let start_cell = CellId::Bytes(SmallVec::from_slice(&[0u8, 0, 2]));
         let next = table
-            .next_cell(&context, &start_cell, false)
+            .next_cell(context, &start_cell, false)
             .expect("Should find next cell after [0,0,2]");
         assert_eq!(
             next.assume_bytes_id().as_slice(),
@@ -2882,7 +2882,7 @@ mod tests {
         );
 
         let prev = table
-            .next_cell(&context, &start_cell, true)
+            .next_cell(context, &start_cell, true)
             .expect("Should find previous cell before [0,0,2]");
         assert_eq!(
             prev.assume_bytes_id().as_slice(),
@@ -2933,7 +2933,7 @@ mod tests {
 
         // Manually set the single entry to DirtyLoaded to simulate a write
         let context = table.ks_context(ks_id);
-        let (mut row, cell) = table.row(&context, &[0u8]);
+        let (mut row, cell) = table.row(context, &[0u8]);
         let (entry, _) = row.entry_mut(&cell);
         entry
             .data

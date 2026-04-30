@@ -113,7 +113,7 @@ fn test_wal_relocation_basic_flow() {
         db.wait_for_background_threads_to_finish();
     }
     assert!(
-        list_wal_files(&dir.path())
+        list_wal_files(dir.path())
             .into_iter()
             .all(|name| name != "wal_0000000000000000")
     );
@@ -131,7 +131,7 @@ fn test_wal_relocation_basic_flow() {
         Some(value.clone().into())
     );
     assert_eq!(
-        db.get(ks, &1500_u32.to_be_bytes().to_vec()).unwrap(),
+        db.get(ks, 1500_u32.to_be_bytes().as_ref()).unwrap(),
         Some(value.clone().into())
     );
 }
@@ -223,7 +223,7 @@ fn test_index_based_relocation_filter() {
             db.insert(ks, insert_count.to_be_bytes().to_vec(), vec![0, 1, 2])
                 .unwrap();
             insert_count += 1;
-            if insert_count % 10000 == 0 && list_wal_files(&dir.path()).len() > 1 {
+            if insert_count.is_multiple_of(10000) && list_wal_files(dir.path()).len() > 1 {
                 break;
             }
         }
@@ -440,9 +440,9 @@ fn test_both_strategies_handle_concurrent_writes() {
                 for i in (0..100u64).step_by(5) {
                     let key = i.to_be_bytes().to_vec();
                     let value = vec![round as u8, (round >> 8) as u8, i as u8];
-                    match db_clone.insert(ks, key, value) {
-                        Ok(_) => successful_writes += 1,
-                        Err(_) => {} // Some concurrent access failures are expected
+                    // Some concurrent access failures are expected
+                    if db_clone.insert(ks, key, value).is_ok() {
+                        successful_writes += 1;
                     }
                 }
                 thread::sleep(Duration::from_millis(1));
@@ -839,7 +839,7 @@ fn test_index_based_relocation_with_target_position() {
 
     // Verify approximately 500 entries were relocated (allow wider margin for WAL position variation)
     assert!(
-        kept >= 350 && kept <= 650,
+        (350..=650).contains(&kept),
         "Expected ~500 entries relocated, got {}",
         kept
     );

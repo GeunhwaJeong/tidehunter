@@ -13,8 +13,8 @@ use rand::rngs::{StdRng, ThreadRng};
 use rand::{Rng, SeedableRng};
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
-use std::{thread, usize};
 
 // see generate.py
 pub(super) fn db_test((key_shape, ks): (KeyShape, KeySpace)) {
@@ -119,7 +119,7 @@ fn test_db_lock() {
 
     let run_subprocess = |mode: &str| {
         Command::new(env::current_exe().unwrap())
-            .args(&["db::tests::db_tests::test_db_lock", "--exact"])
+            .args(["db::tests::db_tests::test_db_lock", "--exact"])
             .env("TEST_DB_LOCK_HELPER", mode)
             .env("TEST_DB_PATH", dir.path().to_str().unwrap())
             .output()
@@ -359,7 +359,7 @@ fn test_corrupted_batch_replay() {
     let mut data = [0u8; 1];
     file.read_exact_at(&mut data, position).unwrap();
     data[0] = !data[0];
-    file.write_all_at(&mut data, position).unwrap();
+    file.write_all_at(&data, position).unwrap();
 
     let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
     assert_eq!(Some(value_a.into()), db.get(ks, &key_a).unwrap());
@@ -624,9 +624,9 @@ fn test_iterator_slice(db: &Arc<Db>, ks: KeySpace, slice: &[u128], reverse: bool
     let data: Vec<_> = iterator.collect::<DbResult<_>>().unwrap();
     assert_eq!(data.len(), slice.len());
     let slice_iter: Box<dyn Iterator<Item = &u128>> = if reverse {
-        Box::new(slice.into_iter().rev())
+        Box::new(slice.iter().rev())
     } else {
-        Box::new(slice.into_iter())
+        Box::new(slice.iter())
     };
     for ((key, value), expected) in data.into_iter().zip(slice_iter) {
         assert_eq!(key, ku128(*expected));
@@ -847,7 +847,7 @@ fn test_ordered_iterator() {
         let v = v.unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!(
-            v.get(0).unwrap(),
+            v.first().unwrap(),
             &(vec![1, 2, 3, 4, 5].into(), vec![2].into())
         );
         assert_eq!(
@@ -870,7 +870,7 @@ fn test_ordered_iterator() {
         let v = v.unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!(
-            v.get(0).unwrap(),
+            v.first().unwrap(),
             &(vec![1, 2, 3, 4, 5].into(), vec![2].into())
         );
         assert_eq!(
@@ -1966,7 +1966,7 @@ fn test_value_corruption() {
     let position = last_position + CrcFrame::CRC_HEADER_LENGTH as u64;
     file.read_exact_at(&mut data, position).unwrap();
     data[0] = !data[0];
-    file.write_all_at(&mut data, position).unwrap();
+    file.write_all_at(&data, position).unwrap();
 
     // Re-open the database and insert some new data
     {
@@ -2033,7 +2033,7 @@ fn test_header_corruption() {
     let mut data = [0u8; 1];
     file.read_exact_at(&mut data, last_position).unwrap();
     data[0] = !data[0];
-    file.write_all_at(&mut data, last_position).unwrap();
+    file.write_all_at(&data, last_position).unwrap();
 
     // Re-open the database and insert some new data
     {
@@ -2831,6 +2831,7 @@ fn db_test_snapshot_unload_threshold() {
 ///    The buggy code uses ForceRelocate which copies the stale on-disk index
 ///    (missing the dirty write) and advances `last_processed` past the dirty write.
 /// 5. Simulate crash recovery (drop + reopen). The dirty write should be present.
+///
 /// Validates the file-occupancy index GC path end-to-end.
 ///
 /// Tiny index files (8 KiB) guarantee that a moderate number of flushes fills

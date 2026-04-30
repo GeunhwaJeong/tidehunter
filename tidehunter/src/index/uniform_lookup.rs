@@ -836,6 +836,7 @@ mod test {
         {
             let mut file = OpenOptions::new()
                 .create(true)
+                .truncate(true)
                 .write(true)
                 .read(true)
                 .open(&file_path)
@@ -984,8 +985,8 @@ mod test {
 
         // Create an index with sorted entries
         let mut table = IndexTable::default();
-        for i in 1..6 {
-            let key = (i as u64 * 10).to_be_bytes().to_vec();
+        for i in 1..6u64 {
+            let key = (i * 10).to_be_bytes().to_vec();
             table.insert(Bytes::from(key), WalPosition::test_value(i));
         }
 

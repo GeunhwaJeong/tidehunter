@@ -1053,7 +1053,7 @@ mod tests {
     }
 
     fn test_prefix_falls_in_range_impl(mutexes: usize, key_type: KeyType) {
-        let (key_shape, ks) = KeyShape::new_single(32, mutexes, key_type.clone());
+        let (key_shape, ks) = KeyShape::new_single(32, mutexes, key_type);
         let ks = key_shape.ks(ks);
         let mut rng = StdRng::from_seed(Default::default());
         for _ in 0..1024 {
@@ -1073,8 +1073,8 @@ mod tests {
         ks: &KeySpaceDesc,
         key: &[u8],
     ) {
-        let prefix = ks.index_prefix_u32(&key) as u64;
-        let cell = ks.cell_id(&key);
+        let prefix = ks.index_prefix_u32(key) as u64;
+        let cell = ks.cell_id(key);
         let range = ks.index_prefix_range(&cell);
         if !range.contains(&prefix) {
             let mut formatted_key = String::default();

@@ -257,9 +257,9 @@ mod tests {
         );
 
         // test take_committed_for
-        let mut tx3 = Transaction::default();
-        table.insert(b(3), WalPosition::test_value(3), None, &mut tx3);
-        table.insert(b(4), WalPosition::test_value(4), None, &mut tx3);
+        let tx3 = Transaction::default();
+        table.insert(b(3), WalPosition::test_value(3), None, &tx3);
+        table.insert(b(4), WalPosition::test_value(4), None, &tx3);
         tx3.commit();
         let (committed, removed) = table.take_committed_for(&b(3));
         assert_eq!(committed.len(), 1);
@@ -304,7 +304,7 @@ mod tests {
         let threads: Vec<_> = tables
             .clone()
             .into_iter()
-            .zip(receivers.into_iter())
+            .zip(receivers)
             .enumerate()
             .map(|(id, (table, receiver))| {
                 thread::spawn(move || {
