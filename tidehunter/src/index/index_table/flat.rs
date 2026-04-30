@@ -23,6 +23,8 @@ use super::{IndexEntryKind, IndexWalPosition};
 use crate::wal::position::WalPosition;
 use bytes::BytesMut;
 use minibytes::Bytes;
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 // ---- Variable-length helpers (operate on the flat buffer directly) --------
 
@@ -386,4 +388,127 @@ impl<'a> Iterator for FlatIter<'a> {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Merge writer (flat + BTreeMap → new flat) used by `promote_to_flat`
+// ---------------------------------------------------------------------------
+
+/// Walk the merge of `flat` (decoded via `FlatIter`) with the sorted `btree`,
+/// invoking `f` once per emitted entry in sorted-key order. BTreeMap entries
+/// override flat entries when the keys are equal.
+fn merge_walk(
+    flat: &[u8],
+    key_size: Option<usize>,
+    btree: &BTreeMap<Bytes, IndexWalPosition>,
+    mut f: impl FnMut(&[u8], IndexWalPosition),
+) {
+    let mut flat_iter = FlatIter::new(flat, key_size);
+    let mut btree_iter = btree.iter();
+    let mut flat_cur = flat_iter.next();
+    let mut btree_cur = btree_iter.next();
+
+    loop {
+        let order = match (&flat_cur, &btree_cur) {
+            (None, None) => break,
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(fl), Some(bt)) => fl.0.cmp(bt.0.as_ref()),
+        };
+        match order {
+            Ordering::Less => {
+                let (fk, fiwp) = flat_cur.take().unwrap();
+                f(fk, fiwp);
+                flat_cur = flat_iter.next();
+            }
+            Ordering::Greater => {
+                let (bk, biwp) = btree_cur.take().unwrap();
+                f(bk.as_ref(), *biwp);
+                btree_cur = btree_iter.next();
+            }
+            Ordering::Equal => {
+                // BTreeMap entry overrides flat entry on equal keys.
+                flat_cur = flat_iter.next();
+                let (bk, biwp) = btree_cur.take().unwrap();
+                f(bk.as_ref(), *biwp);
+                btree_cur = btree_iter.next();
+            }
+        }
+    }
+}
+
+/// Merge `flat` and `btree` into a new flat buffer with a single allocation.
+///
+/// Two passes over the merge:
+///  1. Sizing: count emitted entries (and total key bytes for var-len) and
+///     dirty entries to compute the exact output size.
+///  2. Fill: write entries directly into a pre-sized `BytesMut`.
+///
+/// Returns the new flat buffer and the dirty-entry count.
+pub(super) fn merge_into_flat(
+    flat: &[u8],
+    key_size: Option<usize>,
+    btree: &BTreeMap<Bytes, IndexWalPosition>,
+) -> (Bytes, usize) {
+    let mut entry_count: usize = 0;
+    let mut total_key_bytes: usize = 0;
+    let mut dirty_count: usize = 0;
+    merge_walk(flat, key_size, btree, |key, iwp| {
+        entry_count += 1;
+        total_key_bytes += key.len();
+        if !iwp.is_clean() {
+            dirty_count += 1;
+        }
+    });
+
+    if entry_count == 0 {
+        return (Bytes::default(), 0);
+    }
+
+    let new_flat = match key_size {
+        Some(ks) => {
+            // Fixed-len: [key (ks)][wal_offset: u64][encoded_len: u32]*
+            let elem_size = ks + WalPosition::LENGTH;
+            let total_size = entry_count * elem_size;
+            let mut out = BytesMut::with_capacity(total_size);
+            merge_walk(flat, key_size, btree, |key, iwp| {
+                debug_assert_eq!(key.len(), ks, "key length mismatch in fixed flat");
+                out.extend_from_slice(key);
+                out.extend_from_slice(&iwp.offset.to_be_bytes());
+                out.extend_from_slice(&encode_kind_in_len(iwp.len, iwp.kind).to_be_bytes());
+            });
+            debug_assert_eq!(out.len(), total_size, "fixed flat size mismatch");
+            Bytes::from(out.freeze())
+        }
+        None => {
+            // Var-len: [count: u32][offsets: u32 * n][key_len: u16][key][wal_offset: u64][encoded_len: u32]*
+            // Per entry contributes 14 + key.len() bytes (2 + key + 8 + 4) to the entries section.
+            let header_size = 4 + 4 * entry_count;
+            let entries_size = entry_count * 14 + total_key_bytes;
+            let total_size = header_size + entries_size;
+            let mut out = BytesMut::with_capacity(total_size);
+            out.extend_from_slice(&(entry_count as u32).to_be_bytes());
+            let offsets_start = out.len();
+            // Reserve the offset table; back-fill each slot as we write entries.
+            out.resize(offsets_start + 4 * entry_count, 0);
+            let data_start = out.len();
+            let mut i: usize = 0;
+            merge_walk(flat, key_size, btree, |key, iwp| {
+                let entry_offset: u32 = (out.len() - data_start)
+                    .try_into()
+                    .expect("flat buffer exceeds u32 offset range");
+                out[offsets_start + 4 * i..offsets_start + 4 * i + 4]
+                    .copy_from_slice(&entry_offset.to_be_bytes());
+                out.extend_from_slice(&(key.len() as u16).to_be_bytes());
+                out.extend_from_slice(key);
+                out.extend_from_slice(&iwp.offset.to_be_bytes());
+                out.extend_from_slice(&encode_kind_in_len(iwp.len, iwp.kind).to_be_bytes());
+                i += 1;
+            });
+            debug_assert_eq!(out.len(), total_size, "varlen flat size mismatch");
+            Bytes::from(out.freeze())
+        }
+    };
+
+    (new_flat, dirty_count)
 }

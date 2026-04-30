@@ -1,7 +1,7 @@
 mod flat;
 use flat::{
     FlatIter, append_flat_varlen, build_flat_bytes, flat_count, flat_entry_at, flat_lower_bound,
-    flat_upper_bound,
+    flat_upper_bound, merge_into_flat,
 };
 
 use crate::index::index_format::Direction;
@@ -1085,60 +1085,11 @@ impl IndexTable {
             return false;
         }
 
-        // Collect old flat entries. `slice_to_bytes` avoids per-key heap copies —
-        // each key is a refcount bump on `old_flat`, which outlives `flat_entries`.
-        let old_flat = std::mem::take(&mut self.flat);
-        let flat_entries: Vec<(Bytes, IndexWalPosition)> = FlatIter::new(&old_flat, self.key_size)
-            .map(|(k, iwp)| (old_flat.slice_to_bytes(k), iwp))
-            .collect();
+        let (new_flat, dirty_count) = merge_into_flat(&self.flat, self.key_size, &self.data);
 
-        // Collect ALL BTreeMap entries sorted by key (BTreeMap is already sorted).
-        let btree_entries: Vec<(&Bytes, IndexWalPosition)> =
-            self.data.iter().map(|(k, v)| (k, *v)).collect();
-
-        // Merge-sort: BTreeMap entries override flat entries for the same key.
-        // Upper bound on result length is flat + btree (equal keys produce one row).
-        let mut result: Vec<(Bytes, IndexWalPosition)> =
-            Vec::with_capacity(flat_entries.len() + btree_entries.len());
-        let mut fi = 0usize;
-        let mut bi = 0usize;
-        let flat_count = flat_entries.len();
-
-        while fi < flat_count || bi < btree_entries.len() {
-            match (flat_entries.get(fi), btree_entries.get(bi)) {
-                (None, None) => break,
-                (Some((fk, fiwp)), None) => {
-                    result.push((fk.clone(), *fiwp));
-                    fi += 1;
-                }
-                (None, Some((bk, biwp))) => {
-                    result.push(((*bk).clone(), *biwp));
-                    bi += 1;
-                }
-                (Some((fk, fiwp)), Some((bk, biwp))) => match fk.as_ref().cmp(bk.as_ref()) {
-                    Ordering::Less => {
-                        result.push((fk.clone(), *fiwp));
-                        fi += 1;
-                    }
-                    Ordering::Equal => {
-                        // BTreeMap entry overrides flat entry for the same key.
-                        result.push(((*bk).clone(), *biwp));
-                        fi += 1;
-                        bi += 1;
-                    }
-                    Ordering::Greater => {
-                        result.push(((*bk).clone(), *biwp));
-                        bi += 1;
-                    }
-                },
-            }
-        }
-
-        // All BTreeMap key bytes are now in flat; reset the BTreeMap.
+        self.flat = new_flat;
+        self.dirty_count = dirty_count;
         self.key_bytes = 0;
-        // Recount dirty from the merged result (cheaper than an extra pass over flat after build).
-        self.dirty_count = result.iter().filter(|(_, iwp)| !iwp.is_clean()).count();
-        self.flat = build_flat_bytes(result, self.key_size);
         self.data.clear();
         true
     }
@@ -2232,6 +2183,367 @@ mod tests {
         assert!(current.get(&[2]).is_none());
         // No stale [1]@pos2 left behind in flat.
         assert_eq!(current.flat_binary_search(&[1]), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_into_flat — direct tests for the two-pass merge writer
+    // -----------------------------------------------------------------------
+
+    use super::flat::merge_into_flat;
+
+    /// Decode a flat buffer back to a Vec for assertion-friendly comparison.
+    fn decode_flat(flat: &Bytes, key_size: Option<usize>) -> Vec<(Vec<u8>, IndexWalPosition)> {
+        FlatIter::new(flat, key_size)
+            .map(|(k, iwp)| (k.to_vec(), iwp))
+            .collect()
+    }
+
+    fn iwp_modified(n: u64) -> IndexWalPosition {
+        IndexWalPosition::new_modified(WalPosition::test_value(n))
+    }
+    fn iwp_clean(n: u64) -> IndexWalPosition {
+        IndexWalPosition::new_clean(WalPosition::test_value(n))
+    }
+    fn iwp_removed(n: u64) -> IndexWalPosition {
+        IndexWalPosition::new_removed(WalPosition::test_value(n))
+    }
+
+    #[test]
+    fn test_merge_into_flat_var_len_btree_only() {
+        let flat = Bytes::default();
+        let btree: BTreeMap<Bytes, IndexWalPosition> = BTreeMap::from_iter([
+            (vec![1].into(), iwp_modified(1)),
+            (vec![2, 5].into(), iwp_clean(2)),
+            (vec![9].into(), iwp_modified(3)),
+        ]);
+
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        assert_eq!(dirty, 2);
+        let entries = decode_flat(&new_flat, None);
+        assert_eq!(
+            entries,
+            vec![
+                (vec![1], iwp_modified(1)),
+                (vec![2, 5], iwp_clean(2)),
+                (vec![9], iwp_modified(3)),
+            ]
+        );
+
+        // Exact size: header (4 + 4*n) + per-entry (14 + key_len).
+        let expected = 4 + 4 * 3 + (14 + 1) + (14 + 2) + (14 + 1);
+        assert_eq!(new_flat.len(), expected);
+    }
+
+    #[test]
+    fn test_merge_into_flat_var_len_flat_only() {
+        // Build a flat buffer via promote_to_flat, then call merge_into_flat with empty btree.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(1));
+        table.insert(vec![2].into(), WalPosition::test_value(2));
+        table.insert(vec![3].into(), WalPosition::test_value(3));
+        table.promote_to_flat();
+        let flat = table.flat.clone();
+        let btree: BTreeMap<Bytes, IndexWalPosition> = BTreeMap::new();
+
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        // All three flat entries are Modified.
+        assert_eq!(dirty, 3);
+        // Output equals input bytes (same entries, same order, same encoding).
+        assert_eq!(new_flat.as_ref(), flat.as_ref());
+    }
+
+    #[test]
+    fn test_merge_into_flat_var_len_btree_overrides_flat() {
+        // flat: [1]=Modified@1, [3]=Modified@3
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(1));
+        table.insert(vec![3].into(), WalPosition::test_value(3));
+        table.promote_to_flat();
+        let flat = table.flat.clone();
+
+        // btree: [1]=Modified@10 (overrides flat), [2]=Modified@2 (new)
+        let btree: BTreeMap<Bytes, IndexWalPosition> = BTreeMap::from_iter([
+            (vec![1].into(), iwp_modified(10)),
+            (vec![2].into(), iwp_modified(2)),
+        ]);
+
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        // 3 emitted entries, all dirty (Modified).
+        assert_eq!(dirty, 3);
+        let entries = decode_flat(&new_flat, None);
+        assert_eq!(
+            entries,
+            vec![
+                (vec![1], iwp_modified(10)), // btree wins
+                (vec![2], iwp_modified(2)),
+                (vec![3], iwp_modified(3)),
+            ]
+        );
+
+        // Exact size: 3 entries with 1-byte keys each.
+        let expected = 4 + 4 * 3 + 3 * (14 + 1);
+        assert_eq!(new_flat.len(), expected);
+    }
+
+    #[test]
+    fn test_merge_into_flat_var_len_interleaved() {
+        // flat: [1], [4], [7]   btree: [2], [5], [8]
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(1));
+        table.insert(vec![4].into(), WalPosition::test_value(4));
+        table.insert(vec![7].into(), WalPosition::test_value(7));
+        table.promote_to_flat();
+        let flat = table.flat.clone();
+
+        let btree: BTreeMap<Bytes, IndexWalPosition> = BTreeMap::from_iter([
+            (vec![2].into(), iwp_clean(2)),
+            (vec![5].into(), iwp_clean(5)),
+            (vec![8].into(), iwp_clean(8)),
+        ]);
+
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        // 3 flat dirty (Modified) + 0 btree dirty (Clean) = 3.
+        assert_eq!(dirty, 3);
+        let keys: Vec<Vec<u8>> = decode_flat(&new_flat, None)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![vec![1], vec![2], vec![4], vec![5], vec![7], vec![8]]
+        );
+    }
+
+    #[test]
+    fn test_merge_into_flat_var_len_btree_removed_overrides_flat_modified() {
+        // flat: [1]=Modified, [2]=Modified. btree marks [1] as Removed.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(1));
+        table.insert(vec![2].into(), WalPosition::test_value(2));
+        table.promote_to_flat();
+        let flat = table.flat.clone();
+        let btree: BTreeMap<Bytes, IndexWalPosition> =
+            BTreeMap::from_iter([(vec![1].into(), iwp_removed(10))]);
+
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        // Modified [2] from flat + Removed [1] from btree = 2 dirty.
+        assert_eq!(dirty, 2);
+        let entries = decode_flat(&new_flat, None);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, vec![1]);
+        assert_eq!(entries[0].1.kind, IndexEntryKind::Removed);
+        assert_eq!(entries[0].1.offset, WalPosition::test_value(10).offset());
+        assert_eq!(entries[1].0, vec![2]);
+        assert_eq!(entries[1].1.kind, IndexEntryKind::Modified);
+    }
+
+    #[test]
+    fn test_merge_into_flat_var_len_preserves_flat_tombstone() {
+        // Promote a tombstone into flat (insert → promote → remove → promote).
+        // The standalone Removed entry must survive a subsequent merge with
+        // an empty btree — needed for L0/L1 LSM where a tombstone shadows a
+        // live entry in the lower level.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(1));
+        table.insert(vec![2].into(), WalPosition::test_value(2));
+        table.promote_to_flat();
+        table.remove(vec![1].into(), WalPosition::test_value(10));
+        table.promote_to_flat();
+        // flat now has [1]=Removed, [2]=Modified.
+        let flat = table.flat.clone();
+        // Sanity: flat really has the tombstone encoded.
+        let pre = decode_flat(&flat, None);
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0].1.kind, IndexEntryKind::Removed);
+
+        // Merge with empty btree — Removed must round-trip unchanged.
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &BTreeMap::new());
+        assert_eq!(dirty, 2); // Modified + Removed both dirty.
+        let entries = decode_flat(&new_flat, None);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, vec![1]);
+        assert_eq!(entries[0].1.kind, IndexEntryKind::Removed);
+        assert_eq!(entries[1].0, vec![2]);
+        assert_eq!(entries[1].1.kind, IndexEntryKind::Modified);
+        // Byte-identical: same entries through encode → decode → encode.
+        assert_eq!(new_flat.as_ref(), flat.as_ref());
+    }
+
+    #[test]
+    fn test_merge_into_flat_var_len_btree_modified_overrides_flat_removed() {
+        // Re-insertion case: flat has [1]=Removed, btree has [1]=Modified.
+        // btree wins, the resulting entry must be Modified, not Removed.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(1));
+        table.promote_to_flat();
+        table.remove(vec![1].into(), WalPosition::test_value(10));
+        table.promote_to_flat();
+        let flat = table.flat.clone();
+
+        let btree: BTreeMap<Bytes, IndexWalPosition> =
+            BTreeMap::from_iter([(vec![1].into(), iwp_modified(20))]);
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        assert_eq!(dirty, 1);
+        let entries = decode_flat(&new_flat, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.kind, IndexEntryKind::Modified);
+        assert_eq!(entries[0].1.offset, WalPosition::test_value(20).offset());
+    }
+
+    #[test]
+    fn test_merge_into_flat_fixed_len_preserves_flat_tombstone() {
+        // Same as the var-len tombstone-preservation test, but for fixed-len keys.
+        let mut table = IndexTable::default();
+        table.insert(k4(10), WalPosition::test_value(1));
+        table.insert(k4(20), WalPosition::test_value(2));
+        table.key_size = Some(4);
+        table.promote_to_flat();
+        table.remove(k4(10), WalPosition::test_value(50));
+        table.promote_to_flat();
+        let flat = table.flat.clone();
+
+        let (new_flat, dirty) = merge_into_flat(&flat, Some(4), &BTreeMap::new());
+        assert_eq!(dirty, 2);
+        let entries = decode_flat(&new_flat, Some(4));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, k4(10).to_vec());
+        assert_eq!(entries[0].1.kind, IndexEntryKind::Removed);
+        assert_eq!(entries[1].0, k4(20).to_vec());
+        assert_eq!(entries[1].1.kind, IndexEntryKind::Modified);
+        // Byte-identical round-trip.
+        assert_eq!(new_flat.as_ref(), flat.as_ref());
+    }
+
+    #[test]
+    fn test_merge_into_flat_empty_inputs() {
+        let flat = Bytes::default();
+        let btree: BTreeMap<Bytes, IndexWalPosition> = BTreeMap::new();
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        assert!(new_flat.is_empty());
+        assert_eq!(dirty, 0);
+    }
+
+    #[test]
+    fn test_merge_into_flat_fixed_len_btree_overrides_flat() {
+        // flat with two fixed-len keys.
+        let mut table = IndexTable::default();
+        table.insert(k4(10), WalPosition::test_value(10));
+        table.insert(k4(30), WalPosition::test_value(30));
+        table
+            .data
+            .values_mut()
+            .for_each(|v| *v = v.as_clean_modified());
+        table.key_size = Some(4);
+        table.promote_to_flat();
+        let flat = table.flat.clone();
+
+        // btree overrides k4(10), inserts k4(20).
+        let btree: BTreeMap<Bytes, IndexWalPosition> =
+            BTreeMap::from_iter([(k4(10), iwp_modified(100)), (k4(20), iwp_modified(20))]);
+
+        let (new_flat, dirty) = merge_into_flat(&flat, Some(4), &btree);
+        // 2 btree Modified + 0 flat dirty (clean) = 2.
+        assert_eq!(dirty, 2);
+        let entries = decode_flat(&new_flat, Some(4));
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].0, k4(10).to_vec());
+        assert_eq!(entries[0].1, iwp_modified(100)); // btree wins
+        assert_eq!(entries[1].0, k4(20).to_vec());
+        assert_eq!(entries[1].1, iwp_modified(20));
+        assert_eq!(entries[2].0, k4(30).to_vec());
+        assert_eq!(entries[2].1, iwp_clean(30));
+
+        // Exact size: 3 entries × (4 + WalPosition::LENGTH).
+        assert_eq!(new_flat.len(), 3 * (4 + WalPosition::LENGTH));
+    }
+
+    #[test]
+    fn test_merge_into_flat_fixed_len_btree_only() {
+        let flat = Bytes::default();
+        let btree: BTreeMap<Bytes, IndexWalPosition> = BTreeMap::from_iter([
+            (k4(1), iwp_modified(1)),
+            (k4(2), iwp_clean(2)),
+            (k4(3), iwp_removed(3)),
+        ]);
+
+        let (new_flat, dirty) = merge_into_flat(&flat, Some(4), &btree);
+        // Modified + Removed = 2 dirty (Clean is not dirty).
+        assert_eq!(dirty, 2);
+        let entries = decode_flat(&new_flat, Some(4));
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].1.kind, IndexEntryKind::Modified);
+        assert_eq!(entries[1].1.kind, IndexEntryKind::Clean);
+        assert_eq!(entries[2].1.kind, IndexEntryKind::Removed);
+        assert_eq!(new_flat.len(), 3 * (4 + WalPosition::LENGTH));
+    }
+
+    #[test]
+    fn test_merge_into_flat_fixed_len_flat_only() {
+        let mut table = IndexTable::default();
+        table.insert(k4(10), WalPosition::test_value(10));
+        table.insert(k4(20), WalPosition::test_value(20));
+        table.key_size = Some(4);
+        table.promote_to_flat();
+        let flat = table.flat.clone();
+
+        let (new_flat, dirty) = merge_into_flat(&flat, Some(4), &BTreeMap::new());
+        // Both flat entries are Modified.
+        assert_eq!(dirty, 2);
+        // Byte-identical: same entries, same order.
+        assert_eq!(new_flat.as_ref(), flat.as_ref());
+    }
+
+    #[test]
+    fn test_merge_into_flat_var_len_dirty_count_mixed() {
+        // flat: [1]=Clean, [2]=Modified, [3]=Removed
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(1));
+        table.insert(vec![2].into(), WalPosition::test_value(2));
+        table.insert(vec![3].into(), WalPosition::test_value(3));
+        // Demote [1] and [3] to clean/removed before promotion.
+        table
+            .data
+            .entry(vec![1].into())
+            .and_modify(|v| *v = v.as_clean_modified());
+        table.data.insert(vec![3].into(), iwp_removed(3));
+        table.promote_to_flat();
+        // flat now: [1]=Clean, [2]=Modified, [3]=Removed.
+        let flat = table.flat.clone();
+
+        // btree: [4]=Clean (overrides nothing), [2]=Modified@20 (overrides [2])
+        let btree: BTreeMap<Bytes, IndexWalPosition> = BTreeMap::from_iter([
+            (vec![2].into(), iwp_modified(20)),
+            (vec![4].into(), iwp_clean(4)),
+        ]);
+
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        // Emitted: [1]=Clean, [2]=Modified(btree-overrides), [3]=Removed, [4]=Clean.
+        // Dirty: Modified + Removed = 2.
+        assert_eq!(dirty, 2);
+        let entries = decode_flat(&new_flat, None);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].1.kind, IndexEntryKind::Clean);
+        assert_eq!(entries[1].1.kind, IndexEntryKind::Modified);
+        assert_eq!(entries[1].1.offset, WalPosition::test_value(20).offset());
+        assert_eq!(entries[2].1.kind, IndexEntryKind::Removed);
+        assert_eq!(entries[3].1.kind, IndexEntryKind::Clean);
+    }
+
+    #[test]
+    fn test_merge_into_flat_var_len_size_with_varying_key_lengths() {
+        // Verify exact buffer size for keys of different lengths.
+        let flat = Bytes::default();
+        let btree: BTreeMap<Bytes, IndexWalPosition> = BTreeMap::from_iter([
+            (vec![1].into(), iwp_modified(1)),
+            (vec![2, 3].into(), iwp_modified(2)),
+            (vec![4, 5, 6].into(), iwp_modified(3)),
+            (vec![7, 8, 9, 10, 11].into(), iwp_modified(4)),
+        ]);
+
+        let (new_flat, _) = merge_into_flat(&flat, None, &btree);
+        // header: 4 + 4*4 = 20
+        // entries: (14+1) + (14+2) + (14+3) + (14+5) = 15+16+17+19 = 67
+        assert_eq!(new_flat.len(), 20 + 67);
     }
 }
 
