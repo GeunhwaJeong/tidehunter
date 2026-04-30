@@ -2,6 +2,7 @@
       frag_size: 134217728
       max_maps: 16
       max_dirty_keys: 32
+      l0_max_entries: 18446744073709551615
       snapshot_written_bytes: 134217728
       snapshot_unload_threshold: 268435456
       unload_jitter_pct: 10
@@ -28,6 +29,7 @@
       frag_size: 134217728
       max_maps: 16
       max_dirty_keys: 32
+      l0_max_entries: 18446744073709551615
       snapshot_written_bytes: 134217728
       snapshot_unload_threshold: 268435456
       unload_jitter_pct: 10
