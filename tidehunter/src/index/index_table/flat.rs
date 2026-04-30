@@ -214,24 +214,15 @@ pub(super) fn build_flat_bytes(
         Bytes::from(result)
     } else {
         // Variable-length format: [count: u32][offsets: u32*n][key_len: u16][key][wal_offset (8)][encoded_len (4)]*
-        let mut data_section: Vec<u8> = Vec::new();
-        let mut offsets: Vec<u32> = Vec::with_capacity(n);
-        for (key, iwp) in &entries {
-            offsets.push(data_section.len() as u32);
-            let key_len = key.len() as u16;
-            data_section.extend_from_slice(&key_len.to_be_bytes());
-            data_section.extend_from_slice(key);
-            data_section.extend_from_slice(&iwp.offset.to_be_bytes());
-            data_section.extend_from_slice(&encode_kind_in_len(iwp.len, iwp.kind).to_be_bytes());
-        }
-        let header_size = 4 + 4 * n; // count + offsets
-        let mut result = Vec::with_capacity(header_size + data_section.len());
-        result.extend_from_slice(&(n as u32).to_be_bytes());
-        for off in offsets {
-            result.extend_from_slice(&off.to_be_bytes());
-        }
-        result.extend_from_slice(&data_section);
-        Bytes::from(result)
+        // Each entry contributes 14 + key.len() bytes (2 + key + 8 + 4) to the entries section;
+        // the header is 4 (count) + 4*n (offset table). Pre-size the buffer so `append_flat_varlen`
+        // writes into a single allocation.
+        let total_key_bytes: usize = entries.iter().map(|(k, _)| k.len()).sum();
+        let total_size = 4 + 4 * n + 14 * n + total_key_bytes;
+        let mut out = BytesMut::with_capacity(total_size);
+        append_flat_varlen(&entries, &mut out);
+        debug_assert_eq!(out.len(), total_size, "varlen flat size mismatch");
+        Bytes::from(out.freeze())
     }
 }
 
