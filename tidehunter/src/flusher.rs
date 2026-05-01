@@ -303,7 +303,7 @@ impl IndexFlusherThread {
         //
         // The read path walks `entry.levels()` — `get()` does a miss-chain
         // across levels and `next_in_cell` does a k-way merge — so
-        // producing `[L0, L1]` is safe. See docs/two_level_lsm_design.md §7.
+        // producing `[L0, L1]` is safe.
         let is_relocation = matches!(&command.flush_kind, FlushKind::ForceRelocate(_));
         let l0_threshold = ctx.l0_max_entries();
         let over_threshold = !is_relocation && merged_l0.len() > l0_threshold;

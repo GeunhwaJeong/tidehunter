@@ -47,6 +47,22 @@ Currently, Tidehunter works well with two types of keys:
 
 You can double-check if the shard configuration is efficient by consulting the `max_index_size` metric, which reports the maximum size of the index per key space. The `entry_state` metric can be used to learn the current number of shards in a key space.
 
+# Index layout: two-level LSM
+
+Each cell's on-disk index is stored as a small ordered list of *level* blobs (an LSM-style L0/L1):
+
+* **L0** is small, hot, and rewritten on every flush.
+* **L1** is large, cold, and rewritten only when L0 grows past a threshold ("promote"). Promote merges L0 into L1, then resets L0 to empty.
+* On reads, the freshest level wins — if a key appears in L0 and L1, the L0 copy is authoritative.
+
+This dramatically reduces index write amplification for cells that hold many entries: instead of rewriting the full per-cell index on every flush (which scales as `N/D`, where `N` is the cell entry count and `D` is the dirty-flush threshold), the steady-state cost is roughly `√(2N/D)`.
+
+The relevant configuration knobs are:
+
+* `Config::l0_max_entries` — number of entries at which L0 promotes into L1. `None` (default) falls back to `max_dirty_keys × 8`.
+* `KeySpaceConfig::with_l0_max_entries(n)` — per-key-space override of the same threshold; takes precedence over the database-wide `Config::l0_max_entries`.
+* `Config::index_min_occupancy_pct` (default `15`) — minimum live-byte occupancy for an index WAL file. When a file's occupancy drops below this percentage of `wal_file_size`, its remaining cells are force-relocated on the next snapshot so the file can be GC'd. Set to `0` to disable occupancy-based force-relocation entirely.
+
 In addition to **KeyType**, **KeyIndexing** can be used to specify additional information that helps store keys efficiently:
 
 * `KeyIndexing::Fixed(len)` should be used for keys that have a fixed length.
@@ -71,7 +87,9 @@ You can check the list of all metrics in `tidehunter/src/metrics.rs`, but here a
   * Ideally, you want to configure the bloom filter and LRU cache for your key space to minimize the `cache` and `lookup` sources, as those can be expensive.
 * `wal_written_bytes_type` breaks down all disk writes performed by Tidehunter.
   * `record` and `tombstone` indicate user-initiated writes (updates and deletes, respectively).
-  * `index` is a periodic internal write during index flush. If this value is too high, it might indicate the sharding configuration (**KeyType**) is not optimal. 
+  * `index` is a periodic internal write during index flush. If this value is too high relative to `record`, it indicates excessive index write amplification — see the L0/L1 metrics below for a finer-grained breakdown.
+* `l0_bytes_written` and `l1_bytes_written` (per key space) split index writes between the hot L0 tier and the cold L1 tier. A high `l1_bytes_written` rate relative to `l0_bytes_written` means promotes are firing too often — increasing `l0_max_entries` (globally or per key space via `KeySpaceConfig::with_l0_max_entries`) trades a slightly larger L0 footprint for fewer L1 rewrites and lower overall write amplification. A high `l0_bytes_written` rate that doesn't drive L1 may instead point to suboptimal sharding (**KeyType**).
+* `promote_total` (per key space) counts L0 → L1 promotes. Useful for confirming that the configured `l0_max_entries` is being hit at the expected cadence.
 
 Long startup times can usually be debugged with the following metrics:
 

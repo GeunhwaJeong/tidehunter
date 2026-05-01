@@ -45,8 +45,14 @@ pub(crate) fn register(engine: &mut Engine) {
     //         "cells": [               // every cell in the snapshot (including empty ones)
     //           {
     //             "cell_id":        i64 | string,  // Integer → i64; Bytes → lowercase hex
-    //             "offset":         i64,           // index WAL offset; -1 if no index yet
-    //             "len":            i64,           // index frame length; 0 if no index yet
+    //             "levels": [                      // one entry per populated on-disk level,
+    //               {                              //   freshest (L0) first; empty if no index yet
+    //                 "level":  i64,               // schema slot (0 = L0, 1 = L1, …)
+    //                 "offset": i64,               // index WAL offset
+    //                 "len":    i64,               // index frame length
+    //               },
+    //               ...
+    //             ],
     //             "last_processed": i64,           // WAL offset up to which index is current
     //           },
     //           ...
@@ -81,18 +87,22 @@ pub(crate) fn register(engine: &mut Engine) {
                             CellId::Integer(n) => Dynamic::from(*n as i64),
                             CellId::Bytes(b) => Dynamic::from(hex::encode(b.as_slice())),
                         };
-                        // TODO(levels-generic): surface every level once the
-                        // flusher writes L0 + L1. Today `levels` is single-level,
-                        // so `latest()` is the only on-disk blob.
-                        let (offset, len) = match entry.levels.latest() {
-                            Some(p) => (p.offset() as i64, p.frame_len() as i64),
-                            None => (-1i64, 0i64),
-                        };
+
+                        let levels: rhai::Array = entry
+                            .levels
+                            .iter_with_level()
+                            .map(|(level, pos)| {
+                                let mut m = Map::new();
+                                m.insert("level".into(), Dynamic::from(level as i64));
+                                m.insert("offset".into(), Dynamic::from(pos.offset() as i64));
+                                m.insert("len".into(), Dynamic::from(pos.frame_len() as i64));
+                                Dynamic::from(m)
+                            })
+                            .collect();
 
                         let mut cell_map = Map::new();
                         cell_map.insert("cell_id".into(), cell_id_val);
-                        cell_map.insert("offset".into(), Dynamic::from(offset));
-                        cell_map.insert("len".into(), Dynamic::from(len));
+                        cell_map.insert("levels".into(), Dynamic::from(levels));
                         cell_map.insert(
                             "last_processed".into(),
                             Dynamic::from(entry.last_processed.as_u64() as i64),
@@ -189,8 +199,6 @@ pub(crate) fn register(engine: &mut Engine) {
 
             let mut valid_offsets: Vec<u64> = Vec::new();
             for entry in snapshot.data[ks_idx].values() {
-                // TODO(levels-generic): iterate every level once L0 + L1 are
-                // populated. Today there's at most one blob per cell.
                 for pos in entry.levels.iter() {
                     valid_offsets.push(pos.offset());
                 }
@@ -298,22 +306,22 @@ fn cr_stats_impl(h: &mut DbHandle, lowest_n: usize) -> Result<(), Box<EvalAltRes
     })?;
     let snapshot = cr.snapshot();
 
-    // Collect all valid positions: (offset, frame_len, ks_idx)
-    let mut all_positions: Vec<(u64, usize, usize)> = Vec::new();
+    // Collect all valid positions: (offset, frame_len, ks_idx, level_idx).
+    // Each populated level (L0, L1, …) within a cell contributes one tuple,
+    // so a cell with both L0 and L1 appears twice — disambiguated by level_idx.
+    let mut all_positions: Vec<(u64, usize, usize, usize)> = Vec::new();
     let mut total_position_size = 0u64;
     for (ks_idx, ks_data) in snapshot.data.iter().enumerate() {
         for entry in ks_data.values() {
-            // TODO(levels-generic): every level will contribute its own
-            // (offset, len) tuple once the flusher writes L0 + L1.
-            for pos in entry.levels.iter() {
+            for (level, pos) in entry.levels.iter_with_level() {
                 let off = pos.offset();
                 let len = pos.frame_len();
-                all_positions.push((off, len, ks_idx));
+                all_positions.push((off, len, ks_idx, level));
                 total_position_size += len as u64;
             }
         }
     }
-    all_positions.sort_by_key(|(off, _, _)| *off);
+    all_positions.sort_by_key(|(off, _, _, _)| *off);
 
     // Sum index WAL files on disk
     let index_prefix = format!("{}_", WalKind::Index.name());
@@ -344,7 +352,7 @@ fn cr_stats_impl(h: &mut DbHandle, lowest_n: usize) -> Result<(), Box<EvalAltRes
     print("Control Region Stats");
     print("====================");
     print(&format!("  Last WAL position : {:#x}", cr.last_position()));
-    print(&format!("  Valid cells       : {}", all_positions.len()));
+    print(&format!("  Valid level blobs : {}", all_positions.len()));
 
     print("");
     print("Index WAL Space:");
@@ -363,7 +371,7 @@ fn cr_stats_impl(h: &mut DbHandle, lowest_n: usize) -> Result<(), Box<EvalAltRes
 
     // Position percentiles (computed from sorted positions)
     if !all_positions.is_empty() {
-        let offsets: Vec<u64> = all_positions.iter().map(|(off, _, _)| *off).collect();
+        let offsets: Vec<u64> = all_positions.iter().map(|(off, _, _, _)| *off).collect();
         let pct = |p: usize| -> u64 {
             let idx = (offsets.len() * p / 100).min(offsets.len() - 1);
             offsets[idx]
@@ -379,14 +387,14 @@ fn cr_stats_impl(h: &mut DbHandle, lowest_n: usize) -> Result<(), Box<EvalAltRes
     if !all_positions.is_empty() && lowest_n > 0 {
         let n = lowest_n.min(all_positions.len());
         print("");
-        print(&format!("Lowest {n} cells by WAL position:"));
-        for (i, (offset, _len, ks_idx)) in all_positions.iter().take(n).enumerate() {
+        print(&format!("Lowest {n} level blobs by WAL position:"));
+        for (i, (offset, _len, ks_idx, level)) in all_positions.iter().take(n).enumerate() {
             let ks_name = key_shape
                 .ks(KeySpace::new(*ks_idx as u8))
                 .name()
                 .to_string();
             print(&format!(
-                "  {:2}. offset={offset:#010x}  ks={ks_name}",
+                "  {:2}. offset={offset:#010x}  ks={ks_name}  L{level}",
                 i + 1
             ));
         }

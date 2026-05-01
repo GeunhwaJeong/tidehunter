@@ -197,7 +197,7 @@ pub struct Metrics {
     pub flushed_bytes: MetricIntCounterVec,
     pub flush_pending: MetricIntGauge,
 
-    // Two-level LSM accounting (see docs/two_level_lsm_design.md).
+    // Two-level LSM accounting.
     pub l0_bytes_written: MetricIntCounterVec,
     pub l1_bytes_written: MetricIntCounterVec,
     pub promote_total: MetricIntCounterVec,

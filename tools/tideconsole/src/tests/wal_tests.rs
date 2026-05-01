@@ -219,8 +219,8 @@ fn test_load_index_returns_entries() {
         for ks in cr.keyspaces {
             if ks.name == "objects" {
                 for c in ks.cells {
-                    if c.offset >= 0 {
-                        idx_offset = c.offset;
+                    if c.levels.len() > 0 {
+                        idx_offset = c.levels[0].offset;
                         break;
                     }
                 }

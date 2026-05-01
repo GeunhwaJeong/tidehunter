@@ -54,10 +54,8 @@ pub struct LargeTableEntry {
     state: LargeTableEntryState,
     /// On-disk index-blob positions for this cell.
     ///
-    /// Invariant: empty iff `state == Empty`; otherwise `len() == 1` until
-    /// the flusher grows to emit L0 + L1 (see
-    /// `docs/two_level_lsm_design.md`). Held as an `IndexLevels` so
-    /// state-transition code is already level-generic.
+    /// Invariant: empty iff `state == Empty`. Held as an `IndexLevels` so
+    /// state-transition code is level-generic.
     levels: IndexLevels,
     context: KsContext,
     bloom_filter: Option<BloomFilter>,
@@ -83,14 +81,9 @@ pub struct LargeTableEntry {
 /// In-memory status of a `LargeTableEntry`.
 ///
 /// The on-disk position(s) for the cell are stored separately on
-/// [`LargeTableEntry::levels`] — see `docs/two_level_lsm_design.md` for the
-/// long-form rationale. This enum used to carry a `WalPosition` in each
-/// non-`Empty` variant; that field has moved onto the entry so that the
-/// runtime can grow from one position per cell to an `IndexLevels` list
-/// without touching every state transition.
+/// [`LargeTableEntry::levels`].
 ///
-/// Invariant: `Empty` ⇔ `levels.is_empty()`. All other states carry
-/// `levels.len() == 1` today; multi-level populations are a later phase.
+/// Invariant: `Empty` ⇔ `levels.is_empty()`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LargeTableEntryState {
     Empty,
@@ -1704,9 +1697,8 @@ impl LargeTableEntry {
         };
         // Load only the L0 slot — never L1. Reading L1 into `self.data` here
         // would make the next flush treat L1 content as "L0 + overlay" and
-        // rewrite L1 as the new L0 (see sentinel discussion in
-        // docs/two_level_lsm_design.md §9). On the read path, lookups already
-        // walk `levels` level-by-level, so L1 is reached via on-disk reads.
+        // rewrite L1 as the new L0. On the read path, lookups already walk
+        // `levels` level-by-level, so L1 is reached via on-disk reads.
         let mut data = match self.levels.l0() {
             Some(pos) => loader.load(&self.context.ks_config, pos)?,
             None => IndexTable::default(),

@@ -357,8 +357,8 @@ pub(crate) fn register(engine: &mut Engine) {
     // --- db.load_index(offset) ---
     //
     // Reads the index entry stored in the INDEX WAL at the given byte offset
-    // (as returned by db.load_cr() cell.offset) and returns the key→data-WAL-position
-    // mapping stored in that on-disk index.
+    // (as returned by db.load_cr() cell.levels[i].offset) and returns the
+    // key→data-WAL-position mapping stored in that on-disk index.
     //
     // Returns an array of maps:
     //   [ { "key": "<hex>", "wal_position": <i64> }, ... ]

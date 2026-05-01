@@ -13,7 +13,11 @@ let cells = ks0["cells"];
 assert(cells.len() > 0, "cells array should be non-empty");
 
 let cell = cells[0];
-let offset = cell["offset"];
-assert(offset == -1 || offset >= 0, "offset must be -1 (invalid) or >=0");
-assert(cell["len"]            >= 0, "len should be non-negative");
+let levels = cell["levels"];
+assert(type_of(levels) == "array", "levels should be an array");
+for lvl in levels {
+    assert(lvl["level"]  >= 0, "level index should be non-negative");
+    assert(lvl["offset"] >= 0, "level offset should be non-negative");
+    assert(lvl["len"]    >  0, "level len should be positive");
+}
 assert(cell["last_processed"] >= 0, "last_processed should be non-negative");

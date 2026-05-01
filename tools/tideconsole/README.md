@@ -98,8 +98,14 @@ These methods read the `cr` file directly — no WAL replay or `Db::open` requir
       "cells": [              // every cell in the snapshot
         {
           "cell_id":        i64 | string,  // integer for Uniform KS, hex for PrefixedUniform
-          "offset":         i64,           // index WAL offset; -1 if no index yet
-          "len":            i64,           // index frame length; 0 if no index yet
+          "levels": [                      // one entry per populated on-disk level,
+            {                              //   freshest (L0) first; empty if no index yet
+              "level":  i64,               // schema slot (0 = L0, 1 = L1, …)
+              "offset": i64,               // index WAL offset
+              "len":    i64,               // index frame length
+            },
+            ...
+          ],
           "last_processed": i64,           // WAL offset up to which the index is current
         },
         ...
@@ -139,9 +145,24 @@ print("WAL replay starts at: " + cr.last_position);
 for ks in cr.keyspaces {
     let valid = 0;
     for c in ks.cells {
-        if c.offset >= 0 { valid += 1; }
+        if c.levels.len() > 0 { valid += 1; }
     }
     print(ks.name + ": " + ks.cells.len() + " cells, " + valid + " with index");
+}
+```
+
+**Count cells that have been promoted to L1:**
+```rhai
+let db = open("/data/mydb");
+let cr = db.load_cr();
+for ks in cr.keyspaces {
+    let promoted = 0;
+    for c in ks.cells {
+        for lvl in c.levels {
+            if lvl.level >= 1 { promoted += 1; break; }
+        }
+    }
+    print(ks.name + ": " + promoted + " cells with L1");
 }
 ```
 

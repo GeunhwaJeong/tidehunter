@@ -1,9 +1,9 @@
 //! `IndexLevels` — the per-cell list of on-disk index blobs.
 //!
-//! The two-level LSM design (see `docs/two_level_lsm_design.md`) represents
-//! each cell's on-disk state as an ordered list of level slots: L0 (freshest,
-//! small, rewritten often) at index 0, L1 (cold, large, rewritten only on
-//! promote) at index 1, and — schema-wise — further levels if ever needed.
+//! The two-level LSM design represents each cell's on-disk state as an
+//! ordered list of level slots: L0 (freshest, small, rewritten often) at
+//! index 0, L1 (cold, large, rewritten only on promote) at index 1, and —
+//! schema-wise — further levels if ever needed.
 //!
 //! A slot can be "empty" even when a later slot is populated: immediately
 //! after a promote, L0 is empty and L1 holds the merged blob. To represent
@@ -104,6 +104,17 @@ impl IndexLevels {
     /// empty interior slots. This is the read-path order: first hit wins.
     pub fn iter(&self) -> impl Iterator<Item = WalPosition> + '_ {
         self.positions.iter().copied().filter(|p| p.is_valid())
+    }
+
+    /// Like [`iter`] but yields `(level_idx, position)` pairs. The level index
+    /// is the schema slot (0 = L0, 1 = L1, …), preserved across empty interior
+    /// slots — so a post-promote `[INVALID, L1]` yields `(1, L1)`.
+    pub fn iter_with_level(&self) -> impl Iterator<Item = (usize, WalPosition)> + '_ {
+        self.positions
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, p)| p.is_valid())
     }
 
     /// Iterates **populated** levels below L0 (slot index ≥ 1), skipping
