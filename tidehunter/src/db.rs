@@ -1112,11 +1112,17 @@ impl Db {
     }
 
     /// Wait for all background threads to finish by polling until no strong references remain.
-    /// This ensures clean shutdown before database restart in tests.
-    #[cfg(any(test, feature = "test-utils"))]
+    ///
+    /// The caller is responsible to make sure there is no more alive Arc references to the Db held by the user.
+    ///
+    /// This method panics after certain period to avoid hanging forever.
     pub fn wait_for_background_threads_to_finish(self: Arc<Self>) {
         use std::thread;
         use std::time::Duration;
+        #[cfg(test)]
+        const POLL_LIMIT: usize = 10_000;
+        #[cfg(not(test))]
+        const POLL_LIMIT: usize = 100_000;
 
         // Take the lock out before releasing the Arc. This ensures the registry removal
         // happens exactly once, here in the calling thread, after all background threads
@@ -1126,13 +1132,13 @@ impl Db {
         let weak_db = Arc::downgrade(&self);
         drop(self);
 
-        let mut poll_count = 0;
+        let mut poll_count = 0usize;
         loop {
             if weak_db.upgrade().is_none() {
                 break;
             }
             poll_count += 1;
-            if poll_count > 10000 {
+            if poll_count > POLL_LIMIT {
                 panic!(
                     "Database shutdown timeout: background threads not terminating after {poll_count} polls"
                 );
