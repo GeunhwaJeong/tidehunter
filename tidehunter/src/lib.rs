@@ -1,4 +1,5 @@
 pub mod batch;
+mod budget;
 mod cell;
 pub mod config;
 #[doc(hidden)] // Used by tools/tideconsole for control region inspection

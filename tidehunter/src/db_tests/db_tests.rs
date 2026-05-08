@@ -366,6 +366,169 @@ fn test_corrupted_batch_replay() {
     assert_eq!(Some(value_b.into()), db.get(ks, &key_b).unwrap());
 }
 
+/// Builds a Config with a tiny per-cell index budget so the gate fires after
+/// a small number of inserts. Avoids triggering unrelated flush/snapshot
+/// paths that would obscure the test.
+fn overflow_test_config() -> Config {
+    let mut config = Config::small();
+    config.frag_size = 8 * 1024;
+    config.wal_file_size = 16 * config.frag_size;
+    config.max_dirty_keys = 1_000_000;
+    config.snapshot_unload_threshold = u64::MAX;
+    config
+}
+
+#[test]
+fn test_index_overflow_insert_pre_wal_gate() {
+    let dir = tempdir::TempDir::new("test-overflow-insert").unwrap();
+    let config = Arc::new(overflow_test_config());
+    let (key_shape, ks) = KeyShape::new_single(256, 1, KeyType::uniform(1));
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+
+    let mut last_ok_pos = db.wal_writer.position();
+    let mut hit = false;
+    for i in 0..1000u32 {
+        let mut k = vec![0u8; 256];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        match db.insert(ks, k, vec![1, 2, 3]) {
+            Ok(()) => last_ok_pos = db.wal_writer.position(),
+            Err(DbError::IndexWouldOverflow {
+                ks_name,
+                limit_bytes,
+                ..
+            }) => {
+                assert_eq!(ks_name, "root");
+                assert!(limit_bytes > 0);
+                let pos_after_fail = db.wal_writer.position();
+                assert_eq!(
+                    pos_after_fail, last_ok_pos,
+                    "WAL must not advance on a failed insert"
+                );
+                hit = true;
+                break;
+            }
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+    assert!(hit, "expected overflow within 1000 inserts");
+    // The cell is at the budget limit. The index that's already there must
+    // still be flushable — `force_rebuild_control_region` triggers a flush
+    // and snapshot. If the cell were truly over `frag_size`, the WAL
+    // allocator would panic; the budget margin guarantees it isn't.
+    db.wal_writer.wal_tracker_barrier();
+    db.force_rebuild_control_region().unwrap();
+    assert!(
+        db.large_table.is_all_clean(),
+        "all entries should be clean after force_rebuild_control_region"
+    );
+}
+
+#[test]
+fn test_index_overflow_batch_pre_wal_gate() {
+    let dir = tempdir::TempDir::new("test-overflow-batch").unwrap();
+    let config = Arc::new(overflow_test_config());
+    let (key_shape, ks) = KeyShape::new_single(256, 1, KeyType::uniform(1));
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+
+    // Pre-fill via single inserts to ~half the budget.
+    for i in 0..15u32 {
+        let mut k = vec![0u8; 256];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        db.insert(ks, k, vec![1, 2, 3]).unwrap();
+    }
+    let pre_batch_pos = db.wal_writer.position();
+    let mut batch = db.write_batch();
+    for i in 100..125u32 {
+        let mut k = vec![0u8; 256];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        batch.write(ks, k, vec![1, 2, 3]);
+    }
+    let res = batch.commit();
+    assert!(
+        matches!(res, Err(DbError::IndexWouldOverflow { .. })),
+        "batch commit should fail with IndexWouldOverflow, got {res:?}"
+    );
+    assert_eq!(
+        db.wal_writer.position(),
+        pre_batch_pos,
+        "WAL must not advance on a failed batch commit"
+    );
+    // None of the batch keys are visible after the failed commit.
+    for i in 100..125u32 {
+        let mut k = vec![0u8; 256];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        assert_eq!(db.get(ks, &k).unwrap(), None);
+    }
+    // Pre-fill keys still readable.
+    for i in 0..15u32 {
+        let mut k = vec![0u8; 256];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        assert_eq!(db.get(ks, &k).unwrap(), Some(vec![1, 2, 3].into()));
+    }
+}
+
+#[test]
+fn test_index_overflow_replay_clean() {
+    let dir = tempdir::TempDir::new("test-overflow-replay").unwrap();
+    let config = Arc::new(overflow_test_config());
+    let (key_shape, ks) = KeyShape::new_single(256, 1, KeyType::uniform(1));
+
+    {
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            Metrics::new(),
+        )
+        .unwrap();
+        // Drive single-insert overflow; then drive batch overflow. Both are
+        // pre-WAL gated, so the WAL only carries successful records.
+        let mut hit = false;
+        for i in 0..1000u32 {
+            let mut k = vec![0u8; 256];
+            k[..4].copy_from_slice(&i.to_be_bytes());
+            match db.insert(ks, k, vec![1, 2, 3]) {
+                Ok(()) => {}
+                Err(DbError::IndexWouldOverflow { .. }) => {
+                    hit = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        assert!(hit);
+    }
+    // Reopen — must succeed, replay sees no overflowing records.
+    let metrics = Metrics::new();
+    let _db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let replayed = metrics.replayed_wal_records.get();
+    assert!(
+        replayed > 0,
+        "expected some successful records to be replayed"
+    );
+}
+
+#[test]
+fn test_index_overflow_skip_space_budget() {
+    // With skip_space_budget=true the gate is a no-op and inserts proceed
+    // until the flusher panic threshold; for this test we just verify many
+    // inserts that would normally overflow now succeed.
+    let dir = tempdir::TempDir::new("test-overflow-skip").unwrap();
+    let mut config = overflow_test_config();
+    config.skip_space_budget = true;
+    let config = Arc::new(config);
+    let (key_shape, ks) = KeyShape::new_single(256, 1, KeyType::uniform(1));
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+    // Insert past the would-be limit. The limit at frag_size=8 KiB is
+    // ~7 KiB, hit at ~28 inserts of 256-byte keys; do 50 to be safely over.
+    for i in 0..50u32 {
+        let mut k = vec![0u8; 256];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        db.insert(ks, k, vec![1, 2, 3])
+            .expect("skip_space_budget should disable the gate");
+    }
+}
+
 #[test]
 fn test_concurrent_batch() {
     let dir = tempdir::TempDir::new("test_concurrent_batch").unwrap();

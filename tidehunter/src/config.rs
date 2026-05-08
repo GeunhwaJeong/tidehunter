@@ -67,6 +67,12 @@ pub struct Config {
     /// instance at the same path to fully close before giving up.
     #[serde(default = "default_open_lock_retry_timeout")]
     pub open_lock_retry_timeout: Duration,
+    /// When true, disables the per-cell index-overflow budget. Inserts/removes
+    /// no longer return `DbError::IndexWouldOverflow` and the flusher is left
+    /// to panic if a serialized index would exceed `frag_size`. Provided as
+    /// an escape hatch for environments that prefer the legacy behavior.
+    #[serde(default)]
+    pub skip_space_budget: bool,
 }
 
 fn default_open_lock_retry_timeout() -> Duration {
@@ -111,6 +117,7 @@ impl Default for Config {
             commit_pool_size: 0,
             num_pending_promotion_threads: default_num_pending_promotion_threads(),
             open_lock_retry_timeout: default_open_lock_retry_timeout(),
+            skip_space_budget: false,
         }
     }
 }
@@ -137,6 +144,7 @@ impl Config {
             commit_pool_size: 0,
             num_pending_promotion_threads: default_num_pending_promotion_threads(),
             open_lock_retry_timeout: default_open_lock_retry_timeout(),
+            skip_space_budget: false,
         }
     }
 
