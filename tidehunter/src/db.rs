@@ -336,8 +336,10 @@ impl Db {
         let _timer = context.db_op_timer(DbOpKind::Get);
         let reduced_key = context.ks_config.reduce_key(k);
         match self.large_table.get(context, reduced_key.as_ref(), self)? {
-            GetResult::Value(_, value) => {
-                // todo check collision ?
+            GetResult::Value(full_key, value) => {
+                if context.ks_config.need_check_index_key() && full_key.as_ref() != k {
+                    return Ok(None);
+                }
                 Ok(Some(value))
             }
             GetResult::WalPosition(w) => {
