@@ -990,6 +990,18 @@ impl IndexTable {
 
     /// Compact index by retaining keys identified by the compactor.
     /// The compactor receives a double-ended iterator over all keys and returns keys to retain.
+    ///
+    /// # Tombstone preservation
+    ///
+    /// `Removed` entries (tombstones) are never shown to the user's compactor
+    /// closure and are always retained in the output. A compacted index is
+    /// sometimes the deepest level (over_threshold promote → new L1, deepest),
+    /// in which case the caller follows up with `clean_self()` to strip
+    /// tombstones; but it is just as often a shallower level written above an
+    /// existing L1 (`flusher.rs:333-354`), where the tombstones are the only
+    /// thing shadowing matching keys in the level below. Stripping them here
+    /// would resurrect those deeper keys — see the regression test
+    /// `test_compact_with_preserves_tombstones_shadowing_l1`.
     pub fn compact_with<F>(&mut self, compactor: F)
     where
         F: FnOnce(&mut dyn DoubleEndedIterator<Item = &Bytes>) -> HashSet<Bytes>,
@@ -1032,13 +1044,15 @@ impl IndexTable {
         drop(iter);
         drop(all_keys);
 
-        self.retain(|k, _| to_retain.contains(k));
+        // Keep tombstones regardless of `to_retain` so they can shadow deeper
+        // levels (see method-level doc above).
+        self.retain(|k, v| v.is_removed() || to_retain.contains(k));
 
         self.retain_flat(|k, iwp| {
-            if iwp.is_removed() || !to_retain.contains(k) {
-                None
-            } else {
+            if iwp.is_removed() || to_retain.contains(k) {
                 Some(iwp)
+            } else {
+                None
             }
         });
         // flat was rebuilt; recount since retain only tracked BTreeMap changes.

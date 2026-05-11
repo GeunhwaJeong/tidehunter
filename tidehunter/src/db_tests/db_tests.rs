@@ -4,7 +4,9 @@ use crate::crc::CrcFrame;
 use crate::failpoints::FailPoint;
 use crate::index::index_format::IndexFormatType;
 use crate::index::uniform_lookup::UniformLookupIndex;
-use crate::key_shape::{KeyIndexing, KeyShape, KeyShapeBuilder, KeySpace, KeySpaceConfig, KeyType};
+use crate::key_shape::{
+    Compactor, KeyIndexing, KeyShape, KeyShapeBuilder, KeySpace, KeySpaceConfig, KeyType,
+};
 use crate::latch::Latch;
 use crate::metrics::Metrics;
 use hex_literal::hex;
@@ -3712,4 +3714,104 @@ pub(super) fn drop_db((key_shape, ks): (KeyShape, KeySpace)) {
 
     // Prevent TempDir from trying to delete the already-removed directory
     std::mem::forget(dir);
+}
+
+// `compact_with` must preserve `Removed` entries — they are the only thing
+// shadowing matching keys in deeper levels (see `flusher.rs:333-354`: in the
+// non-over_threshold branch, `existing_l1.is_some()` skips `clean_self`, so
+// tombstones in the new L0 are load-bearing). Without that invariant, the
+// shallow flush below would drop the in-memory tombstone, the next read would
+// fall through to L1, and the deleted key would resurface.
+#[test]
+fn test_compact_with_preserves_tombstones_shadowing_l1() {
+    use std::collections::HashSet;
+
+    let dir = tempdir::TempDir::new("test-compact-with-preserves-tombstones").unwrap();
+    let mut config = Config::small();
+    config.sync_flush = false;
+    let config = Arc::new(config);
+
+    // Keep-one-per-prefix compactor. The closure's return value is not what
+    // matters here — what matters is that `run_compactor` runs during the
+    // shallow flush below. Key layout: prefix(1) || suffix(1).
+    let compactor: Compactor = Box::new(|iter: &mut dyn DoubleEndedIterator<Item = &Bytes>| {
+        let mut retain: HashSet<Bytes> = HashSet::new();
+        let mut previous: Option<Bytes> = None;
+        const PREFIX_SIZE: usize = 1;
+        for key in iter.rev() {
+            if let Some(prev) = &previous
+                && prev[..PREFIX_SIZE] == key[..PREFIX_SIZE]
+            {
+                continue;
+            }
+            previous = Some(key.clone());
+            retain.insert(key.clone());
+        }
+        retain
+    });
+
+    // One cell, two-byte keys. l0_max_entries=4 means a flush with
+    // merged_l0.len() > 4 promotes into L1.
+    let ks_config = KeySpaceConfig::new()
+        .with_compactor(compactor)
+        .with_l0_max_entries(4);
+    let (key_shape, ks) = KeyShape::new_single_config(2, 1, KeyType::uniform(1), ks_config);
+
+    let db = Db::open(dir.path(), key_shape, config.clone(), Metrics::new()).unwrap();
+
+    // Phase 1: write 8 distinct-prefix keys (one is the victim we will later
+    // delete) and force a flush. 8 > l0_max_entries=4 → `over_threshold`
+    // branch promotes everything into L1, cell ends as [INVALID, L1].
+    let victim_prefix: u8 = 0x42;
+    let victim_key: Vec<u8> = vec![victim_prefix, 0x01];
+    let victim_val: Vec<u8> = vec![0xAA, 0xBB];
+
+    db.insert(ks, victim_key.clone(), victim_val.clone())
+        .unwrap();
+    for i in 0u8..8 {
+        if i == victim_prefix {
+            continue;
+        }
+        db.insert(ks, vec![i, 0x00], vec![i]).unwrap();
+    }
+    db.wal_writer.wal_tracker_barrier();
+    db.force_rebuild_control_region().unwrap();
+
+    db.large_table.each_entry(|entry| {
+        assert!(
+            entry.levels().l0().is_none(),
+            "expected post-promote L0 to be INVALID",
+        );
+        assert!(
+            entry.levels().l1().is_some(),
+            "expected L1 to hold the blob"
+        );
+    });
+
+    assert_eq!(
+        Some(victim_val.clone().into()),
+        db.get(ks, &victim_key).unwrap(),
+    );
+
+    // Phase 2: delete the victim. Single-op `Db::remove` writes the tombstone
+    // straight into `entry.data`, so the in-memory shadow is visible.
+    db.remove(ks, victim_key.clone()).unwrap();
+    assert_eq!(None, db.get(ks, &victim_key).unwrap());
+
+    // Force a non-over_threshold flush. merged_l0 has a single Removed entry
+    // (well under l0_max_entries=4), so the flusher writes a new L0 above the
+    // existing L1. The tombstone must survive into that new L0 to keep
+    // shadowing L1.
+    db.wal_writer.wal_tracker_barrier();
+    db.force_rebuild_control_region().unwrap();
+
+    db.large_table.each_entry(|entry| {
+        assert!(entry.levels().l1().is_some(), "L1 must still be populated");
+    });
+
+    assert_eq!(
+        None,
+        db.get(ks, &victim_key).unwrap(),
+        "tombstone in the new L0 must shadow the L1 entry",
+    );
 }
