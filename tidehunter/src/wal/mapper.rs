@@ -2,7 +2,7 @@ use super::layout::WalLayout;
 use super::position::{MapId, WalFileId};
 use super::tracking_mmap::TrackingMMapMut;
 use super::{Map, Wal, WalFiles};
-use crate::metrics::{MetricIntGauge, Metrics};
+use crate::metrics::{MetricIntGauge, Metrics, TimerExt};
 use crate::wal::syncer::WalSyncer;
 use arc_swap::ArcSwap;
 use std::collections::{BTreeMap, HashSet};
@@ -46,12 +46,14 @@ struct UnlinkWorker {
 }
 
 impl UnlinkWorker {
-    fn start() -> Self {
+    fn start(metrics: Arc<Metrics>, kind: &'static str) -> Self {
         let (sender, receiver) = mpsc::channel::<PathBuf>();
+        let time_mcs = metrics.wal_unlinker_time_mcs.with_label_values(&[kind]);
         let jh = thread::Builder::new()
             .name("wal-unlinker".to_string())
             .spawn(move || {
                 for path in receiver {
+                    let _timer = time_mcs.clone().mcs_timer();
                     if path.exists() {
                         std::fs::remove_file(&path).expect("Failed to remove wal file");
                     }
@@ -114,6 +116,7 @@ impl WalMapper {
         }
         let maps = WalMaps::clone(&maps);
         let (sender, receiver) = mpsc::sync_channel(5);
+        let unlinker = UnlinkWorker::start(metrics.clone(), layout.kind.name());
         let this = WalMapperThread {
             maps,
             maps_arc,
@@ -122,7 +125,7 @@ impl WalMapper {
             receiver,
             metrics,
             syncer,
-            unlinker: UnlinkWorker::start(),
+            unlinker,
         };
         let jh = thread::Builder::new()
             .name("wal-mapper".to_string())

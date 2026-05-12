@@ -179,6 +179,7 @@ pub struct Metrics {
     pub db_op_mcs: MetricHistogramVec,
     pub map_time_mcs: MetricHistogram,
     pub wal_mapper_time_mcs: MetricIntCounter,
+    pub wal_unlinker_time_mcs: MetricIntCounterVec,
     pub write_batch_times: MetricIntCounterVec,
     pub write_batch_operations: MetricIntCounterVec,
     pub skip_stale_update: MetricIntCounterVec,
@@ -373,6 +374,12 @@ impl Metrics {
             db_op_mcs: histogram_vec!("db_op", &["op", "ks"], db_op_buckets, registry, enabled),
             map_time_mcs: histogram!("map_time_mcs", lookup_buckets.clone(), registry, enabled),
             wal_mapper_time_mcs: counter!("wal_mapper_time_mcs", registry, enabled),
+            wal_unlinker_time_mcs: counter_vec!(
+                "wal_unlinker_time_mcs",
+                &["kind"],
+                registry,
+                enabled
+            ),
             write_batch_times: counter_vec!(
                 "write_batch_times",
                 &["tag", "kind"],
