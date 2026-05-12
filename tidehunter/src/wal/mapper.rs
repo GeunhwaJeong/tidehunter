@@ -5,7 +5,7 @@ use super::{Map, Wal, WalFiles};
 use crate::metrics::{MetricIntGauge, Metrics};
 use crate::wal::syncer::WalSyncer;
 use arc_swap::ArcSwap;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -15,6 +15,7 @@ use std::time::Instant;
 pub(crate) enum WalMapperMessage {
     MapFinalized(MapId),
     MinWalPositionUpdated(u64, mpsc::SyncSender<()>),
+    DeleteFiles(Vec<WalFileId>, mpsc::SyncSender<()>),
 }
 
 pub(crate) struct WalMapper {
@@ -106,9 +107,25 @@ impl WalMapper {
             .expect("Wal mapper dropped")
             .send(WalMapperMessage::MinWalPositionUpdated(watermark, tx))
             .ok();
-        // Block until the mapper thread finishes deleting files and updating the file set.
-        // This prevents a race where the next relocation run iterates WAL files
-        // that are being deleted by a concurrent GC from the previous run.
+        // Block until the mapper thread finishes deleting files and updating
+        // the file set. This prevents a race where a subsequent operation
+        // (e.g. the next relocation run, or another `delete_files` call)
+        // iterates or rewrites WAL files that are concurrently being deleted.
+        rx.recv().ok();
+    }
+
+    /// Delete a specific set of WAL files. Files that still have any map in
+    /// `WalMaps` (writeable or finalized) are skipped by the mapper thread
+    /// and will be reconsidered by the next snapshot once their map has
+    /// been evicted. Blocks until the mapper finishes — same race-prevention
+    /// motivation as [`Self::min_wal_position_updated`].
+    pub fn delete_files(&self, files: Vec<WalFileId>) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender
+            .as_ref()
+            .expect("Wal mapper dropped")
+            .send(WalMapperMessage::DeleteFiles(files, tx))
+            .ok();
         rx.recv().ok();
     }
 }
@@ -158,6 +175,10 @@ impl WalMapperThread {
                     self.min_wal_position_updated(watermark);
                     // dropping _cb to release receiver
                 }
+                WalMapperMessage::DeleteFiles(to_delete, _cb) => {
+                    self.delete_files(&to_delete);
+                    // dropping _cb to release receiver
+                }
             }
             self.metrics
                 .wal_mapper_time_mcs
@@ -165,34 +186,58 @@ impl WalMapperThread {
         }
     }
 
-    /// Delete files up to the watermark
+    /// Delete files forming a prefix below `watermark`.
     fn min_wal_position_updated(&mut self, watermark: u64) {
         let wal_files = self.files.load();
-        let mut num_files_deleted = 0;
-        for idx in 0..wal_files.files.len() {
-            let file_id = WalFileId(wal_files.min_file_id.0 + idx as u64);
+        let mut to_delete = Vec::new();
+        for &file_id in wal_files.files.keys() {
             if self.layout.wal_file_range(file_id).end > watermark {
                 break;
             }
-            let path = self.layout.wal_file_name(&wal_files.base_path, file_id);
+            to_delete.push(file_id);
+        }
+        drop(wal_files);
+        if !to_delete.is_empty() {
+            self.delete_files(&to_delete);
+        }
+    }
+
+    /// Delete the specific set of files (gaps allowed). Files that still
+    /// have a map in `WalMaps` are skipped — that covers the writer's
+    /// current file and its lookahead (writeable maps) as well as any
+    /// finalized maps still in the LRU. Skipping is safe: the snapshot
+    /// path recomputes the deletable set each time it runs, so a file that
+    /// is reclaimable but currently mapped will be picked up by the next
+    /// snapshot once its map has been evicted by `WalMaps::pop_first`.
+    fn delete_files(&mut self, to_delete: &[WalFileId]) {
+        let wal_files = self.files.load();
+        let mapped_files: HashSet<WalFileId> = self
+            .maps
+            .maps
+            .keys()
+            .map(|map_id| self.layout.file_for_map(*map_id))
+            .collect();
+        let mut actual: Vec<WalFileId> = to_delete
+            .iter()
+            .copied()
+            .filter(|id| !mapped_files.contains(id) && wal_files.files.contains_key(id))
+            .collect();
+        if actual.is_empty() {
+            return;
+        }
+        actual.sort();
+        actual.dedup();
+        for id in &actual {
+            let path = self.layout.wal_file_name(&wal_files.base_path, *id);
             if path.exists() {
                 std::fs::remove_file(path).expect("Failed to remove wal file");
             }
-            num_files_deleted += 1;
         }
-        // Update the WalFiles structure and maps by removing deleted files
-        if num_files_deleted > 0 {
-            let new_files = wal_files.skip_first_n_files(num_files_deleted);
-            let new_min_file_id = new_files.min_file_id;
-            self.files.store(Arc::new(new_files));
-
-            // Remove all maps that belonged to deleted files
-            self.maps
-                .maps
-                .retain(|&map_id, _| self.layout.file_for_map(map_id) >= new_min_file_id);
-
-            self.publish_maps();
-        }
+        let new_files = wal_files.without_files(&actual);
+        self.files.store(Arc::new(new_files));
+        // No `WalMaps` update needed: the `mapped_files` filter above already
+        // guarantees every entry in `actual` is unmapped, so there is nothing
+        // in `self.maps` referencing the just-deleted files.
     }
 
     fn make_map(&mut self, map_id: MapId) {
@@ -200,17 +245,10 @@ impl WalMapperThread {
         let mut files = self.files.load();
         if file_id > files.current_file_id() {
             assert_eq!(file_id, WalFileId(files.current_file_id().0 + 1));
-            let mut new_files = files.files.clone();
             let new_file_path = self.layout.wal_file_name(&files.base_path, file_id);
             let new_file = Wal::open_file(&new_file_path, &self.layout)
                 .expect("Failed to create new wal file");
-            new_files.push(Arc::new(new_file));
-
-            let new_wal_files = WalFiles {
-                base_path: files.base_path.clone(),
-                files: new_files,
-                min_file_id: files.min_file_id,
-            };
+            let new_wal_files = files.with_file(file_id, Arc::new(new_file));
             self.files.store(Arc::new(new_wal_files));
             files = self.files.load();
         }

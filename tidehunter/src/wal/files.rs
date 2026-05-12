@@ -4,15 +4,19 @@ use super::layout::WalKind;
 use super::layout::WalLayout;
 use super::position::WalFileId;
 use arc_swap::ArcSwap;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Open WAL files keyed by `WalFileId`. The map may be sparse — the index WAL
+/// is GC'd by file id, so middle file ids can be missing after a snapshot
+/// reclaims dead files. The replay WAL keeps a contiguous prefix by virtue of
+/// its watermark-based GC, but the data structure does not enforce that.
 pub(crate) struct WalFiles {
     pub(crate) base_path: PathBuf,
-    pub(crate) files: Vec<Arc<File>>,
-    pub(crate) min_file_id: WalFileId,
+    pub(crate) files: BTreeMap<WalFileId, Arc<File>>,
 }
 
 impl WalFiles {
@@ -22,7 +26,7 @@ impl WalFiles {
     }
 
     pub(crate) fn load(base_path: &Path, layout: &WalLayout) -> io::Result<Self> {
-        let mut files = vec![];
+        let mut files: BTreeMap<WalFileId, Arc<File>> = BTreeMap::new();
         for entry in std::fs::read_dir(base_path)? {
             let file_path = entry?.path();
             if file_path.is_file()
@@ -35,39 +39,41 @@ impl WalFiles {
                 let id = u64::from_str_radix(id_str, 16)
                     .unwrap_or_else(|_| panic!("invalid wal file name {file_name:?}"));
                 let file = Wal::open_file(&file_path, layout)?;
-                files.push((id, file));
+                files.insert(WalFileId(id), Arc::new(file));
             }
         }
         if files.is_empty() {
             let file = Wal::open_file(&layout.wal_file_name(base_path, WalFileId(0)), layout)?;
-            files.push((0, file));
+            files.insert(WalFileId(0), Arc::new(file));
         }
-        files.sort_by_key(|(id, _)| *id);
-        let min_file_id = files[0].0;
-        assert_eq!(
-            files[files.len() - 1].0 - min_file_id + 1,
-            files.len() as u64,
-            "WAL file IDs must form a contiguous range",
-        );
         Ok(Self {
             base_path: base_path.to_path_buf(),
-            files: files.into_iter().map(|(_, file)| Arc::new(file)).collect(),
-            min_file_id: WalFileId(min_file_id),
+            files,
         })
     }
 
+    pub(crate) fn min_file_id(&self) -> WalFileId {
+        *self.files.keys().next().expect("WalFiles is never empty")
+    }
+
     pub(crate) fn current_file_id(&self) -> WalFileId {
-        WalFileId(self.min_file_id.0 + self.files.len() as u64 - 1)
+        *self
+            .files
+            .keys()
+            .next_back()
+            .expect("WalFiles is never empty")
     }
 
     #[inline]
     pub(crate) fn current_file(&self) -> &Arc<File> {
-        self.files.last().expect("unable to find current WAL file")
+        self.files
+            .values()
+            .next_back()
+            .expect("unable to find current WAL file")
     }
 
     pub(crate) fn get_checked(&self, id: WalFileId) -> Option<&Arc<File>> {
-        id.0.checked_sub(self.min_file_id.0)
-            .and_then(|id| self.files.get(id as usize))
+        self.files.get(&id)
     }
 
     pub(crate) fn get(&self, id: WalFileId) -> &Arc<File> {
@@ -75,19 +81,31 @@ impl WalFiles {
             .unwrap_or_else(|| panic!("attempt to access non existing file {id:?}"))
     }
 
-    /// Creates a new WalFiles with the first `num_files` removed.
-    /// This is used after deleting old WAL files from disk.
-    pub(crate) fn skip_first_n_files(&self, num_files: usize) -> Self {
+    /// Returns a new `WalFiles` with the listed file ids removed.
+    /// Ids not present in the map are silently ignored.
+    pub(crate) fn without_files(&self, to_remove: &[WalFileId]) -> Self {
+        let mut files = self.files.clone();
+        for id in to_remove {
+            files.remove(id);
+        }
+        Self {
+            base_path: self.base_path.clone(),
+            files,
+        }
+    }
+
+    /// Returns a new `WalFiles` with `file` inserted at `id`. Panics if `id`
+    /// is already present — the writer-side caller appends sequentially and
+    /// must never collide with an existing entry.
+    pub(crate) fn with_file(&self, id: WalFileId, file: Arc<File>) -> Self {
+        let mut files = self.files.clone();
         assert!(
-            num_files <= self.files.len(),
-            "Cannot skip {} files, only {} files exist",
-            num_files,
-            self.files.len()
+            files.insert(id, file).is_none(),
+            "wal file {id:?} already in registry",
         );
         Self {
             base_path: self.base_path.clone(),
-            files: self.files[num_files..].to_vec(),
-            min_file_id: WalFileId(self.min_file_id.0 + num_files as u64),
+            files,
         }
     }
 }

@@ -169,6 +169,18 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Requests deletion of a specific set of WAL files (gaps allowed).
+    /// Files that still have any map in `WalMaps` are skipped and will be
+    /// reconsidered on a later call once their map has been evicted.
+    /// Blocks until the mapper thread finishes the deletion.
+    pub fn delete_files(&self, files: Vec<position::WalFileId>) -> io::Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        self.wal_tracker.delete_files(files);
+        Ok(())
+    }
+
     #[cfg(test)]
     /// Waits until wal_tracker processes all in-flight messages.
     pub fn wal_tracker_barrier(&self) {
@@ -351,9 +363,18 @@ impl Wal {
         self.files.load().current_file().sync_all()
     }
 
-    /// Get the minimum WAL position based on the oldest WAL file
+    /// Get the minimum WAL position based on the oldest WAL file present.
+    /// For sparsely-GC'd WALs (index) this is the lowest still-live file id;
+    /// it is not a guarantee that every byte below it has been reclaimed.
     pub fn min_wal_position(&self) -> u64 {
-        self.files.load().min_file_id.0 * self.layout.wal_file_size
+        self.files.load().min_file_id().0 * self.layout.wal_file_size
+    }
+
+    /// Snapshot of currently-open WAL file ids, ordered ascending.
+    /// Used by the snapshot path to compute the set of unreferenced files
+    /// to delete (sparse GC). The active writer file is included.
+    pub(crate) fn file_ids(&self) -> Vec<position::WalFileId> {
+        self.files.load().files.keys().copied().collect()
     }
 
     pub fn wal_file_size(&self) -> u64 {

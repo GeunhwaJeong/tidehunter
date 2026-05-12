@@ -18,14 +18,14 @@ use crate::relocation::updates::RelocationUpdates;
 use crate::relocation::{RelocationCommand, RelocationDriver, RelocationStrategy, Relocator};
 use crate::state_snapshot;
 use crate::wal::layout::WalKind;
-use crate::wal::position::{LastProcessed, WalPosition};
+use crate::wal::position::{LastProcessed, WalFileId, WalPosition};
 use crate::wal::tracker::WalGuard;
 use crate::wal::{PreparedWalWrite, Wal, WalError, WalIterator, WalRandomRead, WalWriter};
 use bloom::needed_bits;
 use bytes::{Buf, BufMut, BytesMut};
 use minibytes::Bytes;
 use parking_lot::Mutex;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak, mpsc};
@@ -945,12 +945,28 @@ impl Db {
         let snapshot = self
             .large_table
             .relocate_and_snapshot(self, &relocate_files);
-        let min_index_position = snapshot.data.iter_valid_val_positions().min();
-        if let Some(min_index_position) = min_index_position {
-            self.index_writer.gc(min_index_position.offset())?;
+
+        // Sparse GC: any open index file strictly below the writer's current
+        // file is reclaimable if no live position references it. A single old
+        // pinned blob does not pin every later empty file behind it.
+        let layout = self.indexes.layout();
+        let mut live_files: HashSet<WalFileId> = HashSet::new();
+        for pos in snapshot.data.iter_valid_val_positions() {
+            live_files.insert(layout.locate_file(pos.offset()));
         }
+        // Only consider files strictly below the writer's current file. The
+        // mapper pre-allocates lookahead files (INITIAL_MAPS_BUFFER), and
+        // deleting any of those would break the writer when it advances.
+        let current_writer_file = layout.locate_file(self.index_writer.position());
+        let to_delete: Vec<WalFileId> = self
+            .indexes
+            .file_ids()
+            .into_iter()
+            .filter(|id| *id < current_writer_file && !live_files.contains(id))
+            .collect();
         self.indexes.fsync()?;
         self.wal.fsync()?;
+        self.index_writer.delete_files(to_delete)?;
         crs.store(
             snapshot.data,
             snapshot.replay_from,

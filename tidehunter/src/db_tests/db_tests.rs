@@ -3018,6 +3018,12 @@ fn test_index_gc_low_occupancy_files_relocated() {
         config.index_min_occupancy_pct = min_occupancy_pct;
         config.snapshot_unload_threshold = 0;
         config.max_dirty_keys = 100_000;
+        // Keep the index map LRU small so finalized maps for old files drop
+        // out quickly. `delete_files` will not reclaim a file while its map
+        // is still in `WalMaps`, so without this the GC assertion below races
+        // the LRU rather than the reclaim itself. 3 is the minimum allowed
+        // (`INITIAL_MAPS_BUFFER + 1`).
+        config.max_index_maps = Some(3);
         let config = Arc::new(config);
 
         let mut builder = KeyShapeBuilder::new();
@@ -3097,6 +3103,112 @@ fn test_index_gc_low_occupancy_files_relocated() {
     assert!(
         forced_on > 0,
         "with occupancy GC enabled, ForceRelocate should fire for rare; got {forced_on}",
+    );
+}
+
+/// Sparse index-WAL GC: empty middle files are reclaimed even while an old
+/// blob pins the earliest file.
+///
+/// Workload:
+/// - `rare` keyspace writes one value, then never again — its blob lives in
+///   file 0 and pins it.
+/// - `bulk` keyspace runs many rewrite-then-snapshot rounds — each round's
+///   flush replaces all bulk cells' L0 positions, leaving earlier rounds'
+///   positions unreferenced.
+/// - `index_min_occupancy_pct = 0` disables ForceRelocate so the rare blob
+///   is never moved out of file 0.
+///
+/// Expectation: after the rounds, file 0 is alive (rare), the writer-tail
+/// file is alive, and at least one file id in the middle has been deleted
+/// from disk.
+#[test]
+fn test_sparse_gc_deletes_empty_middle_index_files() {
+    let dir = tempdir::TempDir::new("test_sparse_gc_middle").unwrap();
+    let mut config = Config::small();
+    // Tiny index files so each round fills a fresh file.
+    config.frag_size = 8 * 1024;
+    config.wal_file_size = 8 * 1024;
+    // Critical: disable ForceRelocate so the rare blob stays pinned in file 0.
+    // Sparse GC must reclaim empty middle files without help from relocation.
+    config.index_min_occupancy_pct = 0;
+    config.snapshot_unload_threshold = 0;
+    config.max_dirty_keys = 100_000;
+    let config = Arc::new(config);
+
+    let mut builder = KeyShapeBuilder::new();
+    let ks_rare = builder.add_key_space("rare", 8, 1, KeyType::uniform(1));
+    let ks_bulk = builder.add_key_space("bulk", 8, 16, KeyType::uniform(8));
+    let key_shape = builder.build();
+
+    let metrics = Metrics::new();
+    let db = Db::open(
+        dir.path(),
+        key_shape.clone(),
+        config.clone(),
+        metrics.clone(),
+    )
+    .expect("open failed");
+
+    let rare_key = 0u64.to_be_bytes().to_vec();
+    db.insert(ks_rare, rare_key.clone(), vec![0x11; 16])
+        .expect("insert rare");
+
+    let bulk_key = |i: u32| -> Vec<u8> {
+        let mut k = [0u8; 8];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        k.to_vec()
+    };
+    let num_bulk: u32 = 128;
+    let step = u32::MAX / num_bulk;
+    let rounds: u8 = 8;
+
+    for round in 0..rounds {
+        for i in 0..num_bulk {
+            db.insert(ks_bulk, bulk_key(i * step), vec![round; 128])
+                .expect("insert bulk");
+        }
+        db.wal_writer.wal_tracker_barrier();
+        db.force_rebuild_control_region().expect("snapshot");
+    }
+
+    // Sanity: data is intact for both keyspaces.
+    let v = db.get(ks_rare, &rare_key).expect("get rare");
+    assert_eq!(v.as_deref(), Some(&[0x11; 16][..]));
+    let last_round = rounds - 1;
+    for i in 0..num_bulk {
+        let v = db.get(ks_bulk, &bulk_key(i * step)).expect("get bulk");
+        assert_eq!(v.as_deref(), Some(&vec![last_round; 128][..]));
+    }
+
+    // Scan disk for surviving index_* files.
+    let mut present: Vec<u64> = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            let name = p.file_name()?.to_str()?.to_string();
+            let id_str = name.strip_prefix("index_")?;
+            u64::from_str_radix(id_str, 16).ok()
+        })
+        .collect();
+    present.sort();
+    assert!(!present.is_empty(), "no index files on disk");
+
+    let min_id = *present.first().unwrap();
+    let max_id = *present.last().unwrap();
+    assert_eq!(
+        min_id, 0,
+        "rare must keep file 0 pinned (ForceRelocate disabled); present={present:?}",
+    );
+    assert!(
+        max_id >= 2,
+        "test workload must span at least 3 files so a middle exists; \
+         present={present:?}. Increase rounds or num_bulk.",
+    );
+    let full_range_len = (max_id - min_id + 1) as usize;
+    assert!(
+        present.len() < full_range_len,
+        "expected at least one middle file to be sparse-GC'd; \
+         present={present:?}, full range 0..={max_id} would have {full_range_len} files",
     );
 }
 
@@ -3254,6 +3366,10 @@ fn test_concurrent_index_reclaim() {
     let dir = tempdir::TempDir::new("test-concurrent-index-reclaim").unwrap();
     let mut config = Config::small();
     config.wal_file_size = config.frag_size;
+    // `delete_files` skips files whose map is still in `WalMaps`; cap the
+    // index map LRU at its minimum so file 0's map drops out within the
+    // handful of file advances this test performs.
+    config.max_index_maps = Some(3);
     let config = Arc::new(config);
     let (key_shape, ks) = KeyShape::new_single(2, 1, KeyType::uniform(1));
 

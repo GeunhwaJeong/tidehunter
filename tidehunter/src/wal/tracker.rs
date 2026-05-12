@@ -116,6 +116,10 @@ impl WalTracker {
         self.mapper.min_wal_position_updated(watermark);
     }
 
+    pub fn delete_files(&self, files: Vec<super::position::WalFileId>) {
+        self.mapper.delete_files(files);
+    }
+
     #[cfg(test)]
     pub fn barrier(&self) {
         use crate::latch::Latch;
