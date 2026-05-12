@@ -172,7 +172,9 @@ impl WalWriter {
     /// Requests deletion of a specific set of WAL files (gaps allowed).
     /// Files that still have any map in `WalMaps` are skipped and will be
     /// reconsidered on a later call once their map has been evicted.
-    /// Blocks until the mapper thread finishes the deletion.
+    /// Blocks until the mapper has removed the deletable entries from the
+    /// file map; the actual `remove_file` syscalls run on a background
+    /// unlink worker.
     pub fn delete_files(&self, files: Vec<position::WalFileId>) -> io::Result<()> {
         if files.is_empty() {
             return Ok(());

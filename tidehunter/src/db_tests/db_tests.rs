@@ -3180,6 +3180,9 @@ fn test_sparse_gc_deletes_empty_middle_index_files() {
         assert_eq!(v.as_deref(), Some(&vec![last_round; 128][..]));
     }
 
+    // Drop the DB so the unlink worker drains its queue before we scan.
+    drop(db);
+
     // Scan disk for surviving index_* files.
     let mut present: Vec<u64> = std::fs::read_dir(dir.path())
         .expect("read dir")

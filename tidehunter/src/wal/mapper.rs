@@ -7,6 +7,7 @@ use crate::wal::syncer::WalSyncer;
 use arc_swap::ArcSwap;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::thread::JoinHandle;
@@ -31,8 +32,59 @@ struct WalMapperThread {
     layout: WalLayout,
     syncer: WalSyncer,
     metrics: Arc<Metrics>,
+    unlinker: UnlinkWorker,
 }
 const INITIAL_MAPS_BUFFER: usize = 2;
+
+/// Background worker that performs `remove_file` calls off the mapper
+/// thread. Sparse GC can produce large delete batches; running the syscalls
+/// inline would block `MapFinalized` processing long enough for the writer
+/// to time out in `get_writeable_map`.
+struct UnlinkWorker {
+    sender: Option<mpsc::Sender<PathBuf>>,
+    jh: Option<JoinHandle<()>>,
+}
+
+impl UnlinkWorker {
+    fn start() -> Self {
+        let (sender, receiver) = mpsc::channel::<PathBuf>();
+        let jh = thread::Builder::new()
+            .name("wal-unlinker".to_string())
+            .spawn(move || {
+                for path in receiver {
+                    if path.exists() {
+                        std::fs::remove_file(&path).expect("Failed to remove wal file");
+                    }
+                }
+            })
+            .expect("failed to start wal-unlinker thread");
+        Self {
+            sender: Some(sender),
+            jh: Some(jh),
+        }
+    }
+
+    fn unlink(&self, path: PathBuf) {
+        // The receiver is only dropped when the worker thread exits, which
+        // only happens after this struct is dropped. `send` cannot fail in
+        // normal operation.
+        let _: Result<(), mpsc::SendError<PathBuf>> = self
+            .sender
+            .as_ref()
+            .expect("UnlinkWorker dropped")
+            .send(path);
+    }
+}
+
+impl Drop for UnlinkWorker {
+    fn drop(&mut self) {
+        // Closing the sender lets the worker drain its queue and exit.
+        self.sender.take();
+        if let Some(jh) = self.jh.take() {
+            crate::thread_util::join_thread_with_timeout(jh, "wal-unlinker", 10);
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct WalMaps {
@@ -70,6 +122,7 @@ impl WalMapper {
             receiver,
             metrics,
             syncer,
+            unlinker: UnlinkWorker::start(),
         };
         let jh = thread::Builder::new()
             .name("wal-mapper".to_string())
@@ -117,8 +170,10 @@ impl WalMapper {
     /// Delete a specific set of WAL files. Files that still have any map in
     /// `WalMaps` (writeable or finalized) are skipped by the mapper thread
     /// and will be reconsidered by the next snapshot once their map has
-    /// been evicted. Blocks until the mapper finishes — same race-prevention
-    /// motivation as [`Self::min_wal_position_updated`].
+    /// been evicted. Blocks until the mapper has removed the deletable
+    /// entries from the file map; the actual `remove_file` syscalls run on
+    /// a background unlink worker, so subsequent `file_ids()` calls see the
+    /// deletion immediately even though the dirents may not be gone yet.
     pub fn delete_files(&self, files: Vec<WalFileId>) {
         let (tx, rx) = mpsc::sync_channel(1);
         self.sender
@@ -227,14 +282,18 @@ impl WalMapperThread {
         }
         actual.sort();
         actual.dedup();
-        for id in &actual {
-            let path = self.layout.wal_file_name(&wal_files.base_path, *id);
-            if path.exists() {
-                std::fs::remove_file(path).expect("Failed to remove wal file");
-            }
-        }
+        // Drop the entries from the file map first — subsequent `file_ids()`
+        // and `get_checked()` see the deletion immediately. The actual
+        // `remove_file` syscalls are dispatched to the unlink worker so a
+        // large batch doesn't keep this thread out of `MapFinalized` for
+        // long. In-flight readers retain their `Arc<File>` clones, and Unix
+        // unlink keeps the inode alive until the last reference drops.
         let new_files = wal_files.without_files(&actual);
         self.files.store(Arc::new(new_files));
+        for id in &actual {
+            self.unlinker
+                .unlink(self.layout.wal_file_name(&wal_files.base_path, *id));
+        }
         // No `WalMaps` update needed: the `mapped_files` filter above already
         // guarantees every entry in `actual` is unmapped, so there is nothing
         // in `self.maps` referencing the just-deleted files.
