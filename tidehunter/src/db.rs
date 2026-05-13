@@ -966,13 +966,17 @@ impl Db {
             .collect();
         self.indexes.fsync()?;
         self.wal.fsync()?;
-        self.index_writer.delete_files(to_delete)?;
+        // Persist the control region BEFORE unlinking files. A crash between
+        // these steps must leave the on-disk CR consistent with the files
+        // still present: extra (un-deleted) files are tolerated by the next
+        // snapshot; a CR that references a file we already deleted is not.
         crs.store(
             snapshot.data,
             snapshot.replay_from,
             &self.key_shape,
             &self.metrics,
         );
+        self.index_writer.delete_files(to_delete)?;
         Ok(snapshot.replay_from)
     }
 
