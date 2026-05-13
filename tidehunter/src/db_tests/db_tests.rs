@@ -3215,6 +3215,97 @@ fn test_sparse_gc_deletes_empty_middle_index_files() {
     );
 }
 
+/// After sparse GC creates a multi-file gap between the last live val
+/// position and the writer's current file, reopening the DB must not panic.
+/// Pre-fix: on reopen the writer rewinds to `max(live_valpos)` and the
+/// mapper's INITIAL_MAPS_BUFFER lookahead tries to mmap the very next file,
+/// which sparse GC deleted — panic in `WalMapperThread::make_map` at
+/// `attempt to access non existing file WalFileId(_)`.
+#[test]
+fn test_sparse_gc_reopen_with_dead_window() {
+    let dir = tempdir::TempDir::new("test_sparse_gc_reopen").unwrap();
+    let mut config = Config::small();
+    // One map per file so INITIAL_MAPS_BUFFER lookahead crosses file
+    // boundaries on the very first iteration.
+    config.frag_size = 8 * 1024;
+    config.wal_file_size = 8 * 1024;
+    // Disable occupancy-based relocation so dead writes stay in place.
+    config.index_min_occupancy_pct = 0;
+    config.snapshot_unload_threshold = 0;
+    config.max_dirty_keys = 100_000;
+    let config = Arc::new(config);
+
+    let mut builder = KeyShapeBuilder::new();
+    let ks = builder.add_key_space("ks", 8, 1, KeyType::uniform(1));
+    let key_shape = builder.build();
+
+    let rare_key = 0u64.to_be_bytes().to_vec();
+    let rare_value: Vec<u8> = vec![0xAA; 16];
+
+    {
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            Metrics::new(),
+        )
+        .expect("open failed");
+
+        // Single insert + snapshot pins the only live index valpos in file 0.
+        db.insert(ks, rare_key.clone(), rare_value.clone())
+            .expect("insert");
+        db.wal_writer.wal_tracker_barrier();
+        db.force_rebuild_control_region().expect("first snapshot");
+
+        // Push the index writer far past file 0 with raw writes. The returned
+        // WalGuards are dropped, so no cell ever references these positions —
+        // they form a multi-file dead window between max(live_valpos) (file 0)
+        // and the writer's current file.
+        let payload = vec![0u8; config.frag_size as usize - 16];
+        for _ in 0..16 {
+            db.index_writer
+                .write(&PreparedWalWrite::new(&payload))
+                .expect("direct index write");
+        }
+        db.index_writer.wal_tracker_barrier();
+
+        // Sparse GC runs as part of this snapshot and unlinks the dead
+        // middle files, leaving on-disk layout = {0, writer-current-file}.
+        db.force_rebuild_control_region().expect("second snapshot");
+    }
+
+    // Sanity: writer advanced past file 1, and no file the writer must
+    // traverse on restart was reclaimed. Specifically, every file id from
+    // `max(live_valpos)`'s file (= 0 here) through the writer's current
+    // file must still be on disk — that is the invariant sparse GC must
+    // not violate.
+    let mut present: Vec<u64> = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            let name = p.file_name()?.to_str()?.to_string();
+            let id_str = name.strip_prefix("index_")?;
+            u64::from_str_radix(id_str, 16).ok()
+        })
+        .collect();
+    present.sort();
+    let max_id = *present.last().unwrap();
+    assert!(
+        max_id >= 2,
+        "dead-window setup must advance the writer past file 1; max_id={max_id}",
+    );
+    let expected: Vec<u64> = (0..=max_id).collect();
+    assert_eq!(
+        present, expected,
+        "sparse GC must not punch holes between max(live_valpos) and writer file",
+    );
+
+    // Reopen must not panic — this is the regression guard.
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).expect("reopen failed");
+    let v = db.get(ks, &rare_key).expect("read after reopen");
+    assert_eq!(v.as_deref(), Some(&rare_value[..]));
+}
+
 #[test]
 fn test_force_relocate_dirty_entry_preserves_data() {
     let dir = tempdir::TempDir::new("test_force_relocate_dirty").unwrap();

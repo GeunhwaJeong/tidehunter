@@ -946,24 +946,40 @@ impl Db {
             .large_table
             .relocate_and_snapshot(self, &relocate_files);
 
-        // Sparse GC: any open index file strictly below the writer's current
-        // file is reclaimable if no live position references it. A single old
-        // pinned blob does not pin every later empty file behind it.
+        // Sparse GC: an open index file is reclaimable iff it has no live
+        // position in `snapshot.data` AND sits strictly below both safety
+        // bounds:
+        //
+        //   - `pre_snapshot_file`: a file written during this rebuild may
+        //     hold a freshly-flushed blob whose updated `IndexLevels` post-
+        //     dates `snapshot.data` — the new valpos lives only in in-memory
+        //     state, so deleting that file would orphan it.
+        //   - `max_live_file`: on restart the writer rewinds to
+        //     `next_after(max(live_valpos))` and the mapper's
+        //     INITIAL_MAPS_BUFFER lookahead would immediately panic trying
+        //     to mmap a deleted file in `[F_max_live, F_writer]`.
         let layout = self.indexes.layout();
+        let pre_snapshot_file = layout.locate_file(pre_snapshot_index_pos);
         let mut live_files: HashSet<WalFileId> = HashSet::new();
+        let mut max_live_file: Option<WalFileId> = None;
         for pos in snapshot.data.iter_valid_val_positions() {
-            live_files.insert(layout.locate_file(pos.offset()));
+            let file_id = layout.locate_file(pos.offset());
+            live_files.insert(file_id);
+            max_live_file = Some(max_live_file.map_or(file_id, |m| m.max(file_id)));
         }
-        // Only consider files strictly below the writer's current file. The
-        // mapper pre-allocates lookahead files (INITIAL_MAPS_BUFFER), and
-        // deleting any of those would break the writer when it advances.
-        let current_writer_file = layout.locate_file(self.index_writer.position());
-        let to_delete: Vec<WalFileId> = self
-            .indexes
-            .file_ids()
-            .into_iter()
-            .filter(|id| *id < current_writer_file && !live_files.contains(id))
-            .collect();
+        let to_delete: Vec<WalFileId> = match max_live_file {
+            Some(max_live_file) => {
+                let cutoff = pre_snapshot_file.min(max_live_file);
+                self.indexes
+                    .file_ids()
+                    .into_iter()
+                    .filter(|id| *id < cutoff && !live_files.contains(id))
+                    .collect()
+            }
+            // Empty snapshot — restart starts the writer at offset 0, so we
+            // must keep every file the writer might traverse.
+            None => Vec::new(),
+        };
         self.indexes.fsync()?;
         self.wal.fsync()?;
         // Persist the control region BEFORE unlinking files. A crash between
