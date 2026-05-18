@@ -130,17 +130,22 @@ impl WalWriter {
 
     fn get_writeable_map(&self, position: u64) -> (Map, usize) {
         let (map, offset) = self.wal.layout.locate(position);
-        const MAX_ATTEMPTS: usize = 10 * 1000;
-        for _ in 0..MAX_ATTEMPTS {
-            let Some(map) = self.wal.get_map(map) else {
-                self.wal.metrics.wal_write_wait.inc();
-                thread::sleep(Duration::from_millis(1));
-                continue;
-            };
-            assert!(map.writeable, "Map is not writable");
-            return (map, offset as usize);
+        let mut attempts: usize = 0;
+        loop {
+            if let Some(map) = self.wal.get_map(map) {
+                assert!(map.writeable, "Map is not writable");
+                return (map, offset as usize);
+            }
+            self.wal.metrics.wal_write_wait.inc();
+            thread::sleep(Duration::from_millis(1));
+            attempts += 1;
+            if attempts.is_multiple_of(10 * 1000) {
+                println!(
+                    "Still waiting for writable map {map:?} after {} seconds",
+                    attempts / 1000
+                );
+            }
         }
-        panic!("Could not receive writable map {map:?}")
     }
 
     /// Current un-initialized position,
