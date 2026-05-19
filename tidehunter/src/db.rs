@@ -62,6 +62,7 @@ impl Db {
         config: Arc<Config>,
         metrics: Arc<Metrics>,
     ) -> DbResult<Arc<Self>> {
+        config.validate();
         let path = path.canonicalize()?;
         let lock = DbLock::acquire(&path, config.open_lock_retry_timeout)?;
         Self::maybe_create_shape_file(&path, &key_shape)?;

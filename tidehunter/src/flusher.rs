@@ -475,7 +475,7 @@ impl IndexFlusherThread {
         }
     }
 
-    /// Writes the freshly-promoted L1 image. When `auto_sharding` is on
+    /// Writes the freshly-promoted L1 image. When auto-sharding is enabled
     /// and the serialized blob exceeds the shard-split threshold, splits
     /// in-memory and flushes one blob per shard. The split is a pure
     /// in-memory partition of `new_l1` — no further shards are loaded
@@ -486,14 +486,13 @@ impl IndexFlusherThread {
         ks: KeySpace,
         new_l1: IndexTable,
     ) -> IndexLevels {
-        let split_threshold = ctx.config.l1_shard_split_threshold();
-        if ctx.config.auto_sharding {
+        if let Some(threshold) = ctx.config.index_auto_shard_threshold {
             let serialized = ctx
                 .ks_config
                 .index_format()
                 .serialize_index(&new_l1, &ctx.ks_config);
-            if serialized.len() > split_threshold {
-                return Self::flush_split_l1(loader, ctx, ks, new_l1, split_threshold);
+            if serialized.len() > threshold {
+                return Self::flush_split_l1(loader, ctx, ks, new_l1, threshold);
             }
         }
         let pos = loader.flush(ks, &new_l1).expect("Failed to flush index");
@@ -573,7 +572,9 @@ impl IndexFlusherThread {
         // original offset. Use the WAL tail as the placeholder so the merge
         // path's monotonic-offset assertion holds.
         let tombstone_placeholder = WalPosition::new(loader.current_wal_position().max(1), 1);
-        let split_threshold = ctx.config.l1_shard_split_threshold();
+        // `usize::MAX` when auto-sharding is disabled: re-sharding still
+        // rewrites touched shards but never splits any further.
+        let split_threshold = ctx.config.index_auto_shard_threshold.unwrap_or(usize::MAX);
         let first_owner = current_shards
             .keys()
             .next()
@@ -921,8 +922,10 @@ mod tests {
     fn make_ctx(auto_sharding: bool, frag_size: u64) -> KsContext {
         let mut config = Config::small();
         config.frag_size = frag_size;
-        config.auto_sharding = auto_sharding;
         config.l0_max_entries = Some(64);
+        if auto_sharding {
+            config.with_index_auto_sharding();
+        }
         let (shape, ks_id) =
             KeyShape::new_single_config(8, 1, KeyType::uniform(8), KeySpaceConfig::default());
         let ks = shape.ks(ks_id).clone();
@@ -1015,7 +1018,10 @@ mod tests {
         let loader = RecordingLoader::new();
         let dirty = build_table(1000);
         // Sanity: serialized size > the shard-split budget.
-        assert!(serialized_size(&ctx.ks_config, &dirty) > ctx.config.l1_shard_split_threshold());
+        assert!(
+            serialized_size(&ctx.ks_config, &dirty)
+                > ctx.config.index_auto_shard_threshold.unwrap()
+        );
 
         let cmd = flush_command(ctx.id(), dirty, IndexLevels::new());
         let (_orig, new_levels) =
@@ -1051,7 +1057,7 @@ mod tests {
 
         // Re-run split_recursive directly to confirm every shard fits
         // the budget — the on-disk shape the WAL layer accepts.
-        let threshold = ctx.config.l1_shard_split_threshold();
+        let threshold = ctx.config.index_auto_shard_threshold.unwrap();
         let entries: Vec<(Bytes, WalPosition)> = build_table(1000).iter().collect();
         let mut shard_tables: Vec<(Vec<u8>, Vec<u8>, IndexTable)> = Vec::new();
         IndexFlusherThread::split_recursive(&entries, &ctx.ks_config, threshold, &mut shard_tables);

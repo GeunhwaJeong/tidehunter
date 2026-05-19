@@ -3873,10 +3873,10 @@ fn test_auto_sharding_concurrent() {
     let dir = tempdir::TempDir::new("test-auto-sharding-concurrent").unwrap();
 
     let mut config = Config::small();
-    config.auto_sharding = true;
     config.frag_size = 4 * 1024;
     config.max_dirty_keys = 8;
     config.l0_max_entries = Some(16);
+    config.with_index_auto_sharding();
     let config = Arc::new(config);
 
     let (key_shape, ks) = KeyShape::new_single(8, 2, KeyType::uniform(1));

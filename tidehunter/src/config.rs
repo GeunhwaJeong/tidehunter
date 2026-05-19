@@ -1,3 +1,5 @@
+use crate::crc::CrcFrame;
+use crate::db::WalEntry;
 use crate::relocation::RelocationStrategy;
 use crate::wal::layout::{WalKind, WalLayout};
 use rand::Rng;
@@ -67,15 +69,17 @@ pub struct Config {
     /// instance at the same path to fully close before giving up.
     #[serde(default = "default_open_lock_retry_timeout")]
     pub open_lock_retry_timeout: Duration,
-    /// Opt-in to per-cell L1 auto-sharding. When enabled, the flusher splits
-    /// a cell's L1 across multiple WAL blobs (one per key range) if the
-    /// promoted index would otherwise exceed the WAL fragment size. The
-    /// read path consults a single shard per point lookup via
-    /// `IndexLevels::shard_for`. Default `false`; unsharded cells behave
-    /// identically with this flag on or off. See
-    /// `docs/claude-do-not-read/auto_sharding_l1_design.md`.
+    /// Opt-in to per-cell L1 auto-sharding. `Some(threshold)` means the
+    /// flusher splits a cell's L1 across multiple WAL blobs (one per key
+    /// range) whenever the promoted index's serialized size exceeds
+    /// `threshold` bytes. `None` (default) disables auto-sharding entirely;
+    /// behavior is identical to a database written without the feature.
+    /// Set via [`Config::with_index_auto_sharding`] (uses `frag_size / 2`)
+    /// or [`Config::with_index_auto_shard_threshold`] for an explicit
+    /// value. `Db::open` re-validates the value against the WAL fragment
+    /// ceiling, so a struct-literal bypass of the builders is still caught.
     #[serde(default)]
-    pub auto_sharding: bool,
+    pub index_auto_shard_threshold: Option<usize>,
 }
 
 fn default_open_lock_retry_timeout() -> Duration {
@@ -120,7 +124,7 @@ impl Default for Config {
             commit_pool_size: 0,
             num_pending_promotion_threads: default_num_pending_promotion_threads(),
             open_lock_retry_timeout: default_open_lock_retry_timeout(),
-            auto_sharding: false,
+            index_auto_shard_threshold: None,
         }
     }
 }
@@ -147,7 +151,7 @@ impl Config {
             commit_pool_size: 0,
             num_pending_promotion_threads: default_num_pending_promotion_threads(),
             open_lock_retry_timeout: default_open_lock_retry_timeout(),
-            auto_sharding: false,
+            index_auto_shard_threshold: None,
         }
     }
 
@@ -155,12 +159,42 @@ impl Config {
         self.frag_size
     }
 
-    /// Per-shard byte budget the flusher targets when auto-sharding splits
-    /// a cell's L1. Half of `frag_size` leaves room for WAL framing and
-    /// alignment so each shard's frame is still well under the fragment
-    /// ceiling that would panic the WAL writer.
-    pub fn l1_shard_split_threshold(&self) -> usize {
-        (self.frag_size / 2) as usize
+    /// Enable auto-sharding with an explicit per-shard byte threshold. The
+    /// flusher splits a promoted L1 when its serialized size exceeds
+    /// `threshold`. Panics if `threshold` cannot fit in a single WAL
+    /// fragment (the resulting frame would overflow `frag_size`).
+    pub fn with_index_auto_shard_threshold(&mut self, threshold: usize) {
+        self.index_auto_shard_threshold = Some(threshold);
+        self.validate();
+    }
+
+    /// Enable auto-sharding with the default `frag_size / 2` threshold —
+    /// half the fragment leaves comfortable room for WAL framing and
+    /// alignment so each shard's frame stays well under the ceiling.
+    pub fn with_index_auto_sharding(&mut self) {
+        let half = (self.frag_size / 2) as usize;
+        self.with_index_auto_shard_threshold(half);
+    }
+
+    /// Panics if any field holds a value that violates a cross-field
+    /// invariant. Called by the builders (early feedback) and by
+    /// `Db::open` (catches struct-literal / deserialize bypasses).
+    pub(crate) fn validate(&self) {
+        let Some(threshold) = self.index_auto_shard_threshold else {
+            return;
+        };
+        // Largest serialized index blob that still fits in one WAL fragment,
+        // after CRC frame header, WAL entry prefix, and worst-case alignment.
+        let alignment = if self.direct_io { 512 } else { 8 };
+        let overhead = CrcFrame::CRC_HEADER_LENGTH + WalEntry::INDEX_PREFIX_SIZE + alignment;
+        let max = (self.frag_size as usize).saturating_sub(overhead);
+        assert!(
+            threshold <= max,
+            "index_auto_shard_threshold {threshold} exceeds the WAL fragment ceiling \
+             {max} (frag_size={}, direct_io={})",
+            self.frag_size,
+            self.direct_io,
+        );
     }
 
     #[doc(hidden)] // Used by tools/tideconsole to get WAL configuration

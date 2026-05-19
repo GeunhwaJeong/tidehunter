@@ -18,8 +18,7 @@
 //! **content minimum** key to the shard's `WalPosition` plus its
 //! **content maximum** key. The min/max pair lets the iterator pick the
 //! one shard that holds a key past `prev_key` (forward) or before it
-//! (reverse) without ever opening an empty shard. See
-//! `docs/claude-do-not-read/auto_sharding_l1_design.md`.
+//! (reverse) without ever opening an empty shard.
 use crate::wal::position::WalPosition;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
