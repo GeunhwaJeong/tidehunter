@@ -67,6 +67,15 @@ pub struct Config {
     /// instance at the same path to fully close before giving up.
     #[serde(default = "default_open_lock_retry_timeout")]
     pub open_lock_retry_timeout: Duration,
+    /// Opt-in to per-cell L1 auto-sharding. When enabled, the flusher splits
+    /// a cell's L1 across multiple WAL blobs (one per key range) if the
+    /// promoted index would otherwise exceed the WAL fragment size. The
+    /// read path consults a single shard per point lookup via
+    /// `IndexLevels::shard_for`. Default `false`; unsharded cells behave
+    /// identically with this flag on or off. See
+    /// `docs/claude-do-not-read/auto_sharding_l1_design.md`.
+    #[serde(default)]
+    pub auto_sharding: bool,
 }
 
 fn default_open_lock_retry_timeout() -> Duration {
@@ -111,6 +120,7 @@ impl Default for Config {
             commit_pool_size: 0,
             num_pending_promotion_threads: default_num_pending_promotion_threads(),
             open_lock_retry_timeout: default_open_lock_retry_timeout(),
+            auto_sharding: false,
         }
     }
 }
@@ -137,6 +147,7 @@ impl Config {
             commit_pool_size: 0,
             num_pending_promotion_threads: default_num_pending_promotion_threads(),
             open_lock_retry_timeout: default_open_lock_retry_timeout(),
+            auto_sharding: false,
         }
     }
 

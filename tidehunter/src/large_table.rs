@@ -482,8 +482,9 @@ impl LargeTable {
             return Ok(context.report_lookup_result(found.valid(), LookupSource::Cache));
         }
         // Build the reader list while holding the mutex — otherwise a concurrent
-        // relocation could delete the backing blob before we open it.
-        let level_positions = entry.disk_levels_to_walk();
+        // relocation could delete the backing blob before we open it. The
+        // key-aware form keeps a sharded cell to a single shard reader.
+        let level_positions = entry.disk_levels_to_walk_for_key(k);
         if level_positions.is_empty() {
             // No on-disk levels left to consult (e.g., Loaded cell with just
             // `[L0]` — entry.data is authoritative and already missed).
@@ -1670,6 +1671,11 @@ impl LargeTableEntry {
     /// On-disk level positions the read path still needs to consult after
     /// probing `self.data`. For Loaded/DirtyLoaded, `maybe_load` folded L0
     /// into `self.data`, so only L1+ remain; everything else walks all levels.
+    ///
+    /// When the cell is sharded, every shard blob is included — callers
+    /// iterating a cell merge them with a k-way join. Point-lookup callers
+    /// should use [`disk_levels_to_walk_for_key`] instead so only the
+    /// covering shard is opened.
     pub(crate) fn disk_levels_to_walk(&self) -> SmallVec<[WalPosition; INLINE_LEVELS]> {
         match self.state {
             LargeTableEntryState::Loaded | LargeTableEntryState::DirtyLoaded => {
@@ -1677,6 +1683,33 @@ impl LargeTableEntry {
             }
             _ => self.levels.iter().collect(),
         }
+    }
+
+    /// Point-lookup specialization of [`disk_levels_to_walk`]: for a sharded
+    /// cell, returns at most one shard — the one whose range contains `key`
+    /// — instead of every shard. For unsharded cells the result is identical
+    /// to [`disk_levels_to_walk`].
+    pub(crate) fn disk_levels_to_walk_for_key(
+        &self,
+        key: &[u8],
+    ) -> SmallVec<[WalPosition; INLINE_LEVELS]> {
+        if !self.levels.is_sharded() {
+            return self.disk_levels_to_walk();
+        }
+        let mut out: SmallVec<[WalPosition; INLINE_LEVELS]> = SmallVec::new();
+        let below_l0_only = matches!(
+            self.state,
+            LargeTableEntryState::Loaded | LargeTableEntryState::DirtyLoaded
+        );
+        if !below_l0_only && let Some(l0) = self.levels.l0() {
+            out.push(l0);
+        }
+        // `is_sharded` was true above, so `shard_for` always returns Some
+        // for any key (the empty-key sentinel covers the lowest range).
+        if let Some(shard) = self.levels.shard_for(key) {
+            out.push(shard);
+        }
+        out
     }
 
     /// See IndexTable::next_entry for documentation.
@@ -2734,6 +2767,219 @@ mod tests {
             assert_eq!(key.as_ref(), 50_u64.to_be_bytes()); // Should skip over the deleted 40
             assert_eq!(pos, WalPosition::test_value(5));
         }
+    }
+
+    #[test]
+    fn test_disk_levels_to_walk_for_key_sharded() {
+        let metrics = Metrics::new();
+        let config = KeySpaceConfig::default().with_unloaded_iterator(true);
+        let (shape, ks_id) = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
+        let ks = shape.ks(ks_id);
+        let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
+        let cell_id = CellId::Integer(0);
+
+        // Three-shard btree: covers `..b"m"`, `b"m"..b"u"`, and `b"u"..`.
+        let mut shards = BTreeMap::new();
+        shards.insert(Vec::new(), WalPosition::test_value(11));
+        shards.insert(b"m".to_vec(), WalPosition::test_value(22));
+        shards.insert(b"u".to_vec(), WalPosition::test_value(33));
+
+        // Unloaded + sharded (no L0): just `shard_for(key)`.
+        let entry = LargeTableEntry::new_unloaded(
+            context.clone(),
+            cell_id.clone(),
+            IndexLevels::sharded(shards.clone()),
+            0,
+            None,
+        );
+        assert_eq!(
+            entry.disk_levels_to_walk_for_key(b"a").as_slice(),
+            &[WalPosition::test_value(11)],
+        );
+        assert_eq!(
+            entry.disk_levels_to_walk_for_key(b"p").as_slice(),
+            &[WalPosition::test_value(22)],
+        );
+        assert_eq!(
+            entry.disk_levels_to_walk_for_key(b"u").as_slice(),
+            &[WalPosition::test_value(33)],
+        );
+
+        // Unloaded + sharded with L0: L0 first, then the covering shard.
+        let entry = LargeTableEntry::new_unloaded(
+            context.clone(),
+            cell_id.clone(),
+            IndexLevels::sharded_with_l0(WalPosition::test_value(7), shards.clone()),
+            0,
+            None,
+        );
+        assert_eq!(
+            entry.disk_levels_to_walk_for_key(b"a").as_slice(),
+            &[WalPosition::test_value(7), WalPosition::test_value(11)],
+        );
+        assert_eq!(
+            entry.disk_levels_to_walk_for_key(b"z").as_slice(),
+            &[WalPosition::test_value(7), WalPosition::test_value(33)],
+        );
+
+        // Loaded + sharded with L0: L0 is already folded into `self.data`, so
+        // the disk walk drops it and only the covering shard remains.
+        let mut entry = LargeTableEntry::new_empty(context.clone(), cell_id.clone(), 0);
+        entry.levels = IndexLevels::sharded_with_l0(WalPosition::test_value(7), shards.clone());
+        entry.state = LargeTableEntryState::Loaded;
+        assert_eq!(
+            entry.disk_levels_to_walk_for_key(b"a").as_slice(),
+            &[WalPosition::test_value(11)],
+        );
+        assert_eq!(
+            entry.disk_levels_to_walk_for_key(b"q").as_slice(),
+            &[WalPosition::test_value(22)],
+        );
+
+        // Unsharded: identical to `disk_levels_to_walk` regardless of `key`.
+        let mut entry = LargeTableEntry::new_empty(context.clone(), cell_id.clone(), 0);
+        entry.levels = IndexLevels::promoted(WalPosition::test_value(99));
+        entry.state = LargeTableEntryState::Loaded;
+        assert_eq!(
+            entry.disk_levels_to_walk_for_key(b"anything"),
+            entry.disk_levels_to_walk(),
+        );
+    }
+
+    #[test]
+    fn test_next_in_cell_sharded() {
+        // Verify the iterator path (prepare_walk + execute_walk) yields the
+        // correct sequence across multiple disjoint L1 shards. The shards
+        // are stored at distinct WAL positions; a position-aware loader
+        // returns each shard's bytes for its own position so the k-way
+        // merge has real cross-shard inputs to combine.
+        let metrics = Metrics::new();
+        let config = KeySpaceConfig::default().with_unloaded_iterator(true);
+        let (shape, ks_id) = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
+        let ks = shape.ks(ks_id);
+        let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
+        let cell_id = CellId::Integer(0);
+
+        // Shard A: keys 10, 20. Shard B: keys 30, 40, 50.
+        let mut shard_a_table = IndexTable::default();
+        shard_a_table.insert(
+            Bytes::from(10_u64.to_be_bytes().to_vec()),
+            WalPosition::test_value(101),
+        );
+        shard_a_table.insert(
+            Bytes::from(20_u64.to_be_bytes().to_vec()),
+            WalPosition::test_value(102),
+        );
+        let mut shard_b_table = IndexTable::default();
+        shard_b_table.insert(
+            Bytes::from(30_u64.to_be_bytes().to_vec()),
+            WalPosition::test_value(103),
+        );
+        shard_b_table.insert(
+            Bytes::from(40_u64.to_be_bytes().to_vec()),
+            WalPosition::test_value(104),
+        );
+        shard_b_table.insert(
+            Bytes::from(50_u64.to_be_bytes().to_vec()),
+            WalPosition::test_value(105),
+        );
+
+        let format = ks.index_format();
+        let serialized_a = format.clean_serialize_index(&mut shard_a_table.clone(), ks);
+        let serialized_b = format.clean_serialize_index(&mut shard_b_table.clone(), ks);
+
+        let pos_a = WalPosition::test_value(201);
+        let pos_b = WalPosition::test_value(202);
+
+        struct ByPosLoader {
+            blobs: HashMap<u64, (IndexTable, Bytes)>,
+        }
+        impl Loader for ByPosLoader {
+            type Error = io::Error;
+            fn load(
+                &self,
+                _ks: &KeySpaceDesc,
+                position: WalPosition,
+            ) -> Result<IndexTable, io::Error> {
+                Ok(self.blobs.get(&position.offset()).unwrap().0.clone())
+            }
+            fn index_reader(&self, position: WalPosition) -> Result<WalRandomRead, io::Error> {
+                Ok(WalRandomRead::Mapped(
+                    self.blobs.get(&position.offset()).unwrap().1.clone(),
+                ))
+            }
+            fn flush_supported(&self) -> bool {
+                true
+            }
+            fn flush(&self, _ks: KeySpace, _data: &IndexTable) -> Result<WalPosition, io::Error> {
+                unreachable!("sharded iteration test never flushes")
+            }
+            fn last_processed_wal_position(&self) -> LastProcessed {
+                LastProcessed::none()
+            }
+            fn current_wal_position(&self) -> u64 {
+                1000
+            }
+            fn min_wal_position(&self) -> u64 {
+                0
+            }
+        }
+
+        let mut blobs = HashMap::new();
+        blobs.insert(pos_a.offset(), (shard_a_table, serialized_a));
+        blobs.insert(pos_b.offset(), (shard_b_table, serialized_b));
+        let loader = ByPosLoader { blobs };
+
+        // Two shards: range `..30` → pos_a, range `30..` → pos_b. The split
+        // key is the 8-byte BE encoding of 30, matching the on-disk key
+        // layout so lex comparison matches integer order.
+        let mut shards = BTreeMap::new();
+        shards.insert(Vec::new(), pos_a);
+        shards.insert(30_u64.to_be_bytes().to_vec(), pos_b);
+
+        let entry = LargeTableEntry::new_unloaded(
+            context.clone(),
+            cell_id.clone(),
+            IndexLevels::sharded(shards),
+            0,
+            None,
+        );
+        let mut row = Row {
+            context: context.clone(),
+            entries: Entries::Array(1, Box::new([entry])),
+        };
+
+        let expected: Vec<(u64, WalPosition)> = vec![
+            (10, WalPosition::test_value(101)),
+            (20, WalPosition::test_value(102)),
+            (30, WalPosition::test_value(103)),
+            (40, WalPosition::test_value(104)),
+            (50, WalPosition::test_value(105)),
+        ];
+        let mut yielded: Vec<(u64, WalPosition)> = Vec::new();
+        let mut prev: Option<Bytes> = None;
+        loop {
+            let next = LargeTable::next_in_cell(
+                &loader,
+                &mut row,
+                &cell_id,
+                prev.clone(),
+                false,
+                &mut IndexIterCaches::new(),
+            )
+            .unwrap();
+            let Some((key, get_result)) = next else {
+                break;
+            };
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(key.as_ref());
+            yielded.push((u64::from_be_bytes(buf), get_result.unwrap_wal_position()));
+            prev = Some(key);
+        }
+        assert_eq!(
+            yielded, expected,
+            "sharded iteration must merge in key order"
+        );
     }
 
     #[test]
