@@ -51,11 +51,6 @@ fn test_list_wal_files() {
     let config = Arc::new(Config {
         frag_size: wal_file_size,
         wal_file_size,
-        // The 1 KiB frag_size is below the budget's per-cell limit
-        // (`HEADER_SIZE` alone is 1 KiB), so the budget would reject every
-        // insert. This test only cares about WAL-file listing — disable the
-        // gate.
-        skip_space_budget: true,
         ..Config::default()
     });
     let metrics = Metrics::new();
