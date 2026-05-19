@@ -202,6 +202,16 @@ pub struct Metrics {
     pub l0_bytes_written: MetricIntCounterVec,
     pub l1_bytes_written: MetricIntCounterVec,
     pub promote_total: MetricIntCounterVec,
+    /// Number of L1 shard blobs written by the flusher. Each shard blob
+    /// counts as one increment regardless of whether it came from a fresh
+    /// split (Case A) or an incremental rewrite (Case B, future).
+    pub l1_shards_total: MetricIntCounterVec,
+    /// Number of times a promote produced more than one L1 shard (i.e.
+    /// auto-sharding kicked in for this cell on this promote).
+    pub l1_shard_split_total: MetricIntCounterVec,
+    /// Number of existing shards rewritten during an incremental sharded
+    /// promote (Case B). Stays at zero until Case B lands.
+    pub l1_shard_rewritten_total: MetricIntCounterVec,
 
     pub relocation_target_position: MetricIntGauge,
     pub relocation_terminal_position: MetricIntGauge,
@@ -431,6 +441,14 @@ impl Metrics {
             l0_bytes_written: counter_vec!("l0_bytes_written", &["ks"], registry, enabled),
             l1_bytes_written: counter_vec!("l1_bytes_written", &["ks"], registry, enabled),
             promote_total: counter_vec!("promote_total", &["ks"], registry, enabled),
+            l1_shards_total: counter_vec!("l1_shards_total", &["ks"], registry, enabled),
+            l1_shard_split_total: counter_vec!("l1_shard_split_total", &["ks"], registry, enabled),
+            l1_shard_rewritten_total: counter_vec!(
+                "l1_shard_rewritten_total",
+                &["ks"],
+                registry,
+                enabled
+            ),
 
             relocation_target_position: gauge!("relocation_target_position", registry, enabled),
             relocation_terminal_position: gauge!("relocation_terminal_position", registry, enabled),

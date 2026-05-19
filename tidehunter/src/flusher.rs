@@ -3,13 +3,16 @@
 use crate::cell::CellId;
 use crate::context::KsContext;
 use crate::db::Db;
+use crate::index::index_format::IndexFormat;
 use crate::index::index_table::IndexTable;
-use crate::index::levels::IndexLevels;
-use crate::key_shape::KeySpace;
+use crate::index::levels::{IndexLevels, IndexShard};
+use crate::key_shape::{KeySpace, KeySpaceDesc};
 use crate::large_table::Loader;
 use crate::metrics::Metrics;
 use crate::relocation::updates::RelocationUpdates;
 use crate::wal::position::WalPosition;
+use minibytes::Bytes;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::mpsc;
@@ -318,18 +321,11 @@ impl IndexFlusherThread {
             // L1 is the deepest level — nothing below to shadow, so drop
             // tombstones (and the keys they shadow) before writing.
             new_l1.clean_self();
-            let new_l1_pos = loader
-                .flush(command.ks, &new_l1)
-                .expect("Failed to flush index");
             ctx.metrics
                 .promote_total
                 .with_label_values(&[ctx.name()])
                 .inc();
-            ctx.metrics
-                .l1_bytes_written
-                .with_label_values(&[ctx.name()])
-                .inc_by(new_l1_pos.frame_len() as u64);
-            IndexLevels::promoted(new_l1_pos)
+            Self::write_promoted_l1(loader, ctx, command.ks, new_l1)
         } else {
             Self::run_compactor(ctx, &mut merged_l0);
             // If no L1 exists below, this L0 is the deepest level — strip
@@ -385,6 +381,112 @@ impl IndexFlusherThread {
                 .inc_by(compacted as u64);
         }
     }
+
+    /// Writes the freshly-promoted L1 image. When `auto_sharding` is on
+    /// and the serialized blob exceeds the shard-split threshold, splits
+    /// in-memory and flushes one blob per shard. The split is a pure
+    /// in-memory partition of `new_l1` — no further shards are loaded
+    /// from disk.
+    fn write_promoted_l1<L: Loader>(
+        loader: &L,
+        ctx: &KsContext,
+        ks: KeySpace,
+        new_l1: IndexTable,
+    ) -> IndexLevels {
+        let split_threshold = ctx.config.l1_shard_split_threshold();
+        if ctx.config.auto_sharding {
+            let serialized = ctx
+                .ks_config
+                .index_format()
+                .serialize_index(&new_l1, &ctx.ks_config);
+            if serialized.len() > split_threshold {
+                return Self::flush_split_l1(loader, ctx, ks, new_l1, split_threshold);
+            }
+        }
+        let pos = loader.flush(ks, &new_l1).expect("Failed to flush index");
+        ctx.metrics
+            .l1_bytes_written
+            .with_label_values(&[ctx.name()])
+            .inc_by(pos.frame_len() as u64);
+        IndexLevels::promoted(pos)
+    }
+
+    /// Median-by-index splits `new_l1` until every shard's serialized
+    /// size is ≤ `size_limit`, then flushes each as its own WAL blob.
+    /// A shard that's still oversize after collapsing to a single entry
+    /// is written as-is — the WAL layer will panic if the frame exceeds
+    /// the fragment, matching the design's "reshape the keyspace" guidance.
+    fn flush_split_l1<L: Loader>(
+        loader: &L,
+        ctx: &KsContext,
+        ks: KeySpace,
+        new_l1: IndexTable,
+        size_limit: usize,
+    ) -> IndexLevels {
+        let entries: Vec<(Bytes, WalPosition)> = new_l1.iter().collect();
+        let mut shard_tables: Vec<(Vec<u8>, Vec<u8>, IndexTable)> = Vec::new();
+        Self::split_recursive(&entries, &ctx.ks_config, size_limit, &mut shard_tables);
+        debug_assert!(
+            !shard_tables.is_empty(),
+            "split_recursive returned no shards for a non-empty L1",
+        );
+
+        let mut shards: BTreeMap<Vec<u8>, IndexShard> = BTreeMap::new();
+        let mut total_bytes: u64 = 0;
+        for (min_key, max_key, shard_table) in shard_tables.iter() {
+            let pos = loader
+                .flush(ks, shard_table)
+                .expect("Failed to flush shard");
+            total_bytes += pos.frame_len() as u64;
+            shards.insert(min_key.clone(), IndexShard::new(pos, max_key.clone()));
+        }
+        ctx.metrics
+            .l1_bytes_written
+            .with_label_values(&[ctx.name()])
+            .inc_by(total_bytes);
+        ctx.metrics
+            .l1_shards_total
+            .with_label_values(&[ctx.name()])
+            .inc_by(shards.len() as u64);
+        ctx.metrics
+            .l1_shard_split_total
+            .with_label_values(&[ctx.name()])
+            .inc();
+        IndexLevels::sharded(shards)
+    }
+
+    /// Recursively bisect `entries` by index. Appends each chunk that
+    /// fits `size_limit` (or has a single entry, which is always
+    /// accepted) to `out`.
+    fn split_recursive(
+        entries: &[(Bytes, WalPosition)],
+        ks: &KeySpaceDesc,
+        size_limit: usize,
+        out: &mut Vec<(Vec<u8>, Vec<u8>, IndexTable)>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        let table = Self::build_shard_table(entries);
+        let serialized = ks.index_format().serialize_index(&table, ks);
+        if serialized.len() <= size_limit || entries.len() == 1 {
+            let min_key = entries.first().unwrap().0.to_vec();
+            let max_key = entries.last().unwrap().0.to_vec();
+            out.push((min_key, max_key, table));
+            return;
+        }
+        let mid = entries.len() / 2;
+        Self::split_recursive(&entries[..mid], ks, size_limit, out);
+        Self::split_recursive(&entries[mid..], ks, size_limit, out);
+    }
+
+    fn build_shard_table(entries: &[(Bytes, WalPosition)]) -> IndexTable {
+        let mut table = IndexTable::default();
+        for (k, v) in entries {
+            table.insert(k.clone(), *v);
+        }
+        table
+    }
 }
 
 pub struct SendGuard(#[allow(dead_code)] parking_lot::ArcMutexGuard<parking_lot::RawMutex, ()>);
@@ -392,3 +494,216 @@ pub struct SendGuard(#[allow(dead_code)] parking_lot::ArcMutexGuard<parking_lot:
 // Rather than enable send_guard feature globally in parking_lot,
 // using this just for flusher barrier
 unsafe impl Send for SendGuard {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::index::index_format::IndexFormat;
+    use crate::key_shape::{KeyShape, KeySpace, KeySpaceConfig, KeyType};
+    use crate::wal::WalRandomRead;
+    use crate::wal::position::{LastProcessed, WalPosition};
+    use minibytes::Bytes;
+    use parking_lot::Mutex;
+    use std::io;
+
+    /// In-memory `Loader` that records each `flush` call's table length
+    /// and hands out monotonically increasing fake `WalPosition`s.
+    struct RecordingLoader {
+        flushes: Mutex<Vec<usize>>, // entry count of each flushed table
+        next_offset: Mutex<u64>,
+    }
+
+    impl RecordingLoader {
+        fn new() -> Self {
+            Self {
+                flushes: Mutex::new(Vec::new()),
+                next_offset: Mutex::new(1000),
+            }
+        }
+
+        fn flush_count(&self) -> usize {
+            self.flushes.lock().len()
+        }
+
+        fn flush_sizes(&self) -> Vec<usize> {
+            self.flushes.lock().clone()
+        }
+    }
+
+    impl Loader for RecordingLoader {
+        type Error = io::Error;
+
+        fn load(
+            &self,
+            _ks: &crate::key_shape::KeySpaceDesc,
+            _position: WalPosition,
+        ) -> Result<IndexTable, Self::Error> {
+            Ok(IndexTable::default())
+        }
+
+        fn index_reader(&self, _position: WalPosition) -> Result<WalRandomRead, Self::Error> {
+            unreachable!("RecordingLoader does not serve index reads")
+        }
+
+        fn flush_supported(&self) -> bool {
+            true
+        }
+
+        fn flush(&self, _ks: KeySpace, data: &IndexTable) -> Result<WalPosition, Self::Error> {
+            self.flushes.lock().push(data.len());
+            let mut off = self.next_offset.lock();
+            let pos = WalPosition::new(*off, 64);
+            *off += 4096;
+            Ok(pos)
+        }
+
+        fn last_processed_wal_position(&self) -> LastProcessed {
+            LastProcessed::none()
+        }
+
+        fn current_wal_position(&self) -> u64 {
+            1
+        }
+
+        fn min_wal_position(&self) -> u64 {
+            0
+        }
+    }
+
+    fn make_ctx(auto_sharding: bool, frag_size: u64) -> KsContext {
+        let mut config = Config::small();
+        config.frag_size = frag_size;
+        config.auto_sharding = auto_sharding;
+        config.l0_max_entries = Some(64);
+        let (shape, ks_id) =
+            KeyShape::new_single_config(8, 1, KeyType::uniform(8), KeySpaceConfig::default());
+        let ks = shape.ks(ks_id).clone();
+        KsContext::new(Arc::new(config), ks, Metrics::new())
+    }
+
+    fn build_table(n: usize) -> IndexTable {
+        let mut t = IndexTable::default();
+        for i in 0..n as u64 {
+            let key = (i + 1).to_be_bytes().to_vec(); // 8-byte BE, all unique
+            t.insert(Bytes::from(key), WalPosition::test_value(i + 1));
+        }
+        t
+    }
+
+    fn flush_command(ks: KeySpace, dirty: IndexTable, current: IndexLevels) -> IndexFlushCommand {
+        IndexFlushCommand::new(
+            ks,
+            CellId::Integer(0),
+            FlushKind::Flush {
+                dirty: Arc::new(dirty),
+                current_levels: current,
+                loaded: true,
+            },
+        )
+    }
+
+    fn serialized_size(ks: &crate::key_shape::KeySpaceDesc, t: &IndexTable) -> usize {
+        ks.index_format().serialize_index(t, ks).len()
+    }
+
+    #[test]
+    fn auto_sharding_off_writes_single_l1_even_when_huge() {
+        let ctx = make_ctx(false, 4096);
+        let loader = RecordingLoader::new();
+        // Far above l0_max_entries=64 and the synthetic 2 KiB threshold a
+        // 4 KiB frag_size would imply — but auto_sharding is off, so the
+        // flusher must keep today's single-blob shape.
+        let dirty = build_table(1000);
+        let cmd = flush_command(ctx.id(), dirty, IndexLevels::new());
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+        assert!(!new_levels.is_sharded());
+        assert_eq!(new_levels.l0(), None);
+        assert!(new_levels.l1().is_some(), "expected promoted [INVALID, L1]");
+        assert_eq!(loader.flush_count(), 1);
+    }
+
+    #[test]
+    fn auto_sharding_on_small_l1_stays_unsharded() {
+        // L1 fits in one fragment → no split, identical to the
+        // auto_sharding=false shape.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let loader = RecordingLoader::new();
+        let dirty = build_table(200);
+        let cmd = flush_command(ctx.id(), dirty, IndexLevels::new());
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+        assert!(!new_levels.is_sharded());
+        assert!(new_levels.l1().is_some());
+        assert_eq!(loader.flush_count(), 1);
+    }
+
+    #[test]
+    fn auto_sharding_on_large_l1_splits_into_multiple_shards() {
+        // Tiny frag_size forces the split threshold below the serialized
+        // size of the merged_l0, so the flusher must shard.
+        let ctx = make_ctx(true, 4096);
+        let loader = RecordingLoader::new();
+        let dirty = build_table(1000);
+        // Sanity: serialized size > the shard-split budget.
+        assert!(serialized_size(&ctx.ks_config, &dirty) > ctx.config.l1_shard_split_threshold());
+
+        let cmd = flush_command(ctx.id(), dirty, IndexLevels::new());
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+        assert!(new_levels.is_sharded(), "expected sharded IndexLevels");
+        assert_eq!(
+            new_levels.l1(),
+            None,
+            "L1 slot must be vacated when sharded"
+        );
+        assert!(new_levels.shards().len() > 1, "expected at least 2 shards");
+        // Flush count matches the shard count exactly — one WAL blob per
+        // shard, no extra writes.
+        assert_eq!(loader.flush_count(), new_levels.shards().len());
+        // Flushed entry counts add up to the original L1 size.
+        assert_eq!(loader.flush_sizes().iter().sum::<usize>(), 1000);
+
+        // Shards are disjoint and totally cover the input keyset.
+        let shards: Vec<(&Vec<u8>, &IndexShard)> = new_levels.shards().iter().collect();
+        let mut prev_max: Option<&[u8]> = None;
+        for (min_key, shard) in &shards {
+            assert!(min_key.as_slice() <= shard.max_key.as_slice());
+            if let Some(prev) = prev_max {
+                assert!(prev < min_key.as_slice(), "shards must be disjoint");
+            }
+            prev_max = Some(shard.max_key.as_slice());
+        }
+        assert_eq!(shards.first().unwrap().0, &1_u64.to_be_bytes().to_vec());
+        assert_eq!(
+            shards.last().unwrap().1.max_key,
+            1000_u64.to_be_bytes().to_vec(),
+        );
+
+        // Re-run split_recursive directly to confirm every shard fits
+        // the budget — the on-disk shape the WAL layer accepts.
+        let threshold = ctx.config.l1_shard_split_threshold();
+        let entries: Vec<(Bytes, WalPosition)> = build_table(1000).iter().collect();
+        let mut shard_tables: Vec<(Vec<u8>, Vec<u8>, IndexTable)> = Vec::new();
+        IndexFlusherThread::split_recursive(&entries, &ctx.ks_config, threshold, &mut shard_tables);
+        for (_, _, t) in &shard_tables {
+            assert!(serialized_size(&ctx.ks_config, t) <= threshold);
+        }
+        assert_eq!(shard_tables.len(), new_levels.shards().len());
+    }
+
+    #[test]
+    fn split_recursive_singleton_when_one_entry_still_too_big() {
+        // Defensive: with size_limit=0 every shard is "too big", but
+        // split_recursive bottoms out at len=1 instead of recursing forever.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let entries: Vec<(Bytes, WalPosition)> = build_table(4).iter().collect();
+        let mut out: Vec<(Vec<u8>, Vec<u8>, IndexTable)> = Vec::new();
+        IndexFlusherThread::split_recursive(&entries, &ctx.ks_config, 0, &mut out);
+        assert_eq!(out.len(), 4, "len=1 shards must be accepted defensively");
+        for (min_key, max_key, _) in &out {
+            assert_eq!(min_key, max_key, "single-entry shard has min==max");
+        }
+    }
+}

@@ -155,6 +155,14 @@ impl Config {
         self.frag_size
     }
 
+    /// Per-shard byte budget the flusher targets when auto-sharding splits
+    /// a cell's L1. Half of `frag_size` leaves room for WAL framing and
+    /// alignment so each shard's frame is still well under the fragment
+    /// ceiling that would panic the WAL writer.
+    pub fn l1_shard_split_threshold(&self) -> usize {
+        (self.frag_size / 2) as usize
+    }
+
     #[doc(hidden)] // Used by tools/tideconsole to get WAL configuration
     pub fn wal_layout(&self, kind: WalKind) -> WalLayout {
         let max_maps = match kind {
