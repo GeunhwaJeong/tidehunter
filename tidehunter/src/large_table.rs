@@ -897,10 +897,21 @@ impl LargeTable {
             // Phase 1 (under row lock): advance the per-cell state machine and
             // capture an `Arc<IndexTable>` snapshot of the in-memory overlay
             // along with the open readers we need for the on-disk levels.
+            // For sharded cells, the shard-pickers in `IndexLevels` use
+            // `prev_key`/`reverse` plus the per-shard `[min_key, max_key]`
+            // to pick the single shard that holds the next key in
+            // direction — no retries needed.
             let mutex_idx = context.ks_config.mutex_for_cell(&cell);
             let plan = {
                 let mut row = ks_table.lock(mutex_idx, &context.large_table_contention);
-                Self::prepare_walk(loader, &mut row, &cell, caches)?
+                Self::prepare_walk(
+                    loader,
+                    &mut row,
+                    &cell,
+                    prev_key.as_deref(),
+                    reverse,
+                    caches,
+                )?
             };
 
             // Phase 2 (no lock): k-way merge across the snapshot and the
@@ -964,10 +975,16 @@ impl LargeTable {
     /// the in-memory overlay, level positions, open readers). Caller must
     /// hold the row mutex; on `Ok(None)` there is nothing to walk in this
     /// cell.
+    ///
+    /// For sharded cells `disk_levels_to_walk_for_iter` picks the one
+    /// shard that holds the next key in `prev_key`/`reverse` direction;
+    /// no retry plumbing is needed.
     fn prepare_walk<L: Loader>(
         loader: &L,
         row: &mut Row,
         cell: &CellId,
+        prev_key: Option<&[u8]>,
+        reverse: bool,
         caches: &mut IndexIterCaches,
     ) -> Result<Option<WalkPlan>, L::Error> {
         let Some(entry) = row.try_entry_mut(cell) else {
@@ -981,7 +998,7 @@ impl LargeTable {
             caches.clear();
             return Ok(None);
         }
-        let level_positions = entry.disk_levels_to_walk();
+        let level_positions = entry.disk_levels_to_walk_for_iter(prev_key, reverse);
         if level_positions.is_empty() && entry.state == LargeTableEntryState::Unloaded {
             // No on-disk blobs and (by invariant) nothing in memory.
             caches.clear();
@@ -1065,10 +1082,10 @@ impl LargeTable {
         }
     }
 
-    /// Test-only convenience that runs all three phases against an
-    /// already-locked `Row`. Production iteration releases the row mutex
-    /// between phases (see `next_entry`); the unit tests below construct
-    /// `Row` values directly and don't model that release.
+    /// Test-only convenience that drives prepare_walk/execute_walk against
+    /// an already-locked `Row`. Production iteration releases the row
+    /// mutex between phases (see `next_entry`); the unit tests below
+    /// construct `Row` values directly and don't model that release.
     #[cfg(test)]
     fn next_in_cell<L: Loader>(
         loader: &L,
@@ -1078,7 +1095,9 @@ impl LargeTable {
         reverse: bool,
         caches: &mut IndexIterCaches,
     ) -> Result<Option<(Bytes, GetResult)>, L::Error> {
-        let Some(plan) = Self::prepare_walk(loader, row, cell, caches)? else {
+        let Some(plan) =
+            Self::prepare_walk(loader, row, cell, prev_key.as_deref(), reverse, caches)?
+        else {
             return Ok(None);
         };
         let walk_result = Self::execute_walk(
@@ -1672,9 +1691,9 @@ impl LargeTableEntry {
     /// probing `self.data`. For Loaded/DirtyLoaded, `maybe_load` folded L0
     /// into `self.data`, so only L1+ remain; everything else walks all levels.
     ///
-    /// When the cell is sharded, every shard blob is included — callers
-    /// iterating a cell merge them with a k-way join. Point-lookup callers
-    /// should use [`disk_levels_to_walk_for_key`] instead so only the
+    /// When the cell is sharded, every shard blob is included. Point-lookup
+    /// callers should use [`disk_levels_to_walk_for_key`] and iterator
+    /// callers should use [`disk_levels_to_walk_for_iter`] so only the
     /// covering shard is opened.
     pub(crate) fn disk_levels_to_walk(&self) -> SmallVec<[WalPosition; INLINE_LEVELS]> {
         match self.state {
@@ -1686,9 +1705,11 @@ impl LargeTableEntry {
     }
 
     /// Point-lookup specialization of [`disk_levels_to_walk`]: for a sharded
-    /// cell, returns at most one shard — the one whose range contains `key`
-    /// — instead of every shard. For unsharded cells the result is identical
-    /// to [`disk_levels_to_walk`].
+    /// cell, returns at most one shard — the one whose `[min, max]` covers
+    /// `key` — instead of every shard. When `key` lies outside every
+    /// shard's content range the shard is omitted entirely, so the caller
+    /// can short-circuit a wasted on-disk read. For unsharded cells the
+    /// result is identical to [`disk_levels_to_walk`].
     pub(crate) fn disk_levels_to_walk_for_key(
         &self,
         key: &[u8],
@@ -1704,10 +1725,43 @@ impl LargeTableEntry {
         if !below_l0_only && let Some(l0) = self.levels.l0() {
             out.push(l0);
         }
-        // `is_sharded` was true above, so `shard_for` always returns Some
-        // for any key (the empty-key sentinel covers the lowest range).
         if let Some(shard) = self.levels.shard_for(key) {
-            out.push(shard);
+            out.push(shard.position);
+        }
+        out
+    }
+
+    /// Iterator-step specialization of [`disk_levels_to_walk`]: for a
+    /// sharded cell, opens **one** shard per step — the one whose
+    /// content range contains the iterator's next key in
+    /// `prev_key`/`reverse` direction. Returns an empty list when the
+    /// cell's on-disk side is exhausted in that direction (no shard
+    /// has a content key past `prev_key`). For unsharded cells the
+    /// result matches [`disk_levels_to_walk`].
+    pub(crate) fn disk_levels_to_walk_for_iter(
+        &self,
+        prev_key: Option<&[u8]>,
+        reverse: bool,
+    ) -> SmallVec<[WalPosition; INLINE_LEVELS]> {
+        if !self.levels.is_sharded() {
+            return self.disk_levels_to_walk();
+        }
+        let shard = if reverse {
+            self.levels.shard_for_iter_reverse(prev_key)
+        } else {
+            self.levels.shard_for_iter_forward(prev_key)
+        };
+
+        let mut out: SmallVec<[WalPosition; INLINE_LEVELS]> = SmallVec::new();
+        let below_l0_only = matches!(
+            self.state,
+            LargeTableEntryState::Loaded | LargeTableEntryState::DirtyLoaded
+        );
+        if !below_l0_only && let Some(l0) = self.levels.l0() {
+            out.push(l0);
+        }
+        if let Some(s) = shard {
+            out.push(s.position);
         }
         out
     }
@@ -2390,6 +2444,7 @@ impl LargeTableFailPoints {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::levels::IndexShard;
     use crate::key_shape::{KeyShapeBuilder, KeySpaceConfig};
     use crate::wal::Wal;
     use crate::wal::layout::WalKind;
@@ -2778,13 +2833,23 @@ mod tests {
         let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
         let cell_id = CellId::Integer(0);
 
-        // Three-shard btree: covers `..b"m"`, `b"m"..b"u"`, and `b"u"..`.
+        // Three-shard btree. Ranges are tight `[min, max]` content extents:
+        // A: [b"a", b"l"], B: [b"m", b"t"], C: [b"u", b"z"].
         let mut shards = BTreeMap::new();
-        shards.insert(Vec::new(), WalPosition::test_value(11));
-        shards.insert(b"m".to_vec(), WalPosition::test_value(22));
-        shards.insert(b"u".to_vec(), WalPosition::test_value(33));
+        shards.insert(
+            b"a".to_vec(),
+            IndexShard::new(WalPosition::test_value(11), b"l".to_vec()),
+        );
+        shards.insert(
+            b"m".to_vec(),
+            IndexShard::new(WalPosition::test_value(22), b"t".to_vec()),
+        );
+        shards.insert(
+            b"u".to_vec(),
+            IndexShard::new(WalPosition::test_value(33), b"z".to_vec()),
+        );
 
-        // Unloaded + sharded (no L0): just `shard_for(key)`.
+        // Unloaded + sharded (no L0): just `shard_for(key).position`.
         let entry = LargeTableEntry::new_unloaded(
             context.clone(),
             cell_id.clone(),
@@ -2792,6 +2857,7 @@ mod tests {
             0,
             None,
         );
+        // Keys inside each shard's content range:
         assert_eq!(
             entry.disk_levels_to_walk_for_key(b"a").as_slice(),
             &[WalPosition::test_value(11)],
@@ -2804,6 +2870,9 @@ mod tests {
             entry.disk_levels_to_walk_for_key(b"u").as_slice(),
             &[WalPosition::test_value(33)],
         );
+        // Keys outside every shard's content range: no on-disk read needed.
+        assert!(entry.disk_levels_to_walk_for_key(b"").is_empty()); // below A.min
+        assert!(entry.disk_levels_to_walk_for_key(b"~").is_empty()); // above C.max
 
         // Unloaded + sharded with L0: L0 first, then the covering shard.
         let entry = LargeTableEntry::new_unloaded(
@@ -2820,6 +2889,11 @@ mod tests {
         assert_eq!(
             entry.disk_levels_to_walk_for_key(b"z").as_slice(),
             &[WalPosition::test_value(7), WalPosition::test_value(33)],
+        );
+        // Out-of-range key still consults L0 (the dirty overlay might hold it).
+        assert_eq!(
+            entry.disk_levels_to_walk_for_key(b"~").as_slice(),
+            &[WalPosition::test_value(7)],
         );
 
         // Loaded + sharded with L0: L0 is already folded into `self.data`, so
@@ -2846,21 +2920,71 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_next_in_cell_sharded() {
-        // Verify the iterator path (prepare_walk + execute_walk) yields the
-        // correct sequence across multiple disjoint L1 shards. The shards
-        // are stored at distinct WAL positions; a position-aware loader
-        // returns each shard's bytes for its own position so the k-way
-        // merge has real cross-shard inputs to combine.
-        let metrics = Metrics::new();
-        let config = KeySpaceConfig::default().with_unloaded_iterator(true);
-        let (shape, ks_id) = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
-        let ks = shape.ks(ks_id);
-        let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
-        let cell_id = CellId::Integer(0);
+    /// Counts `load` and `index_reader` calls per position so tests can
+    /// assert the iterator opens shard readers on demand instead of all
+    /// at once.
+    struct CountingByPosLoader {
+        blobs: HashMap<u64, (IndexTable, Bytes)>,
+        opens_by_pos: parking_lot::Mutex<HashMap<u64, usize>>,
+    }
 
-        // Shard A: keys 10, 20. Shard B: keys 30, 40, 50.
+    impl CountingByPosLoader {
+        fn new(blobs: HashMap<u64, (IndexTable, Bytes)>) -> Self {
+            Self {
+                blobs,
+                opens_by_pos: parking_lot::Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn opens_for(&self, pos: WalPosition) -> usize {
+            *self.opens_by_pos.lock().get(&pos.offset()).unwrap_or(&0)
+        }
+
+        fn total_opens(&self) -> usize {
+            self.opens_by_pos.lock().values().sum()
+        }
+    }
+
+    impl Loader for CountingByPosLoader {
+        type Error = io::Error;
+        fn load(&self, _ks: &KeySpaceDesc, position: WalPosition) -> Result<IndexTable, io::Error> {
+            Ok(self.blobs.get(&position.offset()).unwrap().0.clone())
+        }
+        fn index_reader(&self, position: WalPosition) -> Result<WalRandomRead, io::Error> {
+            *self
+                .opens_by_pos
+                .lock()
+                .entry(position.offset())
+                .or_insert(0) += 1;
+            Ok(WalRandomRead::Mapped(
+                self.blobs.get(&position.offset()).unwrap().1.clone(),
+            ))
+        }
+        fn flush_supported(&self) -> bool {
+            true
+        }
+        fn flush(&self, _ks: KeySpace, _data: &IndexTable) -> Result<WalPosition, io::Error> {
+            unreachable!("sharded iteration test never flushes")
+        }
+        fn last_processed_wal_position(&self) -> LastProcessed {
+            LastProcessed::none()
+        }
+        fn current_wal_position(&self) -> u64 {
+            1000
+        }
+        fn min_wal_position(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Builds a two-shard cell. Shard A: keys 10, 20. Shard B: keys 30, 40, 50.
+    /// Returns the loader, the row holding the entry, and the WAL positions of
+    /// each shard so callers can assert per-shard open counts.
+    fn make_two_shard_cell(
+        context: KsContext,
+        ks: &KeySpaceDesc,
+        cell_id: CellId,
+    ) -> (CountingByPosLoader, Row, WalPosition, WalPosition) {
         let mut shard_a_table = IndexTable::default();
         shard_a_table.insert(
             Bytes::from(10_u64.to_be_bytes().to_vec()),
@@ -2891,51 +3015,22 @@ mod tests {
         let pos_a = WalPosition::test_value(201);
         let pos_b = WalPosition::test_value(202);
 
-        struct ByPosLoader {
-            blobs: HashMap<u64, (IndexTable, Bytes)>,
-        }
-        impl Loader for ByPosLoader {
-            type Error = io::Error;
-            fn load(
-                &self,
-                _ks: &KeySpaceDesc,
-                position: WalPosition,
-            ) -> Result<IndexTable, io::Error> {
-                Ok(self.blobs.get(&position.offset()).unwrap().0.clone())
-            }
-            fn index_reader(&self, position: WalPosition) -> Result<WalRandomRead, io::Error> {
-                Ok(WalRandomRead::Mapped(
-                    self.blobs.get(&position.offset()).unwrap().1.clone(),
-                ))
-            }
-            fn flush_supported(&self) -> bool {
-                true
-            }
-            fn flush(&self, _ks: KeySpace, _data: &IndexTable) -> Result<WalPosition, io::Error> {
-                unreachable!("sharded iteration test never flushes")
-            }
-            fn last_processed_wal_position(&self) -> LastProcessed {
-                LastProcessed::none()
-            }
-            fn current_wal_position(&self) -> u64 {
-                1000
-            }
-            fn min_wal_position(&self) -> u64 {
-                0
-            }
-        }
-
         let mut blobs = HashMap::new();
         blobs.insert(pos_a.offset(), (shard_a_table, serialized_a));
         blobs.insert(pos_b.offset(), (shard_b_table, serialized_b));
-        let loader = ByPosLoader { blobs };
+        let loader = CountingByPosLoader::new(blobs);
 
-        // Two shards: range `..30` → pos_a, range `30..` → pos_b. The split
-        // key is the 8-byte BE encoding of 30, matching the on-disk key
-        // layout so lex comparison matches integer order.
+        // Shard A: [10, 20] at pos_a. Shard B: [30, 50] at pos_b.
+        // Btree keys are real content mins (8-byte BE), values carry max_key.
         let mut shards = BTreeMap::new();
-        shards.insert(Vec::new(), pos_a);
-        shards.insert(30_u64.to_be_bytes().to_vec(), pos_b);
+        shards.insert(
+            10_u64.to_be_bytes().to_vec(),
+            IndexShard::new(pos_a, 20_u64.to_be_bytes().to_vec()),
+        );
+        shards.insert(
+            30_u64.to_be_bytes().to_vec(),
+            IndexShard::new(pos_b, 50_u64.to_be_bytes().to_vec()),
+        );
 
         let entry = LargeTableEntry::new_unloaded(
             context.clone(),
@@ -2944,10 +3039,26 @@ mod tests {
             0,
             None,
         );
-        let mut row = Row {
-            context: context.clone(),
+        let row = Row {
+            context,
             entries: Entries::Array(1, Box::new([entry])),
         };
+        (loader, row, pos_a, pos_b)
+    }
+
+    #[test]
+    fn test_next_in_cell_sharded() {
+        // Two-shard cell, forward iteration. The min/max metadata on each
+        // shard lets `shard_for_iter_forward` pick the right shard in one
+        // btree probe per step — no boundary retries.
+        let metrics = Metrics::new();
+        let config = KeySpaceConfig::default().with_unloaded_iterator(true);
+        let (shape, ks_id) = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
+        let ks = shape.ks(ks_id);
+        let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
+        let cell_id = CellId::Integer(0);
+
+        let (loader, mut row, pos_a, pos_b) = make_two_shard_cell(context, ks, cell_id.clone());
 
         let expected: Vec<(u64, WalPosition)> = vec![
             (10, WalPosition::test_value(101)),
@@ -2958,6 +3069,7 @@ mod tests {
         ];
         let mut yielded: Vec<(u64, WalPosition)> = Vec::new();
         let mut prev: Option<Bytes> = None;
+        let mut caches = IndexIterCaches::new();
         loop {
             let next = LargeTable::next_in_cell(
                 &loader,
@@ -2965,7 +3077,7 @@ mod tests {
                 &cell_id,
                 prev.clone(),
                 false,
-                &mut IndexIterCaches::new(),
+                &mut caches,
             )
             .unwrap();
             let Some((key, get_result)) = next else {
@@ -2980,6 +3092,59 @@ mod tests {
             yielded, expected,
             "sharded iteration must merge in key order"
         );
+
+        // Open accounting: one shard open per emitted key. The terminating
+        // call (prev = 50 = max of B) returns no plan at all because
+        // `shard_for_iter_forward` reports no shard past prev_key, so
+        // prepare_walk short-circuits before opening any reader.
+        // A handles emits 10, 20 → 2 opens. B handles 30, 40, 50 → 3 opens.
+        assert_eq!(loader.opens_for(pos_a), 2);
+        assert_eq!(loader.opens_for(pos_b), 3);
+        assert_eq!(loader.total_opens(), 5);
+    }
+
+    #[test]
+    fn test_next_in_cell_sharded_reverse() {
+        // Same cell, reverse iteration. `shard_for_iter_reverse` picks B
+        // first and switches to A exactly when prev_key drops to B.min.
+        let metrics = Metrics::new();
+        let config = KeySpaceConfig::default().with_unloaded_iterator(true);
+        let (shape, ks_id) = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
+        let ks = shape.ks(ks_id);
+        let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
+        let cell_id = CellId::Integer(0);
+
+        let (loader, mut row, pos_a, pos_b) = make_two_shard_cell(context, ks, cell_id.clone());
+
+        let expected_keys: Vec<u64> = vec![50, 40, 30, 20, 10];
+        let mut yielded: Vec<u64> = Vec::new();
+        let mut prev: Option<Bytes> = None;
+        let mut caches = IndexIterCaches::new();
+        loop {
+            let next = LargeTable::next_in_cell(
+                &loader,
+                &mut row,
+                &cell_id,
+                prev.clone(),
+                true,
+                &mut caches,
+            )
+            .unwrap();
+            let Some((key, _)) = next else {
+                break;
+            };
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(key.as_ref());
+            yielded.push(u64::from_be_bytes(buf));
+            prev = Some(key);
+        }
+        assert_eq!(yielded, expected_keys);
+        // Mirror of the forward case: B handles 50, 40, 30 → 3 opens, A
+        // handles 20, 10 → 2 opens. The final call (prev = 10 = A.min)
+        // short-circuits before any open.
+        assert_eq!(loader.opens_for(pos_b), 3);
+        assert_eq!(loader.opens_for(pos_a), 2);
+        assert_eq!(loader.total_opens(), 5);
     }
 
     #[test]

@@ -494,7 +494,7 @@ mod legacy_v1 {
 mod tests {
     use super::*;
     use crate::cell::CellId;
-    use crate::index::levels::IndexLevels;
+    use crate::index::levels::{IndexLevels, IndexShard};
     use crate::key_shape::{KeyShape, KeyType, UniformKeyConfig};
     use crate::wal::position::{LastProcessed, WalPosition};
     use std::collections::BTreeMap;
@@ -527,9 +527,15 @@ mod tests {
                 LastProcessed::new_test(42),
             ),
         );
-        let mut shard_btree: BTreeMap<Vec<u8>, WalPosition> = BTreeMap::new();
-        shard_btree.insert(Vec::new(), WalPosition::test_value(1001));
-        shard_btree.insert(b"mid".to_vec(), WalPosition::test_value(1002));
+        let mut shard_btree: BTreeMap<Vec<u8>, IndexShard> = BTreeMap::new();
+        shard_btree.insert(
+            b"aaaaaaaa".to_vec(),
+            IndexShard::new(WalPosition::test_value(1001), b"low_max".to_vec()),
+        );
+        shard_btree.insert(
+            b"mid".to_vec(),
+            IndexShard::new(WalPosition::test_value(1002), b"zzzzzzzz".to_vec()),
+        );
         cr.snapshot.data[0].insert(
             CellId::Integer(1),
             SnapshotEntryData::from_levels(

@@ -14,14 +14,37 @@
 //!
 //! When auto-sharding is enabled and a cell's L1 would exceed the WAL
 //! fragment size, the L1 slot is "vacated" (set to INVALID) and the
-//! `shards` btree owns L1 instead. Each entry in `shards` maps a
-//! lower-bound byte key to the `WalPosition` of a per-range L1 sub-blob.
-//! See `docs/claude-do-not-read/auto_sharding_l1_design.md`.
+//! `shards` btree owns L1 instead. Each entry maps a shard's
+//! **content minimum** key to the shard's `WalPosition` plus its
+//! **content maximum** key. The min/max pair lets the iterator pick the
+//! one shard that holds a key past `prev_key` (forward) or before it
+//! (reverse) without ever opening an empty shard. See
+//! `docs/claude-do-not-read/auto_sharding_l1_design.md`.
 use crate::wal::position::WalPosition;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::ops::Bound;
+
+/// Per-shard descriptor stored as the value side of the shard btree.
+///
+/// `position` is the WAL location of the shard's serialized index blob.
+/// `max_key` is the largest content key inside that blob — paired with
+/// the btree key (which is the shard's smallest content key) it gives
+/// the iterator a closed `[min_key, max_key]` range without reading the
+/// blob, so forward iteration can decide "does this shard hold anything
+/// past prev_key?" in O(log N_shards).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexShard {
+    pub position: WalPosition,
+    pub max_key: Vec<u8>,
+}
+
+impl IndexShard {
+    pub fn new(position: WalPosition, max_key: Vec<u8>) -> Self {
+        Self { position, max_key }
+    }
+}
 
 /// Inline SmallVec capacity used by all per-level containers (the level list
 /// itself, plus matching buffers of readers/caches built alongside it in
@@ -42,10 +65,11 @@ pub const INLINE_LEVELS: usize = 2;
 /// - The empty list represents a cell that has never been flushed.
 /// - Sharded form (`!shards.is_empty()`): `positions[1]` MUST be
 ///   `WalPosition::INVALID` — the btree owns the L1 data. `positions[0]`
-///   (the L0 slot) still behaves normally. `shards` keys are the lower
-///   bound of each shard's key range, in strictly increasing byte order,
-///   and the smallest key MUST be `Vec::new()` so that every byte key
-///   falls in some shard's range under `range(..=k).next_back()`.
+///   (the L0 slot) still behaves normally.
+/// - Sharded btree keys are each shard's **smallest content key** in
+///   strictly increasing byte order (no sentinel). Each value's
+///   `max_key` is the shard's **largest content key** and satisfies
+///   `btree_key ≤ max_key < next_btree_key` (shards are disjoint).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexLevels {
     positions: SmallVec<[WalPosition; INLINE_LEVELS]>,
@@ -53,7 +77,7 @@ pub struct IndexLevels {
     /// the cell uses the legacy single-blob L1 (the common case). See the
     /// struct-level invariants for the contract this field carries.
     #[serde(default)]
-    shards: BTreeMap<Vec<u8>, WalPosition>,
+    shards: BTreeMap<Vec<u8>, IndexShard>,
 }
 
 impl IndexLevels {
@@ -123,9 +147,8 @@ impl IndexLevels {
     /// per-range blobs in `shards`. Shape: `[INVALID, INVALID]` plus the
     /// btree owning L1.
     ///
-    /// Panics (debug) if `shards` is empty, its first key is not the empty
-    /// `Vec<u8>` sentinel, or any value is invalid.
-    pub fn sharded(shards: BTreeMap<Vec<u8>, WalPosition>) -> Self {
+    /// Panics (debug) on any invariant violation (see [`debug_assert_shards`]).
+    pub fn sharded(shards: BTreeMap<Vec<u8>, IndexShard>) -> Self {
         Self::debug_assert_shards(&shards);
         let mut positions = SmallVec::new();
         positions.push(WalPosition::INVALID);
@@ -135,7 +158,7 @@ impl IndexLevels {
 
     /// Returns a sharded level set carrying an L0 alongside the shard btree.
     /// Shape: `[l0, INVALID]` plus the btree owning L1.
-    pub fn sharded_with_l0(l0: WalPosition, shards: BTreeMap<Vec<u8>, WalPosition>) -> Self {
+    pub fn sharded_with_l0(l0: WalPosition, shards: BTreeMap<Vec<u8>, IndexShard>) -> Self {
         debug_assert!(
             l0.is_valid(),
             "IndexLevels::sharded_with_l0 requires a valid L0 position",
@@ -147,20 +170,31 @@ impl IndexLevels {
         Self { positions, shards }
     }
 
-    fn debug_assert_shards(shards: &BTreeMap<Vec<u8>, WalPosition>) {
+    fn debug_assert_shards(shards: &BTreeMap<Vec<u8>, IndexShard>) {
         debug_assert!(
             !shards.is_empty(),
             "sharded IndexLevels requires at least one shard",
         );
         debug_assert!(
-            shards.keys().next().map(|k| k.is_empty()).unwrap_or(false),
-            "first shard key must be the empty byte string \
-             (sentinel for keyspace minimum)",
-        );
-        debug_assert!(
-            shards.values().all(|p| p.is_valid()),
+            shards.values().all(|s| s.position.is_valid()),
             "shard positions must all be valid",
         );
+        // min_key (= btree key) ≤ max_key for every shard, and shards are
+        // disjoint: max_key(X) < min_key(X+1).
+        let mut prev_max: Option<&[u8]> = None;
+        for (min_key, shard) in shards.iter() {
+            debug_assert!(
+                min_key.as_slice() <= shard.max_key.as_slice(),
+                "shard min_key must be ≤ max_key",
+            );
+            if let Some(prev) = prev_max {
+                debug_assert!(
+                    prev < min_key.as_slice(),
+                    "shards must be disjoint: previous max_key < current min_key",
+                );
+            }
+            prev_max = Some(shard.max_key.as_slice());
+        }
     }
 
     /// True when no level holds a blob. Equivalent to `l0().is_none() && l1().is_none() && ...`
@@ -198,7 +232,7 @@ impl IndexLevels {
             .iter()
             .copied()
             .filter(|p| p.is_valid())
-            .chain(self.shards.values().copied())
+            .chain(self.shards.values().map(|s| s.position))
     }
 
     /// Like [`iter`] but yields `(level_idx, position)` pairs. The level index
@@ -211,7 +245,7 @@ impl IndexLevels {
             .copied()
             .enumerate()
             .filter(|(_, p)| p.is_valid())
-            .chain(self.shards.values().copied().map(|p| (1usize, p)))
+            .chain(self.shards.values().map(|s| (1usize, s.position)))
     }
 
     /// Iterates **populated** levels below L0 (slot index ≥ 1), skipping
@@ -226,7 +260,7 @@ impl IndexLevels {
             .copied()
             .skip(1)
             .filter(|p| p.is_valid())
-            .chain(self.shards.values().copied())
+            .chain(self.shards.values().map(|s| s.position))
     }
 
     /// Returns the position at a specific level slot, if populated.
@@ -280,24 +314,76 @@ impl IndexLevels {
 
     /// Returns the shard btree. Use [`shard_for`] for the per-key lookup
     /// instead of walking the map directly.
-    pub fn shards(&self) -> &BTreeMap<Vec<u8>, WalPosition> {
+    pub fn shards(&self) -> &BTreeMap<Vec<u8>, IndexShard> {
         &self.shards
     }
 
-    /// Returns the shard `WalPosition` whose range contains `key`. The
-    /// btree's first key is the empty byte string (sentinel) so every key
-    /// has a covering shard. Returns `None` only when the cell is not
-    /// sharded.
-    pub fn shard_for(&self, key: &[u8]) -> Option<WalPosition> {
+    /// Returns the shard whose `[min_key, max_key]` range contains `key`,
+    /// or `None` when the cell is unsharded or `key` falls outside every
+    /// shard's content range (below the first shard's min, above the last
+    /// shard's max, or in a gap between shards). Point-lookup callers use
+    /// this to skip on-disk reads for keys that can't be in any shard.
+    pub fn shard_for(&self, key: &[u8]) -> Option<&IndexShard> {
+        let (_, shard) = self
+            .shards
+            .range::<[u8], _>((Bound::Unbounded, Bound::Included(key)))
+            .next_back()?;
+        (shard.max_key.as_slice() >= key).then_some(shard)
+    }
+
+    /// Forward-iteration shard picker: the shard holding the smallest
+    /// content key strictly greater than `prev_key`, or `None` when the
+    /// cell has no key past `prev_key`. Returns the first shard when
+    /// `prev_key` is `None`.
+    ///
+    /// Algorithm: the predecessor of `prev_key` in the btree (if any)
+    /// covers `prev_key`'s range; we accept it iff its `max_key`
+    /// strictly exceeds `prev_key` — i.e. there's still content past
+    /// the cursor inside that shard. Otherwise the next shard whose
+    /// `min_key > prev_key` (a single btree query) is the answer; the
+    /// shard's `min_key` is itself the smallest content key past
+    /// `prev_key`.
+    pub fn shard_for_iter_forward(&self, prev_key: Option<&[u8]>) -> Option<&IndexShard> {
         if self.shards.is_empty() {
             return None;
         }
-        // range::<[u8], _>(..=key) finds the greatest btree key ≤ `key`.
-        // The sharded-form invariant guarantees a covering entry exists.
-        self.shards
-            .range::<[u8], _>((Bound::Unbounded, Bound::Included(key)))
+        let Some(k) = prev_key else {
+            return self.shards.values().next();
+        };
+        if let Some((_, pred)) = self
+            .shards
+            .range::<[u8], _>((Bound::Unbounded, Bound::Included(k)))
             .next_back()
-            .map(|(_, p)| *p)
+            && pred.max_key.as_slice() > k
+        {
+            return Some(pred);
+        }
+        self.shards
+            .range::<[u8], _>((Bound::Excluded(k), Bound::Unbounded))
+            .next()
+            .map(|(_, s)| s)
+    }
+
+    /// Reverse-iteration shard picker: the shard holding the largest
+    /// content key strictly less than `prev_key`, or `None` when the
+    /// cell has no key below `prev_key`. Returns the last shard when
+    /// `prev_key` is `None`.
+    ///
+    /// Algorithm: pick the shard with the largest `min_key < prev_key`
+    /// (strict). Because the btree key IS the shard's smallest content
+    /// key, that `min_key` is itself a content key below `prev_key`, so
+    /// the shard is guaranteed non-empty for the reverse merge.
+    pub fn shard_for_iter_reverse(&self, prev_key: Option<&[u8]>) -> Option<&IndexShard> {
+        if self.shards.is_empty() {
+            return None;
+        }
+        let Some(k) = prev_key else {
+            return self.shards.values().next_back();
+        };
+        self.shards
+            .range::<[u8], _>((Bound::Unbounded, Bound::Excluded(k)))
+            .next_back()
+            .map(|(_, s)| s)
     }
 }
 
@@ -379,47 +465,53 @@ mod tests {
         lvls.set(1, pos(1));
     }
 
-    /// Builds a btree with the leading empty-key sentinel and one additional
-    /// split point at `mid`.
+    /// Builds a two-shard btree.
+    /// Shard A: `[min_a, max_a]` at `pos_a`. Shard B: `[min_b, max_b]` at `pos_b`.
+    /// Caller must keep `max_a < min_b` to honor the disjointness invariant.
     fn two_shard_btree(
-        p0: WalPosition,
-        mid: &[u8],
-        p1: WalPosition,
-    ) -> BTreeMap<Vec<u8>, WalPosition> {
+        min_a: &[u8],
+        max_a: &[u8],
+        pos_a: WalPosition,
+        min_b: &[u8],
+        max_b: &[u8],
+        pos_b: WalPosition,
+    ) -> BTreeMap<Vec<u8>, IndexShard> {
         let mut m = BTreeMap::new();
-        m.insert(Vec::new(), p0);
-        m.insert(mid.to_vec(), p1);
+        m.insert(min_a.to_vec(), IndexShard::new(pos_a, max_a.to_vec()));
+        m.insert(min_b.to_vec(), IndexShard::new(pos_b, max_b.to_vec()));
         m
     }
 
     #[test]
     fn sharded_no_l0() {
-        let shards = two_shard_btree(pos(10), b"m", pos(20));
+        // Shard A: [b"a", b"l"] at pos 10. Shard B: [b"m", b"z"] at pos 20.
+        let shards = two_shard_btree(b"a", b"l", pos(10), b"m", b"z", pos(20));
         let lvls = IndexLevels::sharded(shards.clone());
         assert!(!lvls.is_empty());
         assert!(lvls.is_sharded());
         assert_eq!(lvls.l0(), None);
         assert_eq!(lvls.l1(), None, "L1 slot is vacated when sharded");
-        // iter yields shards in btree order.
+        // iter yields shard positions in btree order.
         let collected: Vec<_> = lvls.iter().collect();
         assert_eq!(collected, vec![pos(10), pos(20)]);
-        // iter_below_l0 same shape since no L0.
         let below: Vec<_> = lvls.iter_below_l0().collect();
         assert_eq!(below, vec![pos(10), pos(20)]);
-        // shard_for: empty key -> first shard; below-mid -> first; at/above-mid -> second.
-        assert_eq!(lvls.shard_for(b""), Some(pos(10)));
-        assert_eq!(lvls.shard_for(b"a"), Some(pos(10)));
-        assert_eq!(lvls.shard_for(b"l"), Some(pos(10)));
-        assert_eq!(lvls.shard_for(b"m"), Some(pos(20)));
-        assert_eq!(lvls.shard_for(b"n"), Some(pos(20)));
-        // is_single_level: two shards ⇒ not single-level.
+        // shard_for: tight `[min, max]` check.
+        assert_eq!(lvls.shard_for(b"a").map(|s| s.position), Some(pos(10))); // min of A
+        assert_eq!(lvls.shard_for(b"f").map(|s| s.position), Some(pos(10))); // inside A
+        assert_eq!(lvls.shard_for(b"l").map(|s| s.position), Some(pos(10))); // max of A
+        assert_eq!(lvls.shard_for(b"m").map(|s| s.position), Some(pos(20))); // min of B
+        assert_eq!(lvls.shard_for(b"z").map(|s| s.position), Some(pos(20))); // max of B
+        // Outside any shard's content range:
+        assert_eq!(lvls.shard_for(b"").map(|s| s.position), None); // below A.min
+        assert_eq!(lvls.shard_for(b"~").map(|s| s.position), None); // above B.max
         assert!(!lvls.is_single_level());
         assert_eq!(lvls.shards(), &shards);
     }
 
     #[test]
     fn sharded_with_l0_iterates_l0_first() {
-        let shards = two_shard_btree(pos(10), b"k", pos(20));
+        let shards = two_shard_btree(b"a", b"j", pos(10), b"k", b"z", pos(20));
         let lvls = IndexLevels::sharded_with_l0(pos(99), shards);
         assert!(!lvls.is_empty());
         assert!(lvls.is_sharded());
@@ -427,10 +519,8 @@ mod tests {
         assert_eq!(lvls.l1(), None);
         let collected: Vec<_> = lvls.iter().collect();
         assert_eq!(collected, vec![pos(99), pos(10), pos(20)]);
-        // iter_with_level: L0 at 0; shards at 1.
         let levels_pairs: Vec<_> = lvls.iter_with_level().collect();
         assert_eq!(levels_pairs, vec![(0, pos(99)), (1, pos(10)), (1, pos(20))]);
-        // iter_below_l0 drops L0.
         let below: Vec<_> = lvls.iter_below_l0().collect();
         assert_eq!(below, vec![pos(10), pos(20)]);
     }
@@ -439,15 +529,91 @@ mod tests {
     fn shard_for_returns_none_when_not_sharded() {
         let lvls = IndexLevels::promoted(pos(1));
         assert!(!lvls.is_sharded());
-        assert_eq!(lvls.shard_for(b""), None);
-        assert_eq!(lvls.shard_for(b"anything"), None);
+        assert!(lvls.shard_for(b"").is_none());
+        assert!(lvls.shard_for(b"anything").is_none());
+    }
+
+    #[test]
+    fn shard_for_iter_forward_paths() {
+        // Shard A: [b"a", b"j"]. Shard B: [b"m", b"z"].
+        let shards = two_shard_btree(b"a", b"j", pos(10), b"m", b"z", pos(20));
+        let lvls = IndexLevels::sharded(shards);
+
+        // prev=None → first shard.
+        assert_eq!(
+            lvls.shard_for_iter_forward(None).map(|s| s.position),
+            Some(pos(10))
+        );
+        // prev below all content → first shard (its min > prev).
+        assert_eq!(
+            lvls.shard_for_iter_forward(Some(b"")).map(|s| s.position),
+            Some(pos(10))
+        );
+        // prev inside A, before A.max → A (predecessor with max > prev).
+        assert_eq!(
+            lvls.shard_for_iter_forward(Some(b"e")).map(|s| s.position),
+            Some(pos(10))
+        );
+        // prev == A.max → A has nothing past, skip to B.
+        assert_eq!(
+            lvls.shard_for_iter_forward(Some(b"j")).map(|s| s.position),
+            Some(pos(20))
+        );
+        // prev in the gap (above A.max, below B.min) → B.
+        assert_eq!(
+            lvls.shard_for_iter_forward(Some(b"k")).map(|s| s.position),
+            Some(pos(20))
+        );
+        // prev inside B → B.
+        assert_eq!(
+            lvls.shard_for_iter_forward(Some(b"q")).map(|s| s.position),
+            Some(pos(20))
+        );
+        // prev == B.max → cell exhausted.
+        assert!(lvls.shard_for_iter_forward(Some(b"z")).is_none());
+        // prev above everything → cell exhausted.
+        assert!(lvls.shard_for_iter_forward(Some(b"~")).is_none());
+    }
+
+    #[test]
+    fn shard_for_iter_reverse_paths() {
+        let shards = two_shard_btree(b"a", b"j", pos(10), b"m", b"z", pos(20));
+        let lvls = IndexLevels::sharded(shards);
+
+        // prev=None → last shard.
+        assert_eq!(
+            lvls.shard_for_iter_reverse(None).map(|s| s.position),
+            Some(pos(20))
+        );
+        // prev above B.max → B.
+        assert_eq!(
+            lvls.shard_for_iter_reverse(Some(b"~")).map(|s| s.position),
+            Some(pos(20))
+        );
+        // prev inside B → B (its min < prev).
+        assert_eq!(
+            lvls.shard_for_iter_reverse(Some(b"q")).map(|s| s.position),
+            Some(pos(20))
+        );
+        // prev == B.min → no shard has min < B.min except A; pick A.
+        assert_eq!(
+            lvls.shard_for_iter_reverse(Some(b"m")).map(|s| s.position),
+            Some(pos(10))
+        );
+        // prev inside A → A.
+        assert_eq!(
+            lvls.shard_for_iter_reverse(Some(b"e")).map(|s| s.position),
+            Some(pos(10))
+        );
+        // prev == A.min → no shard has min < A.min → cell exhausted.
+        assert!(lvls.shard_for_iter_reverse(Some(b"a")).is_none());
+        // prev below A.min → cell exhausted.
+        assert!(lvls.shard_for_iter_reverse(Some(b"")).is_none());
     }
 
     #[test]
     fn sharded_serde_roundtrip() {
-        // Round-trip through bincode: the SerDe-derived format must preserve
-        // both the positions vector and the shard btree intact.
-        let shards = two_shard_btree(pos(7), b"split", pos(8));
+        let shards = two_shard_btree(b"a", b"f", pos(7), b"split", b"z", pos(8));
         let lvls = IndexLevels::sharded_with_l0(pos(3), shards);
         let bytes = bincode::serialize(&lvls).unwrap();
         let back: IndexLevels = bincode::deserialize(&bytes).unwrap();
@@ -467,13 +633,10 @@ mod tests {
 
     #[test]
     fn sharded_latest_returns_l0_or_none() {
-        let shards = two_shard_btree(pos(10), b"x", pos(20));
+        let shards = two_shard_btree(b"a", b"j", pos(10), b"m", b"z", pos(20));
         let with_l0 = IndexLevels::sharded_with_l0(pos(99), shards.clone());
         assert_eq!(with_l0.latest(), Some(pos(99)));
         let no_l0 = IndexLevels::sharded(shards);
-        // No L0 + sharded: "freshest" is undefined across disjoint shards.
-        // latest() returns None so misuse stays loud rather than silently
-        // pretending one shard is the answer.
         assert_eq!(no_l0.latest(), None);
     }
 }
