@@ -3961,6 +3961,6 @@ fn test_auto_sharding_concurrent() {
     );
     assert!(
         resharding > 0,
-        "expected resharding (Case B incremental sharded promote) to fire"
+        "expected re-sharding (incremental sharded promote) to fire"
     );
 }

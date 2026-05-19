@@ -74,7 +74,7 @@ pub enum FlushKind {
     ///   resulting levels whose position is still in `relocate_positions`
     ///   (i.e., wasn't naturally rewritten by the merge/promote) is
     ///   reflushed at a fresh position. This is how dirty sharded cells
-    ///   evacuate stale shards that Case B leaves untouched.
+    ///   evacuate stale shards that re-sharding leaves untouched.
     Flush {
         dirty: Arc<IndexTable>,
         current_levels: IndexLevels,
@@ -379,7 +379,7 @@ impl IndexFlusherThread {
                 .with_label_values(&[ctx.name()])
                 .inc();
             if current_levels.is_sharded() {
-                // Case B: spread merged_l0 across existing shards, rewriting
+                // Re-sharding: spread merged_l0 across existing shards, rewriting
                 // only those that received keys (each possibly split again
                 // if it overflows the shard budget). Untouched shards keep
                 // their existing WAL blobs.
@@ -433,7 +433,7 @@ impl IndexFlusherThread {
 
         // Post-pass: any blob in `new_levels` whose position is still in
         // `relocate_positions` wasn't naturally rewritten by the merge/promote
-        // above (untouched Case B shards, or a stale L1 under the L0-write
+        // above (untouched re-sharding shards, or a stale L1 under the L0-write
         // branch). Reflush those at fresh positions.
         let new_levels = match &command.flush_kind {
             FlushKind::Flush {
@@ -559,7 +559,7 @@ impl IndexFlusherThread {
         total_bytes
     }
 
-    /// Sharded promote (Case B): partitions `merged_l0` by owning shard,
+    /// Re-sharding promote: partitions `merged_l0` by owning shard,
     /// rewrites touched shards (re-splitting on overflow), and preserves
     /// untouched shard positions.
     fn write_sharded_promote<L: Loader>(
@@ -680,7 +680,7 @@ impl IndexFlusherThread {
     /// Used by two call paths:
     /// - Sharded `ForceRelocate` (clean entry): the entire rewrite.
     /// - Flush post-pass: rewrite the blobs the normal merge/promote left
-    ///   in place (e.g. untouched shards under Case B, or a stale L1 when
+    ///   in place (e.g. untouched shards under re-sharding, or a stale L1 when
     ///   the dirty overlay was small enough for the L0-write branch).
     fn relocate_in_levels<L: Loader>(
         loader: &L,
@@ -863,7 +863,7 @@ mod tests {
         }
 
         /// Pre-seeds the loader with a blob at the given position so
-        /// Case B tests can simulate "this shard already exists on disk".
+        /// re-sharding tests can simulate "this shard already exists on disk".
         fn seed(&self, pos: WalPosition, table: IndexTable) {
             self.blobs.lock().insert(pos.offset(), table);
         }
@@ -1075,7 +1075,7 @@ mod tests {
         }
     }
 
-    // ----- Case B (incremental sharded promote) -----
+    // ----- Re-sharding (incremental sharded promote) -----
 
     /// Seeds the loader with a sharded cell whose shards cover the given
     /// inclusive `(min, max)` u64 ranges.
@@ -1108,7 +1108,7 @@ mod tests {
 
     /// Builds an `IndexTable` from an iterator of `(key, Option<pos>)`.
     /// `None` means tombstone (remove with a placeholder offset). Used to
-    /// construct the dirty L0 overlay for Case B tests.
+    /// construct the dirty L0 overlay for re-sharding tests.
     fn build_dirty(entries: &[(u64, Option<u64>)]) -> IndexTable {
         let mut t = IndexTable::default();
         for (k, p) in entries {
@@ -1149,7 +1149,7 @@ mod tests {
         let (current_levels, positions) = seed_sharded_cell(&loader, &[(1, 100), (200, 300)]);
 
         // 65 dirty overwrites in shard A's existing [1, 100] range; >
-        // l0_max_entries=64 so the flusher promotes via Case B.
+        // l0_max_entries=64 so the flusher promotes via re-sharding.
         let dirty_entries: Vec<(u64, Option<u64>)> =
             (1..=65u64).map(|k| (k, Some(k + 10_000))).collect();
         let dirty = build_dirty(&dirty_entries);
@@ -1158,7 +1158,7 @@ mod tests {
         let (_orig, new_levels) =
             IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
 
-        assert!(new_levels.is_sharded(), "still sharded after Case B");
+        assert!(new_levels.is_sharded(), "still sharded after re-sharding");
         assert_eq!(new_levels.shards().len(), 2, "two shards expected");
 
         // Shard B (200..=300) is untouched: its btree key and position
@@ -1466,16 +1466,16 @@ mod tests {
     }
 
     #[test]
-    fn dirty_sharded_case_b_relocates_untouched_flagged_shard() {
-        // Big dirty overlay → Case B rewrites the touched shard. The other
-        // shard is untouched by Case B but flagged for relocation; the
+    fn dirty_sharded_resharding_relocates_untouched_flagged_shard() {
+        // Big dirty overlay → re-sharding rewrites the touched shard. The other
+        // shard is untouched by re-sharding but flagged for relocation; the
         // post-pass must rewrite it.
         let ctx = make_ctx(true, 1024 * 1024);
         let loader = RecordingLoader::new();
         let (current_levels, positions) = seed_sharded_cell(&loader, &[(1, 100), (200, 300)]);
         let pos_b = positions[1];
 
-        // 65 overwrites in shard A's range → Case B rewrites A. Flag shard B.
+        // 65 overwrites in shard A's range → re-sharding rewrites A. Flag shard B.
         let dirty: Vec<(u64, Option<u64>)> = (1..=65u64).map(|k| (k, Some(k + 10_000))).collect();
         let cmd =
             flush_command_with_relocation(ctx.id(), build_dirty(&dirty), current_levels, [pos_b]);
@@ -1486,7 +1486,7 @@ mod tests {
         assert_eq!(new_levels.l0(), None, "promote vacated L0");
         let new_a = new_levels.shards().get(&shard_key(1)).unwrap();
         let new_b = new_levels.shards().get(&shard_key(200)).unwrap();
-        // Both shards moved: A via Case B, B via the post-pass.
+        // Both shards moved: A via re-sharding, B via the post-pass.
         assert_ne!(new_a.position, positions[0]);
         assert_ne!(new_b.position, pos_b);
         assert_eq!(new_b.max_key, shard_key(300), "B bounds preserved");
@@ -1521,8 +1521,8 @@ mod tests {
     }
 
     #[test]
-    fn case_b_repeated_promotes_stay_consistent() {
-        // Two consecutive Case B promotes on the same cell. Each promote
+    fn resharding_repeated_promotes_stay_consistent() {
+        // Two consecutive re-sharding promotes on the same cell. Each promote
         // dirties a different shard; both shards must end up with the
         // expected content after the second pass, and the untouched shard
         // from the second promote must still point at the blob the first

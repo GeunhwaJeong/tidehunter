@@ -1922,7 +1922,7 @@ impl LargeTableEntry {
         if self.state.is_dirty() {
             // Dirty entry: dispatch a normal Flush carrying `relocate_positions`
             // so the flusher's post-pass rewrites any blob the merge/promote
-            // leaves in place (e.g. untouched Case B shards or a stale L1
+            // leaves in place (e.g. untouched re-sharding shards or a stale L1
             // under the L0-write branch).
             let kind = self
                 .flush_kind(relocate_positions)
