@@ -13,6 +13,7 @@ use crate::relocation::updates::RelocationUpdates;
 use crate::wal::position::WalPosition;
 use minibytes::Bytes;
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::mpsc;
@@ -143,6 +144,22 @@ impl IndexFlusher {
     }
 }
 
+/// Returns `(min_key, max_key)` from a non-empty sorted slice of entries.
+fn shard_bounds(entries: &[(Bytes, WalPosition)]) -> (Vec<u8>, Vec<u8>) {
+    (
+        entries
+            .first()
+            .expect("entries must be non-empty")
+            .0
+            .to_vec(),
+        entries
+            .last()
+            .expect("entries must be non-empty")
+            .0
+            .to_vec(),
+    )
+}
+
 impl IndexFlusherThread {
     pub fn new(
         db: Weak<Db>,
@@ -205,17 +222,18 @@ impl IndexFlusherThread {
         relocation_updates: Option<RelocationUpdates>,
         relocation_cutoff: Option<u64>,
     ) -> Option<(Arc<IndexTable>, IndexLevels)> {
-        // Build the merged L0 candidate plus the existing L1 (if any).
+        // Build the merged L0 candidate plus the cell's pre-flush levels.
         //
         // For `Flush`, `current_levels` describes the cell's pre-flush on-disk
         // state; we honour the sentinel (empty L0 slot after a prior promote)
         // so post-promote cells start a fresh L0 with just the overlay.
         //
         // `ForceRelocate` collapses L0 + L1 into a single blob so the output
-        // is always single-level (`existing_l1 = None`). Downstream this means
-        // the non-promote branch will `clean_self` (since no L1 sits below)
-        // and emit `IndexLevels::single(new_pos)`.
-        let (original_index, mut merged_l0, existing_l1) = match &command.flush_kind {
+        // is always single-level. Downstream this means the non-promote
+        // branch will `clean_self` (since no L1 sits below) and emit
+        // `IndexLevels::single(new_pos)`. Sharded ForceRelocate is not yet
+        // wired up — see design Section 4.9.
+        let (original_index, mut merged_l0, current_levels) = match &command.flush_kind {
             FlushKind::Flush {
                 dirty,
                 current_levels,
@@ -242,13 +260,17 @@ impl IndexFlusherThread {
                     base.merge_dirty_and_clean(dirty);
                     base
                 };
-                (dirty.clone(), merged, current_levels.l1())
+                (dirty.clone(), merged, current_levels.clone())
             }
             FlushKind::ForceRelocate(levels) => {
+                assert!(
+                    !levels.is_sharded(),
+                    "ForceRelocate of sharded cells not yet supported",
+                );
                 // Collapse L0 + L1 into a single blob. Start from L1 (the
                 // deeper level) and merge L0 on top so L0 wins on overlap,
                 // matching the read-path precedence. The result is handed
-                // downstream as `merged_l0` with `existing_l1 = None`, so
+                // downstream as `merged_l0` with empty `current_levels`, so
                 // the non-promote branch writes it as a single level and
                 // strips tombstones (since nothing sits below it).
                 //
@@ -267,9 +289,14 @@ impl IndexFlusherThread {
                     merged.merge_dirty_and_clean(&l0);
                 }
                 let arc_index = Arc::new(merged);
-                (arc_index.clone(), IndexTable::clone(&arc_index), None)
+                (
+                    arc_index.clone(),
+                    IndexTable::clone(&arc_index),
+                    IndexLevels::new(),
+                )
             }
         };
+        let existing_l1 = current_levels.l1();
 
         // `RelocationUpdates::apply` uses compare-and-set semantics — it can
         // only rewrite positions for keys already in `merged_l0`. Keys that
@@ -278,12 +305,18 @@ impl IndexFlusherThread {
         // apply sees the full key set. The subsequent promote branch still
         // re-loads L1 from disk; the duplication is acceptable on the
         // relocation path — correctness first, optimize later.
-        if relocation_updates.is_some() && existing_l1.is_some() {
-            let mut combined = Self::load_l1_or_default(loader, ctx, existing_l1);
-            // `merged_l0` is the fresher overlay (L0 + dirty) — it wins on
-            // overlapping keys, so treat it as the "dirty" side.
-            combined.merge_dirty_and_clean(&merged_l0);
-            merged_l0 = combined;
+        if relocation_updates.is_some() {
+            assert!(
+                !current_levels.is_sharded(),
+                "RelocationUpdates on sharded cells is not yet supported",
+            );
+            if existing_l1.is_some() {
+                let mut combined = Self::load_l1_or_default(loader, ctx, existing_l1);
+                // `merged_l0` is the fresher overlay (L0 + dirty) — it wins
+                // on overlapping keys, so treat it as the "dirty" side.
+                combined.merge_dirty_and_clean(&merged_l0);
+                merged_l0 = combined;
+            }
         }
         if let Some(relocation_updates) = relocation_updates {
             relocation_updates.apply(&mut merged_l0);
@@ -312,25 +345,41 @@ impl IndexFlusherThread {
         let over_threshold = !is_relocation && merged_l0.len() > l0_threshold;
 
         let new_levels = if over_threshold {
-            // Promote: merge the freshly-built L0 with the existing L1 (if
-            // any). `merge_dirty_and_clean` lets `merged_l0` win on overlap
-            // by treating it as the "dirty" overlay.
-            let mut new_l1 = Self::load_l1_or_default(loader, ctx, existing_l1);
-            new_l1.merge_dirty_and_clean(&merged_l0);
-            Self::run_compactor(ctx, &mut new_l1);
-            // L1 is the deepest level — nothing below to shadow, so drop
-            // tombstones (and the keys they shadow) before writing.
-            new_l1.clean_self();
             ctx.metrics
                 .promote_total
                 .with_label_values(&[ctx.name()])
                 .inc();
-            Self::write_promoted_l1(loader, ctx, command.ks, new_l1)
+            if current_levels.is_sharded() {
+                // Case B: spread merged_l0 across existing shards, rewriting
+                // only those that received keys (each possibly split again
+                // if it overflows the shard budget). Untouched shards keep
+                // their existing WAL blobs.
+                Self::write_sharded_promote(
+                    loader,
+                    ctx,
+                    command.ks,
+                    &merged_l0,
+                    current_levels.shards(),
+                )
+            } else {
+                // Promote: merge the freshly-built L0 with the existing L1 (if
+                // any). `merge_dirty_and_clean` lets `merged_l0` win on overlap
+                // by treating it as the "dirty" overlay.
+                let mut new_l1 = Self::load_l1_or_default(loader, ctx, existing_l1);
+                new_l1.merge_dirty_and_clean(&merged_l0);
+                Self::run_compactor(ctx, &mut new_l1);
+                // L1 is the deepest level — nothing below to shadow, so drop
+                // tombstones (and the keys they shadow) before writing.
+                new_l1.clean_self();
+                Self::write_promoted_l1(loader, ctx, command.ks, new_l1)
+            }
         } else {
             Self::run_compactor(ctx, &mut merged_l0);
-            // If no L1 exists below, this L0 is the deepest level — strip
-            // tombstones. Otherwise leave them in so they shadow L1.
-            if existing_l1.is_none() {
+            // If no deeper level exists, this L0 is the deepest — strip
+            // tombstones. Otherwise (L1 or shards below) leave them in so
+            // they shadow the level beneath.
+            let deeper_level_exists = existing_l1.is_some() || current_levels.is_sharded();
+            if !deeper_level_exists {
                 merged_l0.clean_self();
             }
             let new_l0_pos = loader
@@ -342,11 +391,15 @@ impl IndexFlusherThread {
                     .with_label_values(&[ctx.name()])
                     .inc_by(new_l0_pos.frame_len() as u64);
             }
-            let mut levels = IndexLevels::single(new_l0_pos);
-            if let Some(l1) = existing_l1 {
-                levels.set(1, l1);
+            if current_levels.is_sharded() {
+                IndexLevels::sharded_with_l0(new_l0_pos, current_levels.shards().clone())
+            } else {
+                let mut levels = IndexLevels::single(new_l0_pos);
+                if let Some(l1) = existing_l1 {
+                    levels.set(1, l1);
+                }
+                levels
             }
-            levels
         };
 
         Some((original_index, new_levels))
@@ -432,14 +485,7 @@ impl IndexFlusherThread {
         );
 
         let mut shards: BTreeMap<Vec<u8>, IndexShard> = BTreeMap::new();
-        let mut total_bytes: u64 = 0;
-        for (min_key, max_key, shard_table) in shard_tables.iter() {
-            let pos = loader
-                .flush(ks, shard_table)
-                .expect("Failed to flush shard");
-            total_bytes += pos.frame_len() as u64;
-            shards.insert(min_key.clone(), IndexShard::new(pos, max_key.clone()));
-        }
+        let total_bytes = Self::flush_shard_tables(loader, ks, &shard_tables, &mut shards);
         ctx.metrics
             .l1_bytes_written
             .with_label_values(&[ctx.name()])
@@ -453,6 +499,137 @@ impl IndexFlusherThread {
             .with_label_values(&[ctx.name()])
             .inc();
         IndexLevels::sharded(shards)
+    }
+
+    /// Flushes each `(min_key, max_key, table)` triple as its own WAL blob
+    /// and inserts the resulting `IndexShard` into `target` keyed by
+    /// `min_key`. Returns the total `frame_len` written.
+    fn flush_shard_tables<L: Loader>(
+        loader: &L,
+        ks: KeySpace,
+        tables: &[(Vec<u8>, Vec<u8>, IndexTable)],
+        target: &mut BTreeMap<Vec<u8>, IndexShard>,
+    ) -> u64 {
+        let mut total_bytes = 0u64;
+        for (min_key, max_key, table) in tables {
+            let pos = loader.flush(ks, table).expect("Failed to flush shard");
+            total_bytes += pos.frame_len() as u64;
+            target.insert(min_key.clone(), IndexShard::new(pos, max_key.clone()));
+        }
+        total_bytes
+    }
+
+    /// Sharded promote (Case B): partitions `merged_l0` by owning shard,
+    /// rewrites touched shards (re-splitting on overflow), and preserves
+    /// untouched shard positions.
+    fn write_sharded_promote<L: Loader>(
+        loader: &L,
+        ctx: &KsContext,
+        ks: KeySpace,
+        merged_l0: &IndexTable,
+        current_shards: &BTreeMap<Vec<u8>, IndexShard>,
+    ) -> IndexLevels {
+        // `iter_with_tombstones` collapses Removed→INVALID and discards the
+        // original offset. Use the WAL tail as the placeholder so the merge
+        // path's monotonic-offset assertion holds.
+        let tombstone_placeholder = WalPosition::new(loader.current_wal_position().max(1), 1);
+        let split_threshold = ctx.config.l1_shard_split_threshold();
+        let first_owner = current_shards
+            .keys()
+            .next()
+            .cloned()
+            .expect("write_sharded_promote requires non-empty current_shards");
+
+        // Owner = largest btree_key ≤ key. Keys below the first shard's
+        // btree key fall to the first shard so they extend it leftward.
+        let mut partitions: BTreeMap<Vec<u8>, IndexTable> = BTreeMap::new();
+        for (key, pos) in merged_l0.iter_with_tombstones() {
+            let owner = current_shards
+                .range::<[u8], _>((Bound::Unbounded, Bound::Included(key.as_ref())))
+                .next_back()
+                .map(|(bk, _)| bk.clone())
+                .unwrap_or_else(|| first_owner.clone());
+            let table = partitions.entry(owner).or_default();
+            if pos.is_valid() {
+                table.insert(key, pos);
+            } else {
+                table.remove(key, tombstone_placeholder);
+            }
+        }
+
+        let mut new_shards: BTreeMap<Vec<u8>, IndexShard> = BTreeMap::new();
+        let mut total_bytes: u64 = 0;
+        let mut rewritten: u64 = 0;
+        let mut split_events: u64 = 0;
+
+        for (btree_key, shard) in current_shards.iter() {
+            let Some(dirty_subset) = partitions.remove(btree_key) else {
+                new_shards.insert(btree_key.clone(), shard.clone());
+                continue;
+            };
+            rewritten += 1;
+            let mut shard_table = loader
+                .load(&ctx.ks_config, shard.position)
+                .expect("Failed to load shard for sharded promote");
+            shard_table.merge_dirty_and_clean(&dirty_subset);
+            Self::run_compactor(ctx, &mut shard_table);
+            // Shard is the deepest level for its key range; strip tombstones.
+            shard_table.clean_self();
+
+            if shard_table.is_empty() {
+                // All entries in this shard's range were tombstoned out.
+                continue;
+            }
+
+            let entries: Vec<(Bytes, WalPosition)> = shard_table.iter().collect();
+            let serialized = ctx
+                .ks_config
+                .index_format()
+                .serialize_index(&shard_table, &ctx.ks_config);
+            if serialized.len() <= split_threshold {
+                let (min_key, max_key) = shard_bounds(&entries);
+                let single = [(min_key, max_key, shard_table)];
+                total_bytes += Self::flush_shard_tables(loader, ks, &single, &mut new_shards);
+            } else {
+                split_events += 1;
+                let mut sub_shards: Vec<(Vec<u8>, Vec<u8>, IndexTable)> = Vec::new();
+                Self::split_recursive(&entries, &ctx.ks_config, split_threshold, &mut sub_shards);
+                total_bytes += Self::flush_shard_tables(loader, ks, &sub_shards, &mut new_shards);
+            }
+        }
+        debug_assert!(
+            partitions.is_empty(),
+            "every partition key must match a current shard btree key",
+        );
+
+        ctx.metrics
+            .l1_bytes_written
+            .with_label_values(&[ctx.name()])
+            .inc_by(total_bytes);
+        ctx.metrics
+            .l1_shard_rewritten_total
+            .with_label_values(&[ctx.name()])
+            .inc_by(rewritten);
+        ctx.metrics
+            .l1_shards_total
+            .with_label_values(&[ctx.name()])
+            .inc_by(new_shards.len() as u64);
+        ctx.metrics
+            .l1_shard_split_total
+            .with_label_values(&[ctx.name()])
+            .inc_by(split_events);
+
+        if new_shards.is_empty() {
+            // Every shard got tombstoned out. Fall back to a single empty
+            // L1 blob so the cell still has a valid post-promote shape.
+            let empty = IndexTable::default();
+            let pos = loader
+                .flush(ks, &empty)
+                .expect("Failed to flush empty post-collapse L1");
+            return IndexLevels::promoted(pos);
+        }
+
+        IndexLevels::sharded(new_shards)
     }
 
     /// Recursively bisect `entries` by index. Appends each chunk that
@@ -470,8 +647,7 @@ impl IndexFlusherThread {
         let table = Self::build_shard_table(entries);
         let serialized = ks.index_format().serialize_index(&table, ks);
         if serialized.len() <= size_limit || entries.len() == 1 {
-            let min_key = entries.first().unwrap().0.to_vec();
-            let max_key = entries.last().unwrap().0.to_vec();
+            let (min_key, max_key) = shard_bounds(entries);
             out.push((min_key, max_key, table));
             return;
         }
@@ -505,12 +681,16 @@ mod tests {
     use crate::wal::position::{LastProcessed, WalPosition};
     use minibytes::Bytes;
     use parking_lot::Mutex;
+    use std::collections::HashMap;
     use std::io;
 
     /// In-memory `Loader` that records each `flush` call's table length
-    /// and hands out monotonically increasing fake `WalPosition`s.
+    /// and stores the flushed table in `blobs` keyed by position offset,
+    /// so a subsequent `load` returns the same content (matching the
+    /// real WAL round-trip semantically, without serialization).
     struct RecordingLoader {
-        flushes: Mutex<Vec<usize>>, // entry count of each flushed table
+        flushes: Mutex<Vec<usize>>, // entry count of each flushed table, in order
+        blobs: Mutex<HashMap<u64, IndexTable>>,
         next_offset: Mutex<u64>,
     }
 
@@ -518,6 +698,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 flushes: Mutex::new(Vec::new()),
+                blobs: Mutex::new(HashMap::new()),
                 next_offset: Mutex::new(1000),
             }
         }
@@ -529,6 +710,12 @@ mod tests {
         fn flush_sizes(&self) -> Vec<usize> {
             self.flushes.lock().clone()
         }
+
+        /// Pre-seeds the loader with a blob at the given position so
+        /// Case B tests can simulate "this shard already exists on disk".
+        fn seed(&self, pos: WalPosition, table: IndexTable) {
+            self.blobs.lock().insert(pos.offset(), table);
+        }
     }
 
     impl Loader for RecordingLoader {
@@ -537,9 +724,14 @@ mod tests {
         fn load(
             &self,
             _ks: &crate::key_shape::KeySpaceDesc,
-            _position: WalPosition,
+            position: WalPosition,
         ) -> Result<IndexTable, Self::Error> {
-            Ok(IndexTable::default())
+            Ok(self
+                .blobs
+                .lock()
+                .get(&position.offset())
+                .cloned()
+                .unwrap_or_default())
         }
 
         fn index_reader(&self, _position: WalPosition) -> Result<WalRandomRead, Self::Error> {
@@ -555,6 +747,7 @@ mod tests {
             let mut off = self.next_offset.lock();
             let pos = WalPosition::new(*off, 64);
             *off += 4096;
+            self.blobs.lock().insert(pos.offset(), data.clone());
             Ok(pos)
         }
 
@@ -563,7 +756,10 @@ mod tests {
         }
 
         fn current_wal_position(&self) -> u64 {
-            1
+            // Strictly greater than any seeded/flushed offset so the
+            // tombstone-placeholder offset in write_sharded_promote
+            // satisfies merge_dirty's "must be increasing" assertion.
+            u64::MAX / 2
         }
 
         fn min_wal_position(&self) -> u64 {
@@ -705,5 +901,326 @@ mod tests {
         for (min_key, max_key, _) in &out {
             assert_eq!(min_key, max_key, "single-entry shard has min==max");
         }
+    }
+
+    // ----- Case B (incremental sharded promote) -----
+
+    /// Seeds the loader with a sharded cell whose shards cover the given
+    /// inclusive `(min, max)` u64 ranges.
+    fn seed_sharded_cell(
+        loader: &RecordingLoader,
+        ranges: &[(u64, u64)],
+    ) -> (IndexLevels, Vec<WalPosition>) {
+        let mut shards: BTreeMap<Vec<u8>, IndexShard> = BTreeMap::new();
+        let mut positions = Vec::new();
+        let mut next_seed_offset: u64 = 500;
+        for (min, max) in ranges {
+            let mut table = IndexTable::default();
+            for k in *min..=*max {
+                table.insert(
+                    Bytes::from(k.to_be_bytes().to_vec()),
+                    WalPosition::test_value(k.max(1)),
+                );
+            }
+            let pos = WalPosition::new(next_seed_offset, 64);
+            next_seed_offset += 4096;
+            loader.seed(pos, table);
+            positions.push(pos);
+            shards.insert(
+                min.to_be_bytes().to_vec(),
+                IndexShard::new(pos, max.to_be_bytes().to_vec()),
+            );
+        }
+        (IndexLevels::sharded(shards), positions)
+    }
+
+    /// Builds an `IndexTable` from an iterator of `(key, Option<pos>)`.
+    /// `None` means tombstone (remove with a placeholder offset). Used to
+    /// construct the dirty L0 overlay for Case B tests.
+    fn build_dirty(entries: &[(u64, Option<u64>)]) -> IndexTable {
+        let mut t = IndexTable::default();
+        for (k, p) in entries {
+            let key = Bytes::from(k.to_be_bytes().to_vec());
+            match p {
+                Some(pos) => {
+                    t.insert(key, WalPosition::test_value(*pos));
+                }
+                None => {
+                    t.remove(key, WalPosition::test_value(u64::MAX / 4));
+                }
+            }
+        }
+        t
+    }
+
+    fn shard_key(k: u64) -> Vec<u8> {
+        k.to_be_bytes().to_vec()
+    }
+
+    /// Reads the new shard at `min_key` from the loader's blob store and
+    /// returns its sorted entries as `(key_u64, pos_u64)` for assertion.
+    fn shard_entries(loader: &RecordingLoader, pos: WalPosition) -> Vec<u64> {
+        let blob = loader.blobs.lock().get(&pos.offset()).cloned().unwrap();
+        blob.iter()
+            .map(|(k, _)| {
+                let bytes: [u8; 8] = k.as_ref().try_into().unwrap();
+                u64::from_be_bytes(bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn case_b_untouched_shards_keep_their_position() {
+        // Two shards. Dirty L0 hits only the first shard's range.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let loader = RecordingLoader::new();
+        let (current_levels, positions) = seed_sharded_cell(&loader, &[(1, 100), (200, 300)]);
+
+        // 65 dirty overwrites in shard A's existing [1, 100] range; >
+        // l0_max_entries=64 so the flusher promotes via Case B.
+        let dirty_entries: Vec<(u64, Option<u64>)> =
+            (1..=65u64).map(|k| (k, Some(k + 10_000))).collect();
+        let dirty = build_dirty(&dirty_entries);
+
+        let cmd = flush_command(ctx.id(), dirty, current_levels);
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+
+        assert!(new_levels.is_sharded(), "still sharded after Case B");
+        assert_eq!(new_levels.shards().len(), 2, "two shards expected");
+
+        // Shard B (200..=300) is untouched: its btree key and position
+        // should still match what we seeded.
+        let new_b = new_levels.shards().get(&shard_key(200)).unwrap();
+        assert_eq!(new_b.position, positions[1]);
+        assert_eq!(new_b.max_key, shard_key(300));
+
+        // Shard A was rewritten; min/max bounds unchanged.
+        let new_a = new_levels.shards().get(&shard_key(1)).unwrap();
+        assert_ne!(new_a.position, positions[0]);
+        assert_eq!(new_a.max_key, shard_key(100));
+
+        // Exactly one shard rewritten → one flush.
+        assert_eq!(loader.flush_count(), 1);
+    }
+
+    #[test]
+    fn case_b_tombstones_drop_keys_from_shard() {
+        let ctx = make_ctx(true, 1024 * 1024);
+        let loader = RecordingLoader::new();
+        let (current_levels, _) = seed_sharded_cell(&loader, &[(1, 5), (100, 200)]);
+
+        // 65 dirty entries to trigger promote: 2 tombstones in shard A
+        // (keys 2 and 4) plus 63 inserts in shard B (101..=163, already
+        // present in B — overwritten with newer offsets).
+        let mut dirty_entries: Vec<(u64, Option<u64>)> = vec![(2, None), (4, None)];
+        for k in 101..=163u64 {
+            dirty_entries.push((k, Some(k + 50_000)));
+        }
+        let dirty = build_dirty(&dirty_entries);
+
+        let cmd = flush_command(ctx.id(), dirty, current_levels);
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+        assert!(new_levels.is_sharded());
+        assert_eq!(new_levels.shards().len(), 2);
+
+        let new_a = new_levels.shards().get(&shard_key(1)).unwrap();
+        let a_keys = shard_entries(&loader, new_a.position);
+        assert_eq!(a_keys, vec![1, 3, 5], "tombstones removed keys 2 and 4");
+        assert_eq!(new_a.max_key, shard_key(5));
+
+        let new_b = new_levels.shards().get(&shard_key(100)).unwrap();
+        let b_keys = shard_entries(&loader, new_b.position);
+        assert_eq!(b_keys.first(), Some(&100));
+        assert_eq!(b_keys.last(), Some(&200));
+    }
+
+    #[test]
+    fn case_b_gap_key_routed_to_predecessor_shard() {
+        // Shards A (1..=50) and B (200..=300). Dirty key 100 lies in the
+        // gap; the predecessor rule sends it to A, extending A.max_key.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let loader = RecordingLoader::new();
+        let (current_levels, _) = seed_sharded_cell(&loader, &[(1, 50), (200, 300)]);
+
+        let mut dirty_entries: Vec<(u64, Option<u64>)> =
+            (1..=65u64).map(|k| (k, Some(k + 10_000))).collect();
+        // The single gap-key that should land in A.
+        dirty_entries.push((100, Some(100_000)));
+        let dirty = build_dirty(&dirty_entries);
+
+        let cmd = flush_command(ctx.id(), dirty, current_levels);
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+        let new_a = new_levels.shards().get(&shard_key(1)).unwrap();
+        assert_eq!(
+            new_a.max_key,
+            shard_key(100),
+            "gap key 100 extends shard A's max_key",
+        );
+        assert!(
+            shard_entries(&loader, new_a.position).contains(&100),
+            "key 100 is present in shard A",
+        );
+        // Shard B is untouched.
+        let new_b = new_levels.shards().get(&shard_key(200)).unwrap();
+        assert_eq!(new_b.max_key, shard_key(300));
+    }
+
+    #[test]
+    fn case_b_rewritten_shard_splits_when_oversized() {
+        // Tiny frag_size forces a re-split when shard A grows past
+        // frag_size/2 after the merge.
+        let ctx = make_ctx(true, 4096);
+        let loader = RecordingLoader::new();
+        let (current_levels, _) = seed_sharded_cell(&loader, &[(1, 100), (10_000, 10_010)]);
+
+        // 500 dirty inserts in shard A's extended range so the rewritten
+        // shard A blob crosses the 2 KiB threshold and re-splits.
+        let dirty_entries: Vec<(u64, Option<u64>)> =
+            (1..=500u64).map(|k| (k, Some(k + 1_000))).collect();
+        let dirty = build_dirty(&dirty_entries);
+
+        let cmd = flush_command(ctx.id(), dirty, current_levels);
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+        assert!(new_levels.is_sharded());
+        // Started with 2 shards; A got split into multiple, B is untouched.
+        assert!(
+            new_levels.shards().len() > 2,
+            "shard A was re-split: total shards > 2, got {}",
+            new_levels.shards().len(),
+        );
+        // B's btree entry survives unchanged.
+        let new_b = new_levels.shards().get(&shard_key(10_000)).unwrap();
+        assert_eq!(new_b.max_key, shard_key(10_010));
+    }
+
+    #[test]
+    fn case_b_all_keys_tombstoned_collapses_to_empty_promoted() {
+        // One shard with 3 keys; all tombstoned + a few padding inserts
+        // in a separate range so we cross l0_max_entries. The shard's
+        // entries are dropped; with no remaining shards, the cell
+        // collapses to an empty `IndexLevels::promoted` blob.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let loader = RecordingLoader::new();
+        let (current_levels, _) = seed_sharded_cell(&loader, &[(1, 3)]);
+
+        let mut dirty_entries: Vec<(u64, Option<u64>)> = vec![(1, None), (2, None), (3, None)];
+        // Padding to cross l0_max_entries=64. These go to the same shard
+        // by the predecessor rule (they're > 3, so above the only shard's
+        // max_key — predecessor is the single shard). Then they're also
+        // tombstoned so the shard ends up empty.
+        for k in 100..=200u64 {
+            dirty_entries.push((k, None));
+        }
+        let dirty = build_dirty(&dirty_entries);
+
+        let cmd = flush_command(ctx.id(), dirty, current_levels);
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+        assert!(
+            !new_levels.is_sharded(),
+            "empty-shard cell collapses to unsharded",
+        );
+        assert!(
+            new_levels.l1().is_some(),
+            "fallback is IndexLevels::promoted"
+        );
+    }
+
+    #[test]
+    fn case_b_sharded_l0_path_preserves_shards() {
+        // Sharded cell + a tiny dirty L0 that doesn't trigger promote.
+        // Flusher writes the new L0 and keeps the shard btree intact.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let loader = RecordingLoader::new();
+        let (current_levels, positions) = seed_sharded_cell(&loader, &[(1, 50), (200, 300)]);
+
+        // Tiny dirty: 10 entries, below l0_max_entries=64.
+        let dirty_entries: Vec<(u64, Option<u64>)> =
+            (1..=10u64).map(|k| (k, Some(k + 10_000))).collect();
+        let dirty = build_dirty(&dirty_entries);
+
+        let cmd = flush_command(ctx.id(), dirty, current_levels);
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+
+        assert!(new_levels.is_sharded(), "shards preserved on L0-only flush");
+        assert!(new_levels.l0().is_some(), "new L0 written");
+        let s = new_levels.shards();
+        assert_eq!(s.len(), 2);
+        // Both shard btree entries are unchanged.
+        assert_eq!(s.get(&shard_key(1)).unwrap().position, positions[0]);
+        assert_eq!(s.get(&shard_key(200)).unwrap().position, positions[1]);
+        // Exactly one flush (the new L0).
+        assert_eq!(loader.flush_count(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "ForceRelocate of sharded cells")]
+    fn force_relocate_on_sharded_cell_panics() {
+        let ctx = make_ctx(true, 1024 * 1024);
+        let loader = RecordingLoader::new();
+        let (current_levels, _) = seed_sharded_cell(&loader, &[(1, 5)]);
+        let cmd = IndexFlushCommand::new(
+            ctx.id(),
+            CellId::Integer(0),
+            FlushKind::ForceRelocate(current_levels),
+        );
+        let _ = IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None);
+    }
+
+    #[test]
+    fn case_b_repeated_promotes_stay_consistent() {
+        // Two consecutive Case B promotes on the same cell. Each promote
+        // dirties a different shard; both shards must end up with the
+        // expected content after the second pass, and the untouched shard
+        // from the second promote must still point at the blob the first
+        // promote wrote (not the original seed).
+        let ctx = make_ctx(true, 1024 * 1024);
+        let loader = RecordingLoader::new();
+        let (current_levels, _) = seed_sharded_cell(&loader, &[(1, 100), (200, 300)]);
+
+        // Promote 1: 65 overwrites in shard A's range.
+        let dirty1: Vec<(u64, Option<u64>)> = (1..=65u64).map(|k| (k, Some(k + 10_000))).collect();
+        let cmd1 = flush_command(ctx.id(), build_dirty(&dirty1), current_levels);
+        let (_orig, levels_after_1) =
+            IndexFlusherThread::handle_command(&loader, &cmd1, &ctx, None, None).unwrap();
+        assert!(levels_after_1.is_sharded());
+        let pos_b_after_1 = levels_after_1
+            .shards()
+            .get(&shard_key(200))
+            .unwrap()
+            .position;
+
+        // Promote 2: 65 overwrites in shard B's range. Shard A is now
+        // "untouched" by this promote — its btree entry should carry the
+        // position written in promote 1, not the original seed.
+        let dirty2: Vec<(u64, Option<u64>)> =
+            (200..=264u64).map(|k| (k, Some(k + 20_000))).collect();
+        let cmd2 = flush_command(ctx.id(), build_dirty(&dirty2), levels_after_1.clone());
+        let (_orig, levels_after_2) =
+            IndexFlusherThread::handle_command(&loader, &cmd2, &ctx, None, None).unwrap();
+        assert!(levels_after_2.is_sharded());
+        assert_eq!(levels_after_2.shards().len(), 2);
+
+        // Shard A's position carries through unchanged from promote 1.
+        let a_after_2 = levels_after_2.shards().get(&shard_key(1)).unwrap();
+        assert_eq!(
+            a_after_2.position,
+            levels_after_1.shards().get(&shard_key(1)).unwrap().position,
+            "shard A untouched in promote 2 keeps promote-1 position",
+        );
+        // Shard B got rewritten, so its position changed.
+        let b_after_2 = levels_after_2.shards().get(&shard_key(200)).unwrap();
+        assert_ne!(b_after_2.position, pos_b_after_1);
+        // Content check: shard B's blob contains keys 200..=300 (all
+        // original plus the overwrites — same set).
+        let b_keys = shard_entries(&loader, b_after_2.position);
+        assert_eq!(b_keys.first(), Some(&200));
+        assert_eq!(b_keys.last(), Some(&300));
+        assert_eq!(b_keys.len(), 101);
     }
 }

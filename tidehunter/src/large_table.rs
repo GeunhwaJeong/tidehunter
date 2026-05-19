@@ -1859,6 +1859,13 @@ impl LargeTableEntry {
         if !relocate_files.contains_any(self.levels.iter()) {
             return;
         }
+        // Force-relocate of a clean sharded cell is deferred (design 4.9
+        // option 2): the flusher's ForceRelocate path would collapse all
+        // shards into a single blob, losing the sharded shape. Skip; the
+        // cell stays in place until per-shard relocation lands.
+        if !self.state.is_dirty() && self.levels.is_sharded() {
+            return;
+        }
         self.context
             .metrics
             .snapshot_forced_relocation
