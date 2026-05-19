@@ -3862,3 +3862,105 @@ fn test_compact_with_preserves_tombstones_shadowing_l1() {
         "tombstone in the new L0 must shadow the L1 entry",
     );
 }
+
+#[test]
+fn test_auto_sharding_concurrent() {
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+
+    type Slot = Arc<Mutex<Option<Vec<u8>>>>;
+
+    let dir = tempdir::TempDir::new("test-auto-sharding-concurrent").unwrap();
+
+    let mut config = Config::small();
+    config.auto_sharding = true;
+    config.frag_size = 4 * 1024;
+    config.max_dirty_keys = 8;
+    config.l0_max_entries = Some(16);
+    let config = Arc::new(config);
+
+    let (key_shape, ks) = KeyShape::new_single(8, 2, KeyType::uniform(1));
+    let metrics = Metrics::new();
+    let db = Db::open(dir.path(), key_shape, config.clone(), metrics.clone()).unwrap();
+
+    let state: Arc<Mutex<HashMap<Vec<u8>, Slot>>> = Arc::default();
+
+    const POOL_SIZE: u64 = 4000;
+    const ITERATIONS: usize = 10;
+    const THREADS: usize = 4;
+    const OPS_PER_THREAD: usize = 500;
+
+    for iter in 0..ITERATIONS {
+        let mut handles = vec![];
+        for tid in 0..THREADS {
+            let db = db.clone();
+            let state = state.clone();
+            handles.push(thread::spawn(move || {
+                let seed = (iter * THREADS + tid) as u64;
+                let mut rng = StdRng::seed_from_u64(seed);
+                for _ in 0..OPS_PER_THREAD {
+                    let key = rng.gen_range(0..POOL_SIZE).to_le_bytes().to_vec();
+
+                    let slot = state
+                        .lock()
+                        .entry(key.clone())
+                        .or_insert_with(|| Arc::new(Mutex::new(None)))
+                        .clone();
+                    let mut slot_guard = slot.lock();
+
+                    if rng.gen_bool(0.75) {
+                        let value: Vec<u8> = (0..8).map(|_| rng.r#gen()).collect();
+                        db.insert(ks, key.clone(), value.clone()).unwrap();
+                        *slot_guard = Some(value);
+                    } else {
+                        db.remove(ks, key.clone()).unwrap();
+                        *slot_guard = None;
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let snap: HashMap<Vec<u8>, Vec<u8>> = state
+            .lock()
+            .iter()
+            .filter_map(|(k, s)| s.lock().clone().map(|v| (k.clone(), v)))
+            .collect();
+
+        for (k, v) in &snap {
+            let got = db.get(ks, k).unwrap();
+            assert_eq!(
+                got.as_deref(),
+                Some(v.as_slice()),
+                "get mismatch at iter {iter} for key {k:?}",
+            );
+        }
+
+        let from_iter: HashMap<Vec<u8>, Vec<u8>> = db
+            .iterator(ks)
+            .map(|r| {
+                let (k, v) = r.unwrap();
+                (k.as_ref().to_vec(), v.as_ref().to_vec())
+            })
+            .collect();
+        assert_eq!(from_iter, snap, "iterator/shadow mismatch at iter {iter}");
+    }
+
+    let label = &["root"];
+    let shards_total = metrics.l1_shards_total.with_label_values(label).get();
+    let splits = metrics.l1_shard_split_total.with_label_values(label).get();
+    let resharding = metrics
+        .l1_shard_rewritten_total
+        .with_label_values(label)
+        .get();
+    println!(
+        "auto-sharding counters: l1_shards_total={shards_total} \
+         l1_shard_split_total={splits} l1_shard_rewritten_total={resharding}"
+    );
+    assert!(
+        resharding > 0,
+        "expected resharding (Case B incremental sharded promote) to fire"
+    );
+}

@@ -204,13 +204,14 @@ pub struct Metrics {
     pub promote_total: MetricIntCounterVec,
     /// Number of L1 shard blobs written by the flusher. Each shard blob
     /// counts as one increment regardless of whether it came from a fresh
-    /// split (Case A) or an incremental rewrite (Case B, future).
+    /// split (Case A) or an incremental rewrite (Case B).
     pub l1_shards_total: MetricIntCounterVec,
     /// Number of times a promote produced more than one L1 shard (i.e.
-    /// auto-sharding kicked in for this cell on this promote).
+    /// auto-sharding kicked in for this cell on this promote). Counts
+    /// Case A invocations and Case B re-split events.
     pub l1_shard_split_total: MetricIntCounterVec,
     /// Number of existing shards rewritten during an incremental sharded
-    /// promote (Case B). Stays at zero until Case B lands.
+    /// promote (Case B). Stays at zero until Case B fires.
     pub l1_shard_rewritten_total: MetricIntCounterVec,
 
     pub relocation_target_position: MetricIntGauge,

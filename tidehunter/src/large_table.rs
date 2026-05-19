@@ -123,6 +123,21 @@ struct WalkPlan {
     data: Arc<IndexTable>,
     level_positions: SmallVec<[WalPosition; INLINE_LEVELS]>,
     readers: SmallVec<[WalRandomRead; INLINE_LEVELS]>,
+    /// `true` iff the cell was sharded when this plan was built. Sharded
+    /// cells have to bubble `SkipDeleted` out so `prepare_walk` can re-pick
+    /// the shard for the advanced `prev_key`; unsharded cells can absorb
+    /// the tombstone skip inside `execute_walk` (the plan stays valid).
+    is_sharded: bool,
+}
+
+/// Outcome of one `execute_walk` step. `SkipDeleted` is only returned for
+/// sharded cells, where advancing past the tombstone may cross a shard
+/// boundary; the caller must re-run `prepare_walk` with the advanced key.
+/// Unsharded cells resolve tombstones inline and never surface this variant.
+enum WalkOutcome {
+    Found(Bytes, WalPosition),
+    Exhausted,
+    SkipDeleted(Bytes),
 }
 
 enum Entries {
@@ -922,33 +937,43 @@ impl LargeTable {
                     &plan,
                     &context.ks_config,
                     &context.metrics,
-                    prev_key.take(),
+                    prev_key.clone(),
                     reverse,
                     caches,
                 ),
-                None => None,
+                None => WalkOutcome::Exhausted,
             };
 
-            if let Some((key, val)) = walk_result {
-                // Phase 3: re-acquire the row lock briefly to consult the
-                // per-entry LRU. Skipped entirely when no LRU is configured.
-                // If the entry was removed between phases, fall back to a
-                // WAL read.
-                let value = if context.ks_config.value_cache_size().is_some() {
-                    let mut row = ks_table.lock(mutex_idx, &context.large_table_contention);
-                    if let Some(entry) = row.try_entry_mut(&cell) {
-                        Self::lru_or_wal(entry, &key, val)
+            match walk_result {
+                WalkOutcome::Found(key, val) => {
+                    // Phase 3: re-acquire the row lock briefly to consult the
+                    // per-entry LRU. Skipped entirely when no LRU is configured.
+                    // If the entry was removed between phases, fall back to a
+                    // WAL read.
+                    let value = if context.ks_config.value_cache_size().is_some() {
+                        let mut row = ks_table.lock(mutex_idx, &context.large_table_contention);
+                        if let Some(entry) = row.try_entry_mut(&cell) {
+                            Self::lru_or_wal(entry, &key, val)
+                        } else {
+                            GetResult::WalPosition(val)
+                        }
                     } else {
                         GetResult::WalPosition(val)
-                    }
-                } else {
-                    GetResult::WalPosition(val)
-                };
-                return Ok(Some(IteratorResult {
-                    cell: Some(cell),
-                    key,
-                    value,
-                }));
+                    };
+                    return Ok(Some(IteratorResult {
+                        cell: Some(cell),
+                        key,
+                        value,
+                    }));
+                }
+                WalkOutcome::SkipDeleted(skip_key) => {
+                    // Tombstone shadowed an on-disk hit. Advance past it and
+                    // re-pick: for sharded cells the advance can cross a
+                    // shard boundary, so we must re-enter `prepare_walk`.
+                    prev_key = Some(skip_key);
+                    continue;
+                }
+                WalkOutcome::Exhausted => {}
             }
 
             prev_key = None;
@@ -1016,10 +1041,12 @@ impl LargeTable {
         // `make_mut` which copy-on-writes, so the snapshot is stable across
         // the lock-released walk in Phase 2.
         let data = entry.data.clone_shared();
+        let is_sharded = entry.levels.is_sharded();
         Ok(Some(WalkPlan {
             data,
             level_positions,
             readers,
+            is_sharded,
         }))
     }
 
@@ -1034,7 +1061,7 @@ impl LargeTable {
         mut prev_key: Option<Bytes>,
         reverse: bool,
         caches: &mut IndexIterCaches,
-    ) -> Option<(Bytes, WalPosition)> {
+    ) -> WalkOutcome {
         let direction = Direction::from_bool(reverse);
         runtime::block_in_place(|| {
             let format = ks_config.index_format();
@@ -1061,9 +1088,19 @@ impl LargeTable {
                     candidates.push(on_disk_next);
                 }
                 match merge_levels_next_entry(candidates, direction) {
-                    NextEntryResult::NotFound => return None,
-                    NextEntryResult::Found(key, val) => return Some((key, val)),
-                    NextEntryResult::SkipDeleted(skip_key) => prev_key = Some(skip_key),
+                    NextEntryResult::NotFound => return WalkOutcome::Exhausted,
+                    NextEntryResult::Found(key, val) => return WalkOutcome::Found(key, val),
+                    NextEntryResult::SkipDeleted(skip_key) => {
+                        // Sharded cells must re-pick the shard: the skip can
+                        // cross a shard boundary, and the picked shard in
+                        // this plan would then have no more keys.
+                        if plan.is_sharded {
+                            return WalkOutcome::SkipDeleted(skip_key);
+                        }
+                        // Unsharded: the plan stays valid past the tombstone,
+                        // absorb the skip inline.
+                        prev_key = Some(skip_key);
+                    }
                 }
             }
         })
@@ -1091,32 +1128,39 @@ impl LargeTable {
         loader: &L,
         row: &mut Row,
         cell: &CellId,
-        prev_key: Option<Bytes>,
+        mut prev_key: Option<Bytes>,
         reverse: bool,
         caches: &mut IndexIterCaches,
     ) -> Result<Option<(Bytes, GetResult)>, L::Error> {
-        let Some(plan) =
-            Self::prepare_walk(loader, row, cell, prev_key.as_deref(), reverse, caches)?
-        else {
-            return Ok(None);
-        };
-        let walk_result = Self::execute_walk(
-            &plan,
-            &row.context.ks_config,
-            &row.context.metrics,
-            prev_key,
-            reverse,
-            caches,
-        );
-        let Some((key, val)) = walk_result else {
-            return Ok(None);
-        };
-        let get_result = if let Some(entry) = row.try_entry_mut(cell) {
-            Self::lru_or_wal(entry, &key, val)
-        } else {
-            GetResult::WalPosition(val)
-        };
-        Ok(Some((key, get_result)))
+        loop {
+            let Some(plan) =
+                Self::prepare_walk(loader, row, cell, prev_key.as_deref(), reverse, caches)?
+            else {
+                return Ok(None);
+            };
+            let walk_result = Self::execute_walk(
+                &plan,
+                &row.context.ks_config,
+                &row.context.metrics,
+                prev_key.clone(),
+                reverse,
+                caches,
+            );
+            match walk_result {
+                WalkOutcome::Found(key, val) => {
+                    let get_result = if let Some(entry) = row.try_entry_mut(cell) {
+                        Self::lru_or_wal(entry, &key, val)
+                    } else {
+                        GetResult::WalPosition(val)
+                    };
+                    return Ok(Some((key, get_result)));
+                }
+                WalkOutcome::SkipDeleted(skip_key) => {
+                    prev_key = Some(skip_key);
+                }
+                WalkOutcome::Exhausted => return Ok(None),
+            }
+        }
     }
 
     /// See Db::next_cell for documentation
