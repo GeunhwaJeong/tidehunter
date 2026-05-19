@@ -5,7 +5,7 @@ pub trait HasOffset {
     fn offset(&self) -> u64;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct WalPosition {
     pub(super) offset: u64,
     pub(super) len: u32,

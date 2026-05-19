@@ -1836,7 +1836,7 @@ impl LargeTableEntry {
             .with_label_values(&[self.context.name()])
             .inc();
         let flush_kind = self
-            .flush_kind()
+            .flush_kind(HashSet::new())
             .expect("entry must be dirty here (state checked above)");
         flusher.request_flush(self.context.id(), self.cell.clone(), flush_kind);
     }
@@ -1856,14 +1856,12 @@ impl LargeTableEntry {
         }
         // Check every populated level (not just the freshest): a `[L0, L1]` cell
         // may have an ancient L1 in a sparse file even when L0 is fresh.
-        if !relocate_files.contains_any(self.levels.iter()) {
-            return;
-        }
-        // Force-relocate of a clean sharded cell is deferred (design 4.9
-        // option 2): the flusher's ForceRelocate path would collapse all
-        // shards into a single blob, losing the sharded shape. Skip; the
-        // cell stays in place until per-shard relocation lands.
-        if !self.state.is_dirty() && self.levels.is_sharded() {
+        let relocate_positions: HashSet<WalPosition> = self
+            .levels
+            .iter()
+            .filter(|p| relocate_files.contains(p))
+            .collect();
+        if relocate_positions.is_empty() {
             return;
         }
         self.context
@@ -1878,23 +1876,25 @@ impl LargeTableEntry {
             .with_label_values(&[self.context.name()])
             .inc();
         if self.state.is_dirty() {
-            // Dirty entry: a normal flush of the dirty overlay lands at a fresh
-            // position past the relocation cutoff, achieving relocation.
-            let flush_kind = self
-                .flush_kind()
+            // Dirty entry: dispatch a normal Flush carrying `relocate_positions`
+            // so the flusher's post-pass rewrites any blob the merge/promote
+            // leaves in place (e.g. untouched Case B shards or a stale L1
+            // under the L0-write branch).
+            let kind = self
+                .flush_kind(relocate_positions)
                 .expect("entry must be dirty here (state checked above)");
-            flusher.request_flush(self.context.id(), self.cell.clone(), flush_kind);
+            flusher.request_flush(self.context.id(), self.cell.clone(), kind);
         } else {
-            // Clean entry: hand the current levels to the flusher, which loads
-            // and merges them into a single-level blob at a fresh position.
-            debug_assert!(
-                !self.levels.is_empty(),
-                "forced relocation requires at least one populated level",
-            );
+            // Clean entry: dispatch the levels plus the subset of positions
+            // in low-occupancy files. See `FlushKind::ForceRelocate` for the
+            // two semantics.
             flusher.request_flush(
                 self.context.id(),
                 self.cell.clone(),
-                FlushKind::ForceRelocate(self.levels.clone()),
+                FlushKind::ForceRelocate {
+                    levels: self.levels.clone(),
+                    relocate_positions,
+                },
             );
         }
     }
@@ -1908,13 +1908,15 @@ impl LargeTableEntry {
         // in that case, just update the on-disk levels. The dirty overlay
         // remains valid.
         //
-        // Force-relocate collapses all populated levels into a single new
-        // blob, so `new_levels` is always single-level here. Overwriting
-        // `self.levels` wholesale is intentional: any pre-flush L1 was
-        // consumed into the collapsed output.
+        // Force-relocate on an unsharded cell collapses all populated levels
+        // into a single new blob, so `new_levels` is single-level. On a
+        // sharded cell it rewrites a subset of shards in place, preserving
+        // the sharded shape. Overwriting `self.levels` wholesale is
+        // intentional in both cases: any pre-flush blob that was rewritten
+        // has been replaced at a fresh position.
         debug_assert!(
-            new_levels.is_single_level(),
-            "force-relocate must produce at-most-one populated level (got {:?})",
+            new_levels.is_single_level() || new_levels.is_sharded(),
+            "force-relocate must produce either a single-level blob or a sharded set (got {:?})",
             new_levels,
         );
         match self.state {
@@ -1961,7 +1963,7 @@ impl LargeTableEntry {
         // Important: promote pending should be called after last_processed_wal_position read from loader
         // See also comments in unload_if_ks_enabled.
         self.promote_pending();
-        let flush_kind = match self.flush_kind() {
+        let flush_kind = match self.flush_kind(HashSet::new()) {
             Some(kind) => kind,
             None => {
                 if !forced_relocation {
@@ -1972,6 +1974,7 @@ impl LargeTableEntry {
                     dirty: self.data.clone_shared(),
                     current_levels: self.levels.clone(),
                     loaded: true,
+                    relocate_positions: HashSet::new(),
                 }
             }
         };
@@ -2011,7 +2014,7 @@ impl LargeTableEntry {
                 // before last_processed_wal_position are propagated to the index.
                 self.promote_pending();
                 let flush_kind = self
-                    .flush_kind()
+                    .flush_kind(HashSet::new())
                     .expect("unload_if_ks_enabled is called in clean state");
                 flusher.request_flush(self.context.id(), self.cell.clone(), flush_kind);
             }
@@ -2158,7 +2161,7 @@ impl LargeTableEntry {
         self.report_loaded_keys_count();
     }
 
-    pub fn flush_kind(&mut self) -> Option<FlushKind> {
+    pub fn flush_kind(&mut self, relocate_positions: HashSet<WalPosition>) -> Option<FlushKind> {
         match self.state {
             LargeTableEntryState::Empty => None,
             LargeTableEntryState::Unloaded => None,
@@ -2167,11 +2170,13 @@ impl LargeTableEntry {
                 dirty: self.data.clone_shared(),
                 current_levels: self.levels.clone(),
                 loaded: false,
+                relocate_positions,
             }),
             LargeTableEntryState::DirtyLoaded => Some(FlushKind::Flush {
                 dirty: self.data.clone_shared(),
                 current_levels: self.levels.clone(),
                 loaded: true,
+                relocate_positions,
             }),
         }
     }
