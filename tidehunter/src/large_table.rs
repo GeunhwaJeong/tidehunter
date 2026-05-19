@@ -1,10 +1,8 @@
-use crate::budget::Budget;
 use crate::cell::{CellId, CellIdBytesContainer};
 use crate::config::Config;
 use crate::container::LargeTableContainer;
 use crate::context::{KsContext, LookupResult, LookupSource};
 use crate::control::RelocateFiles;
-use crate::db::DbError;
 use crate::flusher::{FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread};
 use crate::index::index_format::{Direction, IndexFormat, IndexIterCaches};
 use crate::index::index_table::IndexTable;
@@ -109,10 +107,6 @@ struct KsTable {
     /// One flag per mutex shard. Set by the commit path when a batch is applied to that shard;
     /// cleared and consumed by the pending-promotion thread.
     pending_dirty: Box<[AtomicBool]>,
-    /// Per-cell index space budget. Pre-WAL gate: insert/remove call
-    /// `try_consume` before the WAL write so a rejection leaves the WAL
-    /// untouched. Disabled by `Config::skip_space_budget`.
-    pub(crate) budget: Budget,
 }
 
 struct Row {
@@ -221,20 +215,10 @@ impl LargeTable {
                     let mut row_cells: Vec<Vec<(CellId, SnapshotEntryData)>> =
                         (0..num_mutexes).map(|_| Vec::new()).collect();
 
-                    let limit = index_overflow_limit(config.frag_size);
-                    let mut initial_budgets: HashMap<CellId, u64> =
-                        HashMap::with_capacity(ks_cells.len());
                     for (cell, entry_data) in ks_cells {
                         let mutex_idx = ks.mutex_for_cell(cell);
-                        let used: u64 = entry_data
-                            .levels()
-                            .iter()
-                            .map(|p| p.payload_len() as u64)
-                            .sum();
-                        initial_budgets.insert(cell.clone(), limit.saturating_sub(used));
                         row_cells[mutex_idx].push((cell.clone(), entry_data.clone()));
                     }
-                    let budget = Budget::new(initial_budgets, limit, config.skip_space_budget);
 
                     // Create Row structures
                     let rows = row_cells.into_par_iter().map(|cells| {
@@ -317,7 +301,6 @@ impl LargeTable {
                         rows,
                         cell_index,
                         pending_dirty,
-                        budget,
                     }
                 },
             )
@@ -333,40 +316,6 @@ impl LargeTable {
 
     pub(crate) fn ks_context(&self, ks: KeySpace) -> &KsContext {
         &self.table[ks.as_usize()].context
-    }
-
-    /// Pre-WAL space-budget gate: try to charge `bytes` to `cell_id`'s budget
-    /// in keyspace `ks`. Returns `DbError::IndexWouldOverflow` if the cell
-    /// can't absorb the bytes; on Ok the caller proceeds with WAL write +
-    /// apply. On rejection nothing has been written and the budget is
-    /// unchanged. No-op when `Config::skip_space_budget` is set.
-    ///
-    /// PrefixedUniform note: the very first insert that targets a freshly
-    /// created Tree cell finds no entry in the budget map (it gets added
-    /// only later, by the `entry_mut` cell-creation hook) and is therefore
-    /// not gated. A fresh cell starts with full budget on the next op
-    /// regardless, so this can over-credit by at most a single key per cell
-    /// — accepted as the cost of keeping cell registration tied to the one
-    /// site where cells are actually created.
-    pub(crate) fn try_consume_budget(
-        &self,
-        ks: KeySpace,
-        cell_id: &CellId,
-        key_len: u64,
-    ) -> Result<(), DbError> {
-        let ks_table = &self.table[ks.as_usize()];
-        match ks_table
-            .budget
-            .try_consume(cell_id, key_len + INDEX_ENTRY_OVERHEAD)
-        {
-            Ok(()) => Ok(()),
-            Err(over) => Err(DbError::IndexWouldOverflow {
-                ks_name: ks_table.context.name().to_string(),
-                cell_id: cell_id.clone(),
-                bytes: over.bytes,
-                limit_bytes: over.limit_bytes,
-            }),
-        }
     }
 
     pub fn insert<L: Loader>(
@@ -595,10 +544,6 @@ impl LargeTable {
                 .cell_index
                 .write()
                 .insert(cell.assume_bytes_id().clone());
-            // Bring the dynamically-created cell under budget tracking.
-            // This is the only site that creates Tree cells; the matching
-            // remove lives in `drop_cells_in_range`.
-            ks_table.budget.add_cell(cell.clone());
         }
         entry
     }
@@ -1192,12 +1137,10 @@ impl LargeTable {
         to_cell: &CellId,
     ) {
         let mut current_cell = Some(from_cell.clone());
-        let ks_table = self.ks_table(&context.ks_config);
 
         while let Some(cell) = current_cell.as_ref() {
             let mut row = self.lock_cell_waiting_for_flush(context, cell);
             row.remove_entry(cell);
-            ks_table.budget.remove_cell(cell);
 
             if cell == to_cell {
                 break;
@@ -1250,11 +1193,9 @@ impl LargeTable {
         original_index: Arc<IndexTable>,
         new_levels: IndexLevels,
     ) {
-        let used = self.with_promoted_entry(context, cell, |entry| {
+        self.with_promoted_entry(context, cell, |entry| {
             entry.update_flushed_index(original_index, new_levels);
-            entry.used_index_bytes()
         });
-        self.ks_table(&context.ks_config).budget.reset(cell, used);
     }
 
     /// Called by the flusher after a `ForceRelocate` flush completes.
@@ -1266,11 +1207,9 @@ impl LargeTable {
         cell: &CellId,
         new_levels: IndexLevels,
     ) {
-        let used = self.with_promoted_entry(context, cell, |entry| {
+        self.with_promoted_entry(context, cell, |entry| {
             entry.update_relocated_position(new_levels);
-            entry.used_index_bytes()
         });
-        self.ks_table(&context.ks_config).budget.reset(cell, used);
     }
 
     /// Locks the row containing `cell`, calls `promote_pending` on the entry,
@@ -1472,17 +1411,6 @@ impl LargeTableEntry {
             unload_jitter,
             bloom_filter,
         )
-    }
-
-    /// Bytes attributable to this cell's index state: on-disk level payloads
-    /// plus the in-memory overlay's key bytes plus per-entry overhead for
-    /// in-memory entries (matches what `try_consume_budget` charged on the
-    /// way in). Used to reset the per-cell budget after a flush/relocate.
-    pub(crate) fn used_index_bytes(&self) -> u64 {
-        let level_bytes: u64 = self.levels.iter().map(|p| p.payload_len() as u64).sum();
-        let mem_keys = self.data.total_key_bytes() as u64;
-        let mem_count = self.data.len() as u64;
-        level_bytes + mem_keys + mem_count * INDEX_ENTRY_OVERHEAD
     }
 
     pub fn new_empty(context: KsContext, cell: CellId, unload_jitter: usize) -> Self {
@@ -2386,25 +2314,6 @@ impl Entries {
             Entries::Tree(tree) => Box::new(tree.values()),
         }
     }
-}
-
-/// Per-entry serialised cost beyond the raw key bytes that the budget tracks.
-/// Covers `wal_offset(8) + encoded_len(4) = 12` for fixed flat, plus the
-/// variable-flat extras (offset-table u32 + key-len varint, ≤ 6 B). 16 is a
-/// small over-estimate that lets one constant work for both formats.
-pub(crate) const INDEX_ENTRY_OVERHEAD: u64 = 16;
-
-/// Returns the per-cell index byte budget: `frag_size` minus a fixed
-/// headroom reserved for serialized index overhead the budget doesn't
-/// account for per-entry. The margin covers:
-/// - the `LookupHeaderIndex` micro-cell header (`HEADER_SIZE` = 1 KiB),
-/// - the WAL frame's CRC header and entry-type prefix, and frag alignment.
-///
-/// Per-entry costs are charged on every `try_consume_budget` via
-/// `INDEX_ENTRY_OVERHEAD`, so they don't need to live in the margin.
-pub(crate) fn index_overflow_limit(frag_size: u64) -> u64 {
-    const INDEX_OVERFLOW_MARGIN: u64 = crate::index::index_format::HEADER_SIZE as u64 + 1024;
-    frag_size.saturating_sub(INDEX_OVERFLOW_MARGIN)
 }
 
 #[cfg(not(test))]

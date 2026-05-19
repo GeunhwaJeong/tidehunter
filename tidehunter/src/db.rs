@@ -300,17 +300,14 @@ impl Db {
         let k = k.into();
         let v = v.into();
         context.ks_config.check_key(&k);
-        let full_key = k.clone();
-        let reduced_key = context.ks_config.reduced_key_bytes(k.clone());
-        let cell_id = context.ks_config.cell_id(&reduced_key);
-        self.large_table
-            .try_consume_budget(ks, &cell_id, reduced_key.len() as u64)?;
-        let w = PreparedWalWrite::new(&WalEntry::Record(context.id(), k, v.clone(), false));
+        let w = PreparedWalWrite::new(&WalEntry::Record(context.id(), k.clone(), v.clone(), false));
         context.inc_wal_written(WalEntryKind::Record, w.len() as u64);
         let guard = self.wal_writer.write(&w)?;
         self.metrics
             .wal_written_bytes
             .set(guard.wal_position().offset() as i64);
+        let full_key = k.clone();
+        let reduced_key = context.ks_config.reduced_key_bytes(k);
         self.large_table
             .insert(context, reduced_key, full_key, guard, &v, self)?;
         Ok(())
@@ -321,13 +318,10 @@ impl Db {
         let _timer = context.db_op_timer(DbOpKind::Remove);
         let k = k.into();
         context.ks_config.check_key(&k);
-        let reduced_key = context.ks_config.reduced_key_bytes(k.clone());
-        let cell_id = context.ks_config.cell_id(&reduced_key);
-        self.large_table
-            .try_consume_budget(ks, &cell_id, reduced_key.len() as u64)?;
-        let w = PreparedWalWrite::new(&WalEntry::Remove(context.id(), k));
+        let w = PreparedWalWrite::new(&WalEntry::Remove(context.id(), k.clone()));
         context.inc_wal_written(WalEntryKind::Tombstone, w.len() as u64);
         let guard = self.wal_writer.write(&w)?;
+        let reduced_key = context.ks_config.reduced_key_bytes(k);
         self.large_table.remove(context, reduced_key, guard, self)
     }
 
@@ -446,26 +440,6 @@ impl Db {
             .write_batch_times
             .with_label_values(&[&tag, "write"])
             .mcs_timer();
-
-        // Pre-WAL space-budget gate: try to charge each op's bytes to its
-        // target cell's budget before allocating any WAL space. On overflow
-        // the WAL is untouched so replay never sees the rejected records.
-        //
-        // We don't refund decrements from prior ops in the same batch when a
-        // later op fails: by design, partial-batch failure is rare (a single
-        // mid-batch overflow only) and the leaked decrements are bounded by
-        // one batch's worth of keys, with the next flush+reset reconciling
-        // the budget against the on-disk projection.
-        for op in &pending_ops {
-            let ks = op.ks();
-            let key_len = match op {
-                PendingOp::Insert { reduced_key, .. } | PendingOp::Remove { reduced_key, .. } => {
-                    reduced_key.len() as u64
-                }
-            };
-            self.large_table
-                .try_consume_budget(ks, op.cell_id(), key_len)?;
-        }
 
         // Write to WAL first to get positions
         let guards = self.write_batch_into_wal(&writes)?;
@@ -1371,15 +1345,6 @@ pub enum DbError {
     CrCorrupted,
     WalError(WalError),
     CorruptedIndexEntry(bincode::Error),
-    /// An insert/remove would push the cell's index past its space budget
-    /// (`frag_size - margin`). Reported pre-WAL, so the WAL never receives the
-    /// rejected record. Disable via `Config::skip_space_budget`.
-    IndexWouldOverflow {
-        ks_name: String,
-        cell_id: CellId,
-        bytes: u64,
-        limit_bytes: u64,
-    },
 }
 
 impl WalEntry {
