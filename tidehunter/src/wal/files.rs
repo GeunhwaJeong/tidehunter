@@ -81,17 +81,27 @@ impl WalFiles {
             .unwrap_or_else(|| panic!("attempt to access non existing file {id:?}"))
     }
 
-    /// Returns a new `WalFiles` with the listed file ids removed.
-    /// Ids not present in the map are silently ignored.
-    pub(crate) fn without_files(&self, to_remove: &[WalFileId]) -> Self {
+    /// Returns a new `WalFiles` with the listed file ids removed, along with
+    /// the `(WalFileId, Arc<File>)` pairs that were removed. Ids not present
+    /// in the map contribute no entry to the returned vec.
+    pub(crate) fn without_files(
+        &self,
+        to_remove: &[WalFileId],
+    ) -> (Self, Vec<(WalFileId, Arc<File>)>) {
         let mut files = self.files.clone();
+        let mut removed = Vec::with_capacity(to_remove.len());
         for id in to_remove {
-            files.remove(id);
+            if let Some(file) = files.remove(id) {
+                removed.push((*id, file));
+            }
         }
-        Self {
-            base_path: self.base_path.clone(),
-            files,
-        }
+        (
+            Self {
+                base_path: self.base_path.clone(),
+                files,
+            },
+            removed,
+        )
     }
 
     /// Returns a new `WalFiles` with `file` inserted at `id`. Panics if `id`

@@ -2,7 +2,7 @@ use super::layout::WalLayout;
 use super::position::{MapId, WalFileId};
 use super::tracking_mmap::TrackingMMapMut;
 use super::{Map, Wal, WalFiles};
-use crate::metrics::{MetricIntGauge, Metrics, TimerExt};
+use crate::metrics::{MetricIntCounter, MetricIntGauge, Metrics, TimerExt};
 use crate::wal::syncer::WalSyncer;
 use arc_swap::ArcSwap;
 use std::collections::{BTreeMap, HashSet};
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub(crate) enum WalMapperMessage {
     MapFinalized(MapId),
@@ -36,26 +36,36 @@ struct WalMapperThread {
 }
 const INITIAL_MAPS_BUFFER: usize = 2;
 
-/// Background worker that performs `remove_file` calls off the mapper
-/// thread. Sparse GC can produce large delete batches; running the syscalls
-/// inline would block `MapFinalized` processing long enough for the writer
-/// to time out in `get_writeable_map`.
+/// Background worker that performs `remove_file` calls and closes the
+/// underlying `File` off the mapper thread. Sparse GC can produce large
+/// delete batches; running the syscalls (or `File::drop`, which closes the
+/// fd) inline would block `MapFinalized` processing long enough for the
+/// writer to time out in `get_writeable_map`.
 struct UnlinkWorker {
-    sender: Option<mpsc::Sender<PathBuf>>,
+    sender: Option<mpsc::Sender<UnlinkMessage>>,
     jh: Option<JoinHandle<()>>,
+}
+
+struct UnlinkMessage {
+    path: PathBuf,
+    file: Arc<File>,
 }
 
 impl UnlinkWorker {
     fn start(metrics: Arc<Metrics>, kind: &'static str) -> Self {
-        let (sender, receiver) = mpsc::channel::<PathBuf>();
+        let (sender, receiver) = mpsc::channel::<UnlinkMessage>();
         let time_mcs = metrics.wal_unlinker_time_mcs.with_label_values(&[kind]);
+        let retry_count = metrics
+            .wal_unlinker_close_retry_count
+            .with_label_values(&[kind]);
         let jh = thread::Builder::new()
             .name("wal-unlinker".to_string())
             .spawn(move || {
-                for path in receiver {
+                for msg in receiver {
                     let _timer = time_mcs.clone().mcs_timer();
-                    if path.exists() {
-                        std::fs::remove_file(&path).expect("Failed to remove wal file");
+                    drop_arc_file(msg.file, &msg.path, &retry_count);
+                    if msg.path.exists() {
+                        std::fs::remove_file(&msg.path).expect("Failed to remove wal file");
                     }
                 }
             })
@@ -66,15 +76,56 @@ impl UnlinkWorker {
         }
     }
 
-    fn unlink(&self, path: PathBuf) {
+    fn unlink(&self, path: PathBuf, file: Arc<File>) {
         // The receiver is only dropped when the worker thread exits, which
         // only happens after this struct is dropped. `send` cannot fail in
         // normal operation.
-        let _: Result<(), mpsc::SendError<PathBuf>> = self
+        let _: Result<(), mpsc::SendError<UnlinkMessage>> = self
             .sender
             .as_ref()
             .expect("UnlinkWorker dropped")
-            .send(path);
+            .send(UnlinkMessage { path, file });
+    }
+}
+
+/// Spin on `Arc::try_unwrap` until we are the sole owner, then drop the
+/// `File` here so the `close(2)` syscall runs on the unlink worker rather
+/// than whatever thread happens to release the last reader-side clone.
+fn drop_arc_file(mut file: Arc<File>, path: &std::path::Path, retry_count: &MetricIntCounter) {
+    const RETRY_SLEEP: Duration = Duration::from_millis(10);
+    const LOG_EVERY: Duration = Duration::from_secs(10);
+    let start = Instant::now();
+    let mut next_log_at = LOG_EVERY;
+    loop {
+        match Arc::try_unwrap(file) {
+            Ok(f) => {
+                drop(f);
+                return;
+            }
+            Err(arc) => {
+                retry_count.inc();
+                file = arc;
+            }
+        }
+        thread::sleep(RETRY_SLEEP);
+        let elapsed = start.elapsed();
+        if elapsed >= next_log_at {
+            // In debug builds we treat a 10s wait as a bug — a lingering
+            // `Arc<File>` clone means something is holding the file beyond
+            // its expected lifetime.
+            debug_assert!(
+                false,
+                "wal-unlinker stuck closing {} after {:?}: Arc::try_unwrap still failing",
+                path.display(),
+                elapsed,
+            );
+            eprintln!(
+                "WARNING: wal-unlinker still waiting to close {} after {:?}",
+                path.display(),
+                elapsed,
+            );
+            next_log_at += LOG_EVERY;
+        }
     }
 }
 
@@ -287,15 +338,20 @@ impl WalMapperThread {
         actual.dedup();
         // Drop the entries from the file map first — subsequent `file_ids()`
         // and `get_checked()` see the deletion immediately. The actual
-        // `remove_file` syscalls are dispatched to the unlink worker so a
-        // large batch doesn't keep this thread out of `MapFinalized` for
-        // long. In-flight readers retain their `Arc<File>` clones, and Unix
-        // unlink keeps the inode alive until the last reference drops.
-        let new_files = wal_files.without_files(&actual);
+        // `remove_file` syscalls (and the `close(2)` from dropping `File`)
+        // are dispatched to the unlink worker so a large batch doesn't keep
+        // this thread out of `MapFinalized` for long. In-flight readers
+        // retain their `Arc<File>` clones, and Unix unlink keeps the inode
+        // alive until the last reference drops.
+        let (new_files, removed_files) = wal_files.without_files(&actual);
+        let to_unlink: Vec<(PathBuf, Arc<File>)> = removed_files
+            .into_iter()
+            .map(|(id, file)| (self.layout.wal_file_name(&wal_files.base_path, id), file))
+            .collect();
         self.files.store(Arc::new(new_files));
-        for id in &actual {
-            self.unlinker
-                .unlink(self.layout.wal_file_name(&wal_files.base_path, *id));
+        drop(wal_files);
+        for (path, file) in to_unlink {
+            self.unlinker.unlink(path, file);
         }
         // No `WalMaps` update needed: the `mapped_files` filter above already
         // guarantees every entry in `actual` is unmapped, so there is nothing

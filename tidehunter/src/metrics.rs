@@ -188,6 +188,10 @@ pub struct Metrics {
     pub map_time_mcs: MetricHistogram,
     pub wal_mapper_time_mcs: MetricIntCounter,
     pub wal_unlinker_time_mcs: MetricIntCounterVec,
+    /// Number of times the unlink worker's `Arc::try_unwrap` failed because a
+    /// reader (or anything else) still held a clone of `Arc<File>`. One
+    /// increment per failed attempt, not per file.
+    pub wal_unlinker_close_retry_count: MetricIntCounterVec,
     pub write_batch_times: MetricIntCounterVec,
     pub write_batch_operations: MetricIntCounterVec,
     pub skip_stale_update: MetricIntCounterVec,
@@ -402,6 +406,12 @@ impl Metrics {
             wal_mapper_time_mcs: counter!("wal_mapper_time_mcs", registry, enabled),
             wal_unlinker_time_mcs: counter_vec!(
                 "wal_unlinker_time_mcs",
+                &["kind"],
+                registry,
+                enabled
+            ),
+            wal_unlinker_close_retry_count: counter_vec!(
+                "wal_unlinker_close_retry_count",
                 &["kind"],
                 registry,
                 enabled
