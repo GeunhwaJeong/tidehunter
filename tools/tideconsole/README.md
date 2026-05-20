@@ -98,11 +98,22 @@ These methods read the `cr` file directly — no WAL replay or `Db::open` requir
       "cells": [              // every cell in the snapshot
         {
           "cell_id":        i64 | string,  // integer for Uniform KS, hex for PrefixedUniform
-          "levels": [                      // one entry per populated on-disk level,
+          "levels": [                      // one entry per populated on-disk blob,
             {                              //   freshest (L0) first; empty if no index yet
-              "level":  i64,               // schema slot (0 = L0, 1 = L1, …)
+              "level":  i64,               // schema slot (0 = L0, 1 = L1, …); shard
+                                           //   blobs are reported at L1 too
               "offset": i64,               // index WAL offset
               "len":    i64,               // index frame length
+            },
+            ...
+          ],
+          "shards": [                      // empty unless auto_sharding has split L1
+            {                              //   into per-range sub-blobs
+              "min_key": string,           // hex; shard's smallest content key
+              "max_key": string,           // hex; shard's largest content key
+              "offset":  i64,              // index WAL offset (same as the matching
+                                           //   "level":1 entry under `levels`)
+              "len":     i64,              // index frame length
             },
             ...
           ],
@@ -163,6 +174,22 @@ for ks in cr.keyspaces {
         }
     }
     print(ks.name + ": " + promoted + " cells with L1");
+}
+```
+
+**Find sharded cells and their shard ranges:**
+```rhai
+let db = open("/data/mydb");
+let cr = db.load_cr();
+for ks in cr.keyspaces {
+    for c in ks.cells {
+        if c.shards.len() > 0 {
+            print(ks.name + " cell " + c.cell_id + ": " + c.shards.len() + " shards");
+            for s in c.shards {
+                print("  [" + s.min_key + " .. " + s.max_key + "]  " + s.len + " bytes");
+            }
+        }
+    }
 }
 ```
 

@@ -45,11 +45,21 @@ pub(crate) fn register(engine: &mut Engine) {
     //         "cells": [               // every cell in the snapshot (including empty ones)
     //           {
     //             "cell_id":        i64 | string,  // Integer → i64; Bytes → lowercase hex
-    //             "levels": [                      // one entry per populated on-disk level,
-    //               {                              //   freshest (L0) first; empty if no index yet
-    //                 "level":  i64,               // schema slot (0 = L0, 1 = L1, …)
+    //             "levels": [                      // one entry per populated on-disk blob,
+    //               {                              //   freshest (L0) first; empty if no index
+    //                 "level":  i64,               // schema slot (0 = L0, 1 = L1, …); shard
+    //                                              //   blobs are reported at L1 too
     //                 "offset": i64,               // index WAL offset
     //                 "len":    i64,               // index frame length
+    //               },
+    //               ...
+    //             ],
+    //             "shards": [                      // empty unless auto_sharding split L1
+    //               {                              //   into per-range sub-blobs
+    //                 "min_key": string,           // hex; shard's smallest content key
+    //                 "max_key": string,           // hex; shard's largest content key
+    //                 "offset":  i64,              // index WAL offset
+    //                 "len":     i64,              // index frame length
     //               },
     //               ...
     //             ],
@@ -100,9 +110,33 @@ pub(crate) fn register(engine: &mut Engine) {
                             })
                             .collect();
 
+                        let shards: rhai::Array = entry
+                            .levels
+                            .shards()
+                            .iter()
+                            .map(|(min_key, shard)| {
+                                let mut m = Map::new();
+                                m.insert("min_key".into(), Dynamic::from(hex::encode(min_key)));
+                                m.insert(
+                                    "max_key".into(),
+                                    Dynamic::from(hex::encode(&shard.max_key)),
+                                );
+                                m.insert(
+                                    "offset".into(),
+                                    Dynamic::from(shard.position.offset() as i64),
+                                );
+                                m.insert(
+                                    "len".into(),
+                                    Dynamic::from(shard.position.frame_len() as i64),
+                                );
+                                Dynamic::from(m)
+                            })
+                            .collect();
+
                         let mut cell_map = Map::new();
                         cell_map.insert("cell_id".into(), cell_id_val);
                         cell_map.insert("levels".into(), Dynamic::from(levels));
+                        cell_map.insert("shards".into(), Dynamic::from(shards));
                         cell_map.insert(
                             "last_processed".into(),
                             Dynamic::from(entry.last_processed.as_u64() as i64),
@@ -309,8 +343,11 @@ fn cr_stats_impl(h: &mut DbHandle, lowest_n: usize) -> Result<(), Box<EvalAltRes
     // Collect all valid positions: (offset, frame_len, ks_idx, level_idx).
     // Each populated level (L0, L1, …) within a cell contributes one tuple,
     // so a cell with both L0 and L1 appears twice — disambiguated by level_idx.
+    // Sharded L1 contributes one tuple per shard, all at level=1.
     let mut all_positions: Vec<(u64, usize, usize, usize)> = Vec::new();
     let mut total_position_size = 0u64;
+    let mut sharded_cells = 0usize;
+    let mut total_shards = 0usize;
     for (ks_idx, ks_data) in snapshot.data.iter().enumerate() {
         for entry in ks_data.values() {
             for (level, pos) in entry.levels.iter_with_level() {
@@ -318,6 +355,10 @@ fn cr_stats_impl(h: &mut DbHandle, lowest_n: usize) -> Result<(), Box<EvalAltRes
                 let len = pos.frame_len();
                 all_positions.push((off, len, ks_idx, level));
                 total_position_size += len as u64;
+            }
+            if entry.levels.is_sharded() {
+                sharded_cells += 1;
+                total_shards += entry.levels.shards().len();
             }
         }
     }
@@ -353,6 +394,11 @@ fn cr_stats_impl(h: &mut DbHandle, lowest_n: usize) -> Result<(), Box<EvalAltRes
     print("====================");
     print(&format!("  Last WAL position : {:#x}", cr.last_position()));
     print(&format!("  Valid level blobs : {}", all_positions.len()));
+    if sharded_cells > 0 {
+        print(&format!(
+            "  Sharded cells     : {sharded_cells} ({total_shards} shard blobs)"
+        ));
+    }
 
     print("");
     print("Index WAL Space:");

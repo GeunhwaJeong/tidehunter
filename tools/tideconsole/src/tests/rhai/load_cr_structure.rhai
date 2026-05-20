@@ -20,4 +20,13 @@ for lvl in levels {
     assert(lvl["offset"] >= 0, "level offset should be non-negative");
     assert(lvl["len"]    >  0, "level len should be positive");
 }
+let shards = cell["shards"];
+assert(type_of(shards) == "array", "shards should be an array");
+assert_eq(shards.len(), 0, "unsharded cell should expose an empty shards array");
+for s in shards {
+    assert(type_of(s["min_key"]) == "string", "shard min_key should be hex string");
+    assert(type_of(s["max_key"]) == "string", "shard max_key should be hex string");
+    assert(s["offset"] >= 0, "shard offset should be non-negative");
+    assert(s["len"]    >  0, "shard len should be positive");
+}
 assert(cell["last_processed"] >= 0, "last_processed should be non-negative");
