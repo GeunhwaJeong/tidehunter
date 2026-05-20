@@ -4046,6 +4046,29 @@ fn test_auto_sharding_concurrent() {
             .collect();
         assert_eq!(from_iter, snap, "iterator/shadow mismatch at iter {iter}");
 
+        // Reverse iteration must visit the same key set in descending order so
+        // the sharded reverse picker is exercised across the same shards as
+        // the forward sweep.
+        let mut reverse_iter = db.iterator(ks);
+        reverse_iter.reverse();
+        let reverse_pairs: Vec<(Vec<u8>, Vec<u8>)> = reverse_iter
+            .map(|r| {
+                let (k, v) = r.unwrap();
+                (k.as_ref().to_vec(), v.as_ref().to_vec())
+            })
+            .collect();
+        for window in reverse_pairs.windows(2) {
+            assert!(
+                window[0].0 > window[1].0,
+                "reverse iterator must yield strictly descending keys at iter {iter}",
+            );
+        }
+        let from_reverse_iter: HashMap<Vec<u8>, Vec<u8>> = reverse_pairs.into_iter().collect();
+        assert_eq!(
+            from_reverse_iter, snap,
+            "reverse iterator/shadow mismatch at iter {iter}",
+        );
+
         // After the midpoint, snapshot the control region every iteration so
         // the low-occupancy index files left behind by heavy churn become
         // force-relocation candidates.
