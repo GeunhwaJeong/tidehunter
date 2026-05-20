@@ -173,6 +173,14 @@ pub struct Metrics {
     pub lookup_io_mcs: MetricIntCounter,
     pub lookup_io_bytes: MetricIntCounter,
 
+    /// Per-ks count of point reads that hit a `CompressedBatch` frame and had
+    /// to decompress its body to locate the record. Attributed to the
+    /// requesting keyspace, not the keyspaces of inner entries.
+    pub read_decompress_count: MetricIntCounterVec,
+    /// Per-ks cumulative microseconds spent in batch decompression on the
+    /// read path. Attribution matches `read_decompress_count`.
+    pub read_decompress_mcs: MetricIntCounterVec,
+
     pub large_table_contention: MetricHistogramVec,
     pub wal_write_wait: MetricIntCounter,
     pub wal_synced_position: MetricIntGauge,
@@ -373,6 +381,13 @@ impl Metrics {
             lookup_scan_mcs: counter!("lookup_scan_mcs", registry, enabled),
             lookup_io_mcs: counter!("lookup_io_mcs", registry, enabled),
             lookup_io_bytes: counter!("lookup_io_bytes", registry, enabled),
+            read_decompress_count: counter_vec!(
+                "read_decompress_count",
+                &["ks"],
+                registry,
+                enabled
+            ),
+            read_decompress_mcs: counter_vec!("read_decompress_mcs", &["ks"], registry, enabled),
             large_table_contention: histogram_vec!(
                 "large_table_contention",
                 &["ks"],

@@ -834,8 +834,11 @@ impl Db {
                 }
             }
             entry @ WalEntry::CompressedBatch(..) => {
+                let _timer = context.read_decompress_mcs.clone().mcs_timer();
                 let decompressed = decompress_wal_entry(entry).expect("matched above");
-                Ok(find_record(&decompressed, context.ks_config.id(), k))
+                let result = find_record(&decompressed, context.ks_config.id(), k);
+                context.read_decompress_count.inc();
+                Ok(result)
             }
             other => panic!("Unexpected wal entry where expected record/batch: {other:?}"),
         }
@@ -861,12 +864,13 @@ impl Db {
         match entry {
             WalEntry::Record(KeySpace(_), k, v, _relocated) => Ok(Some((k, v))),
             entry @ WalEntry::CompressedBatch(..) => {
+                let _timer = context.read_decompress_mcs.clone().mcs_timer();
                 let decompressed = decompress_wal_entry(entry).expect("matched above");
-                Ok(find_record_by(
-                    &decompressed,
-                    context.ks_config.id(),
-                    |full_key| context.ks_config.reduce_key(full_key).as_ref() == indexed_key,
-                ))
+                let result = find_record_by(&decompressed, context.ks_config.id(), |full_key| {
+                    context.ks_config.reduce_key(full_key).as_ref() == indexed_key
+                });
+                context.read_decompress_count.inc();
+                Ok(result)
             }
             other => panic!("Unexpected wal entry where expected record/batch: {other:?}"),
         }
