@@ -575,21 +575,23 @@ impl IndexFlusherThread {
         // `usize::MAX` when auto-sharding is disabled: re-sharding still
         // rewrites touched shards but never splits any further.
         let split_threshold = ctx.config.index_auto_shard_threshold.unwrap_or(usize::MAX);
-        let first_owner = current_shards
+        let first_owner: &[u8] = current_shards
             .keys()
             .next()
-            .cloned()
+            .map(Vec::as_slice)
             .expect("write_sharded_promote requires non-empty current_shards");
 
         // Owner = largest btree_key ≤ key. Keys below the first shard's
         // btree key fall to the first shard so they extend it leftward.
-        let mut partitions: BTreeMap<Vec<u8>, IndexTable> = BTreeMap::new();
+        // Partition keys borrow into `current_shards`, so the routing loop
+        // does not allocate per dirty key.
+        let mut partitions: BTreeMap<&[u8], IndexTable> = BTreeMap::new();
         for (key, pos) in merged_l0.iter_with_tombstones() {
-            let owner = current_shards
+            let owner: &[u8] = current_shards
                 .range::<[u8], _>((Bound::Unbounded, Bound::Included(key.as_ref())))
                 .next_back()
-                .map(|(bk, _)| bk.clone())
-                .unwrap_or_else(|| first_owner.clone());
+                .map(|(bk, _)| bk.as_slice())
+                .unwrap_or(first_owner);
             let table = partitions.entry(owner).or_default();
             if pos.is_valid() {
                 table.insert(key, pos);
@@ -604,7 +606,7 @@ impl IndexFlusherThread {
         let mut split_events: u64 = 0;
 
         for (btree_key, shard) in current_shards.iter() {
-            let Some(dirty_subset) = partitions.remove(btree_key) else {
+            let Some(dirty_subset) = partitions.remove(btree_key.as_slice()) else {
                 new_shards.insert(btree_key.clone(), shard.clone());
                 continue;
             };
