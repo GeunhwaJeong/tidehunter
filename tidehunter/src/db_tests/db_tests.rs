@@ -3876,6 +3876,20 @@ fn test_auto_sharding_concurrent() {
     config.frag_size = 4 * 1024;
     config.max_dirty_keys = 8;
     config.l0_max_entries = Some(16);
+    // Keep index WAL files tiny so churn rolls the writer forward past the
+    // most-recent file. Combined with the small `index_min_occupancy_pct`
+    // window below, this lets older files qualify as force-relocation
+    // candidates.
+    config.wal_file_size = 8 * 1024;
+    // Force dirty entries to flush on every snapshot so the alive-bytes
+    // accumulator reflects post-flush positions; otherwise untouched-shard
+    // positions never get re-counted against current files.
+    config.snapshot_unload_threshold = 0;
+    // Aggressive occupancy threshold so any old file with a partially-stale
+    // mix of live blobs qualifies for force-relocation. Combined with the
+    // narrowed second-half workload below, the shards covering the outer
+    // quarters stay put while their hosting files drain below this threshold.
+    config.index_min_occupancy_pct = 99;
     config.with_index_auto_sharding();
     let config = Arc::new(config);
 
@@ -3886,11 +3900,25 @@ fn test_auto_sharding_concurrent() {
     let state: Arc<Mutex<HashMap<Vec<u8>, Slot>>> = Arc::default();
 
     const POOL_SIZE: u64 = 4000;
-    const ITERATIONS: usize = 10;
     const THREADS: usize = 4;
     const OPS_PER_THREAD: usize = 500;
+    let iterations: usize = std::env::var("AUTO_SHARDING_ITERATIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
 
-    for iter in 0..ITERATIONS {
+    for iter in 0..iterations {
+        // First half churns the whole pool to build up sharded L1s across
+        // many WAL files. Second half narrows to a sliver around the middle
+        // ([7/16, 9/16) of the pool) so shards outside that band stop
+        // receiving writes — their blobs age into old files that fall below
+        // `index_min_occupancy_pct` and become force-relocation targets.
+        let (key_lo, key_hi) = if iter < iterations / 2 {
+            (0u64, POOL_SIZE)
+        } else {
+            (POOL_SIZE * 7 / 16, POOL_SIZE * 9 / 16)
+        };
+
         let mut handles = vec![];
         for tid in 0..THREADS {
             let db = db.clone();
@@ -3898,8 +3926,14 @@ fn test_auto_sharding_concurrent() {
             handles.push(thread::spawn(move || {
                 let seed = (iter * THREADS + tid) as u64;
                 let mut rng = StdRng::seed_from_u64(seed);
-                for _ in 0..OPS_PER_THREAD {
-                    let key = rng.gen_range(0..POOL_SIZE).to_le_bytes().to_vec();
+                for op_idx in 0..OPS_PER_THREAD {
+                    // Mid-iteration snapshot from thread 0 — races writers in
+                    // the other threads so the flush+relocate path runs while
+                    // dirty overlays are in motion.
+                    if tid == 0 && op_idx == OPS_PER_THREAD / 2 && iter >= iterations / 2 {
+                        db.force_rebuild_control_region().unwrap();
+                    }
+                    let key = rng.gen_range(key_lo..key_hi).to_le_bytes().to_vec();
 
                     let slot = state
                         .lock()
@@ -3946,6 +3980,13 @@ fn test_auto_sharding_concurrent() {
             })
             .collect();
         assert_eq!(from_iter, snap, "iterator/shadow mismatch at iter {iter}");
+
+        // After the midpoint, snapshot the control region every iteration so
+        // the low-occupancy index files left behind by heavy churn become
+        // force-relocation candidates.
+        if iter >= iterations / 2 {
+            db.force_rebuild_control_region().unwrap();
+        }
     }
 
     let label = &["root"];
@@ -3955,9 +3996,14 @@ fn test_auto_sharding_concurrent() {
         .l1_shard_rewritten_total
         .with_label_values(label)
         .get();
+    let forced_reloc = metrics
+        .snapshot_forced_relocation
+        .with_label_values(label)
+        .get();
     println!(
         "auto-sharding counters: l1_shards_total={shards_total} \
-         l1_shard_split_total={splits} l1_shard_rewritten_total={resharding}"
+         l1_shard_split_total={splits} l1_shard_rewritten_total={resharding} \
+         snapshot_forced_relocation={forced_reloc}"
     );
     assert!(
         resharding > 0,
