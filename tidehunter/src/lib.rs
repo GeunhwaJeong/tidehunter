@@ -1,5 +1,7 @@
 pub mod batch;
 mod cell;
+#[doc(hidden)] // Used by tools/tideconsole for WAL compression estimation
+pub mod compressed_batch;
 pub mod config;
 #[doc(hidden)] // Used by tools/tideconsole for control region inspection
 pub mod container;

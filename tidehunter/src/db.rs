@@ -1,5 +1,8 @@
-use crate::batch::{PendingOp, RelocatedWriteBatch, WriteBatch, WriteBatchWrite};
+use crate::batch::{PendingOp, RelocatedWriteBatch, WriteBatch};
 use crate::cell::CellId;
+use crate::compressed_batch::{
+    BatchCodec, CompressedBatch, InnerIter, decompress_wal_entry, find_record, find_record_by,
+};
 use crate::config::Config;
 use crate::context::{DbOpKind, KsContext, KsContextVec, ReadType, WalEntryKind};
 use crate::control::{ControlRegion, ControlRegionStore, RelocateFiles};
@@ -25,8 +28,9 @@ use bloom::needed_bits;
 use bytes::{Buf, BufMut, BytesMut};
 use minibytes::Bytes;
 use parking_lot::Mutex;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak, mpsc};
 use std::thread;
@@ -423,9 +427,9 @@ impl Db {
     pub(crate) fn do_write_batch(&self, batch: WriteBatch) -> DbResult<()> {
         let WriteBatch {
             transaction,
-            writes,
+            mut writes,
             tag,
-            pending_ops,
+            mut pending_ops,
             ..
         } = batch;
         if writes.is_empty() {
@@ -442,11 +446,20 @@ impl Db {
             .with_label_values(&[&tag, "write"])
             .mcs_timer();
 
-        // Write to WAL first to get positions
-        let guards = self.write_batch_into_wal(&writes)?;
-
-        // Extract WAL positions (skip the first guard which is batch start)
-        let positions: Vec<_> = guards[1..].iter().map(|g| *g.wal_position()).collect();
+        // Either write one compressed frame whose position is shared by every
+        // entry in the batch, or write per-record frames. Choice is a config
+        // knob; default is the per-record path.
+        let (guards, positions) = if let Some(codec) = self.config.batch_codec {
+            // Position sharing means the in-memory index can have at most
+            // one op per (ks, reduced_key) — `IndexTable::checked_insert`
+            // requires strictly increasing positions per key, so two ops
+            // on the same key in one batch would panic. Collapse to
+            // last-wins both in the WAL frame and in the pending ops.
+            dedup_last_wins(&mut writes, &mut pending_ops);
+            self.write_compressed_batch_into_wal(&writes, codec)?
+        } else {
+            self.write_batch_into_wal(&writes)?
+        };
 
         // Group pending_ops by (ks_id, mutex_idx) so each mutex is acquired only once.
         let mut grouped: Vec<(
@@ -529,18 +542,28 @@ impl Db {
 
         let mut num_inserts = 0;
         let mut num_deletes = 0;
-        // Create iterator and skip the first guard (batch start)
-
         for write in writes.iter() {
-            let context = self.ks_context(write.ks);
-            let wal_kind = if write.is_modified {
-                num_inserts += 1;
-                WalEntryKind::Record
-            } else {
-                num_deletes += 1;
-                WalEntryKind::Tombstone
-            };
-            context.inc_wal_written(wal_kind, write.prepared_write.len() as u64);
+            match write {
+                WalEntry::Record(..) => num_inserts += 1,
+                WalEntry::Remove(..) => num_deletes += 1,
+                _ => unreachable!("WriteBatch only produces Record/Remove"),
+            }
+        }
+        if self.config.batch_codec.is_some() {
+            // Compressed-batch path: one frame covers many keyspaces, so we
+            // credit it under `CompressedBatch` against the first-touched
+            // keyspace. No per-record decode is required.
+            if let (Some(first), Some(pos)) = (writes.first(), positions.first()) {
+                let context = self.ks_context(batch_entry_ks(first));
+                context.inc_wal_written(WalEntryKind::CompressedBatch, pos.frame_len() as u64);
+            }
+        } else {
+            // Default path: per-record framing. Credit each entry's WAL bytes
+            // to its own keyspace under the appropriate `WalEntryKind`.
+            for (write, pos) in writes.iter().zip(positions.iter()) {
+                let context = self.ks_context(batch_entry_ks(write));
+                context.inc_wal_written(batch_entry_wal_kind(write), pos.frame_len() as u64);
+            }
         }
 
         drop(_write_timer);
@@ -579,6 +602,8 @@ impl Db {
                 .wal_position()
                 .offset() as i64,
         );
+        // Keep batch WAL guards alive until pending writes are committed.
+        drop(guards);
 
         Ok(())
     }
@@ -609,14 +634,43 @@ impl Db {
         Ok(())
     }
 
-    fn write_batch_into_wal(&self, prepared_writes: &[WriteBatchWrite]) -> DbResult<Vec<WalGuard>> {
-        let batch_start_entry =
-            PreparedWalWrite::new(&WalEntry::BatchStart(prepared_writes.len() as u32));
-        let guards = self.wal_writer.multi_write(
-            std::iter::once(&batch_start_entry)
-                .chain(prepared_writes.iter().map(|pw| &pw.prepared_write)),
-        )?;
-        Ok(guards)
+    /// Per-record batch write (default path): one `BatchStart(N)` marker
+    /// followed by N `Record`/`Remove` frames. Returns all guards (N+1, with
+    /// the marker first) and the N positions that should be installed into
+    /// the large-table index — one per entry.
+    fn write_batch_into_wal(
+        &self,
+        entries: &[WalEntry],
+    ) -> DbResult<(Vec<WalGuard>, Vec<WalPosition>)> {
+        let batch_start_entry = PreparedWalWrite::new(&WalEntry::BatchStart(entries.len() as u32));
+        let prepared: Vec<PreparedWalWrite> = entries.iter().map(PreparedWalWrite::new).collect();
+        let guards = self
+            .wal_writer
+            .multi_write(iter::once(&batch_start_entry).chain(prepared.iter()))?;
+        let positions = guards[1..].iter().map(|g| *g.wal_position()).collect();
+        Ok((guards, positions))
+    }
+
+    /// Serialise and compress all inner entries into a single
+    /// `WalEntry::CompressedBatch` frame. Returns the single WAL guard and a
+    /// `positions` vector with one entry per input — every entry shares the
+    /// frame's `WalPosition`.
+    fn write_compressed_batch_into_wal(
+        &self,
+        entries: &[WalEntry],
+        codec: BatchCodec,
+    ) -> DbResult<(Vec<WalGuard>, Vec<WalPosition>)> {
+        let compressed = CompressedBatch::encode(entries, codec);
+        let entry = WalEntry::CompressedBatch(
+            compressed.codec,
+            compressed.uncompressed_len,
+            compressed.body,
+        );
+        let prepared = PreparedWalWrite::new(&entry);
+        let guard = self.wal_writer.write(&prepared)?;
+        let position = *guard.wal_position();
+        let positions = vec![position; entries.len()];
+        Ok((vec![guard], positions))
     }
 
     fn write_relocated_batch_into_wal(
@@ -699,7 +753,9 @@ impl Db {
         let (key, value) = match result.value {
             GetResult::Value(ref full_key, ref v) => (full_key.clone(), v.clone()),
             GetResult::WalPosition(w) => {
-                let Some((k, v)) = self.read_record(w)? else {
+                let Some((k, v)) =
+                    self.read_record_for_indexed_key(context, w, result.key.as_ref())?
+                else {
                     return Ok(None);
                 };
                 self.large_table
@@ -753,8 +809,11 @@ impl Db {
         k: &[u8],
         position: WalPosition,
     ) -> DbResult<Option<Bytes>> {
-        if !context.ks_config.need_check_index_key() {
+        if !context.ks_config.need_check_index_key() && self.config.batch_codec.is_none() {
             // Optimization only possible if an index key always matches a record key
+            // AND the position is guaranteed to point at a single `Record` frame
+            // (not a `CompressedBatch` whose payload length could accidentally
+            // match `record_len(k, &[])`).
             if position.payload_len() == WalEntry::record_len(k, &[]) {
                 // We can see that wal position only holds the key and the value is empty,
                 // we don't need disk read from the wal.
@@ -763,26 +822,53 @@ impl Db {
                 return Ok(Some(Bytes::new()));
             }
         }
-        let Some(record) = self.read_record(position)? else {
+        let Some(entry) = self.read_report_entry(&self.wal, position)? else {
             return Ok(None);
         };
-        let (wal_key, v) = record;
-        if wal_key.as_ref() != k {
-            Ok(None)
-        } else {
-            Ok(Some(v))
+        match entry {
+            WalEntry::Record(_, wal_key, v, _) => {
+                if wal_key.as_ref() != k {
+                    Ok(None)
+                } else {
+                    Ok(Some(v))
+                }
+            }
+            entry @ WalEntry::CompressedBatch(..) => {
+                let decompressed = decompress_wal_entry(entry).expect("matched above");
+                Ok(find_record(&decompressed, context.ks_config.id(), k))
+            }
+            other => panic!("Unexpected wal entry where expected record/batch: {other:?}"),
         }
     }
 
-    pub(crate) fn read_record(&self, position: WalPosition) -> DbResult<Option<(Bytes, Bytes)>> {
-        let entry = self.read_report_entry(&self.wal, position)?;
-        let Some(entry) = entry else {
+    /// Read the record matching `indexed_key` at `position`. `indexed_key` is
+    /// what the large-table index stores — for keyspaces without reduction it
+    /// equals the full key; for reducing keyspaces it is the result of
+    /// `ks_config.reduce_key(full_key)`.
+    ///
+    /// Returns `Some((full_key, value))` if a matching record is found, or
+    /// `None` if the position is unreachable (GC'd) or the inner batch no
+    /// longer contains a record for this indexed key (e.g. it was a tombstone).
+    pub(crate) fn read_record_for_indexed_key(
+        &self,
+        context: &KsContext,
+        position: WalPosition,
+        indexed_key: &[u8],
+    ) -> DbResult<Option<(Bytes, Bytes)>> {
+        let Some(entry) = self.read_report_entry(&self.wal, position)? else {
             return Ok(None);
         };
-        if let WalEntry::Record(KeySpace(_), k, v, _relocated) = entry {
-            Ok(Some((k, v)))
-        } else {
-            panic!("Unexpected wal entry where expected record");
+        match entry {
+            WalEntry::Record(KeySpace(_), k, v, _relocated) => Ok(Some((k, v))),
+            entry @ WalEntry::CompressedBatch(..) => {
+                let decompressed = decompress_wal_entry(entry).expect("matched above");
+                Ok(find_record_by(
+                    &decompressed,
+                    context.ks_config.id(),
+                    |full_key| context.ks_config.reduce_key(full_key).as_ref() == indexed_key,
+                ))
+            }
+            other => panic!("Unexpected wal entry where expected record/batch: {other:?}"),
         }
     }
 
@@ -793,6 +879,10 @@ impl Db {
             WalEntry::Remove(ks, _) => (WalEntryKind::Tombstone, *ks),
             WalEntry::BatchStart(_) => return,
             WalEntry::DropCells(_, _, _) => return, // No metrics for DropCells
+            // A compressed batch may serve many keys across multiple keyspaces;
+            // per-keyspace attribution would require decompressing the body,
+            // which would defeat the metric being lightweight. Skip for the sketch.
+            WalEntry::CompressedBatch(_, _, _) => return,
         };
         let context = self.large_table.ks_context(ks);
         context.inc_read(kind, read_type);
@@ -864,6 +954,41 @@ impl Db {
                     metrics.replayed_wal_records.inc();
                     let context = contexts.ks_context(ks);
                     large_table.drop_cells_in_range(context, &from_cell, &to_cell);
+                }
+                entry @ WalEntry::CompressedBatch(..) => {
+                    // A compressed batch is one durable WAL frame — either it
+                    // CRC-verifies (full batch present) or it does not. There
+                    // is no half-state, so we apply every inner entry
+                    // unconditionally; all of them share `position`.
+                    let decompressed = decompress_wal_entry(entry).expect("matched above");
+                    for inner in InnerIter::new(decompressed) {
+                        metrics.replayed_wal_records.inc();
+                        match inner {
+                            WalEntry::Record(ks, key, value, _relocated) => {
+                                let context = contexts.ks_context(ks);
+                                let full_key = key.clone();
+                                let reduced_key = context.ks_config.reduced_key_bytes(key);
+                                let guard = WalGuard::replay_guard(position);
+                                large_table.insert(
+                                    context,
+                                    reduced_key,
+                                    full_key,
+                                    guard,
+                                    &value,
+                                    indexes,
+                                )?;
+                            }
+                            WalEntry::Remove(ks, key) => {
+                                let context = contexts.ks_context(ks);
+                                let reduced_key = context.ks_config.reduced_key_bytes(key);
+                                let guard = WalGuard::replay_guard(position);
+                                large_table.remove(context, reduced_key, guard, indexes)?;
+                            }
+                            other => panic!(
+                                "Unexpected inner entry in CompressedBatch at {position:?}: {other:?}"
+                            ),
+                        }
+                    }
                 }
             }
         }
@@ -1223,6 +1348,56 @@ impl Db {
     }
 }
 
+/// Inner keyspace for `WriteBatch`-produced entries. Only `Record`/`Remove`
+/// can appear in a batch, so this is total over that domain.
+fn batch_entry_ks(e: &WalEntry) -> KeySpace {
+    match e {
+        WalEntry::Record(ks, ..) | WalEntry::Remove(ks, _) => *ks,
+        _ => unreachable!("WriteBatch only produces Record/Remove"),
+    }
+}
+
+/// Metric kind for a `WriteBatch`-produced entry.
+fn batch_entry_wal_kind(e: &WalEntry) -> WalEntryKind {
+    match e {
+        WalEntry::Record(..) => WalEntryKind::Record,
+        WalEntry::Remove(..) => WalEntryKind::Tombstone,
+        _ => unreachable!("WriteBatch only produces Record/Remove"),
+    }
+}
+
+/// Collapse `(writes, pending_ops)` to last-wins per `(ks, reduced_key)`.
+/// `writes[i]` and `pending_ops[i]` describe the same logical operation, so
+/// they're filtered in lockstep. Required when all entries in the batch share
+/// one `WalPosition`: the in-memory index cannot hold two ops on the same key
+/// at the same position.
+fn dedup_last_wins(writes: &mut Vec<WalEntry>, pending_ops: &mut Vec<PendingOp>) {
+    debug_assert_eq!(writes.len(), pending_ops.len());
+    if writes.len() < 2 {
+        return;
+    }
+    let mut last_idx: HashMap<(KeySpace, Bytes), usize> = HashMap::with_capacity(pending_ops.len());
+    for (i, op) in pending_ops.iter().enumerate() {
+        last_idx.insert((op.ks(), op.reduced_key().clone()), i);
+    }
+    if last_idx.len() == pending_ops.len() {
+        return; // no duplicates
+    }
+    let keep: HashSet<usize> = last_idx.into_values().collect();
+    let mut i = 0;
+    writes.retain(|_| {
+        let k = keep.contains(&i);
+        i += 1;
+        k
+    });
+    let mut j = 0;
+    pending_ops.retain(|_| {
+        let k = keep.contains(&j);
+        j += 1;
+        k
+    });
+}
+
 impl Drop for Db {
     fn drop(&mut self) {
         for slot in self.pending_promotion_threads.iter() {
@@ -1338,6 +1513,16 @@ pub enum WalEntry {
     Remove(KeySpace, Bytes),
     BatchStart(u32),
     DropCells(KeySpace, CellId, CellId),
+    /// A compressed `WriteBatch`: one WAL frame whose payload, when decompressed,
+    /// is a sequence of `Record`/`Remove` inner entries (see `compressed_batch.rs`).
+    /// All large-table entries produced by a batch share the same `WalPosition`
+    /// — the position of this frame. Point lookups linear-scan the inner entries
+    /// by key. Tombstones are never point-read.
+    CompressedBatch(
+        BatchCodec,
+        u32,   /* uncompressed_len */
+        Bytes, /* body */
+    ),
 }
 
 #[derive(Debug)]
@@ -1355,6 +1540,7 @@ impl WalEntry {
     const WAL_ENTRY_BATCH_START: u8 = 4;
     const WAL_ENTRY_RELOCATED_RECORD: u8 = 5;
     const WAL_ENTRY_DROP_CELLS: u8 = 6;
+    const WAL_ENTRY_COMPRESSED_BATCH: u8 = 7;
     pub const INDEX_PREFIX_SIZE: usize = 2;
 
     pub fn from_bytes(bytes: Bytes) -> Self {
@@ -1384,6 +1570,12 @@ impl WalEntry {
                 let to_cell = CellId::from_bytes(&mut b);
                 WalEntry::DropCells(ks, from_cell, to_cell)
             }
+            WalEntry::WAL_ENTRY_COMPRESSED_BATCH => {
+                let codec = BatchCodec::from_u8(b.get_u8());
+                let uncompressed_len = b.get_u32();
+                let body = bytes.slice(1 + 1 + 4..);
+                WalEntry::CompressedBatch(codec, uncompressed_len, body)
+            }
             _ => panic!("Unknown wal entry type {entry_type}"),
         }
     }
@@ -1403,6 +1595,7 @@ impl IntoBytesFixed for WalEntry {
             WalEntry::DropCells(KeySpace(_), from_cell, to_cell) => {
                 1 + 1 + from_cell.len() + to_cell.len()
             }
+            WalEntry::CompressedBatch(_, _, body) => 1 + 1 + 4 + body.len(),
         }
     }
 
@@ -1440,6 +1633,12 @@ impl IntoBytesFixed for WalEntry {
                 buf.put_u8(ks.0);
                 from_cell.write_into_bytes(buf);
                 to_cell.write_into_bytes(buf);
+            }
+            WalEntry::CompressedBatch(codec, uncompressed_len, body) => {
+                buf.put_u8(Self::WAL_ENTRY_COMPRESSED_BATCH);
+                buf.put_u8(*codec as u8);
+                buf.put_u32(*uncompressed_len);
+                buf.put_slice(body);
             }
         }
     }

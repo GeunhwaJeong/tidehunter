@@ -1,3 +1,4 @@
+use crate::compressed_batch::BatchCodec;
 use crate::crc::CrcFrame;
 use crate::db::WalEntry;
 use crate::relocation::RelocationStrategy;
@@ -80,6 +81,14 @@ pub struct Config {
     /// ceiling, so a struct-literal bypass of the builders is still caught.
     #[serde(default)]
     pub index_auto_shard_threshold: Option<usize>,
+    /// Opt-in: pack each committed `WriteBatch` into a single compressed WAL
+    /// entry. `None` (default) preserves the original per-record framing
+    /// (`BatchStart` + N `Record`/`Remove` frames). `Some(codec)` writes one
+    /// `WalEntry::CompressedBatch` per commit and gives every key in the
+    /// batch the same `WalPosition`. Point reads decompress and linear-scan
+    /// the batch; tombstones inside a batch are visited only during replay.
+    #[serde(default)]
+    pub batch_codec: Option<BatchCodec>,
 }
 
 fn default_open_lock_retry_timeout() -> Duration {
@@ -125,6 +134,7 @@ impl Default for Config {
             num_pending_promotion_threads: default_num_pending_promotion_threads(),
             open_lock_retry_timeout: default_open_lock_retry_timeout(),
             index_auto_shard_threshold: None,
+            batch_codec: None,
         }
     }
 }
@@ -152,6 +162,7 @@ impl Config {
             num_pending_promotion_threads: default_num_pending_promotion_threads(),
             open_lock_retry_timeout: default_open_lock_retry_timeout(),
             index_auto_shard_threshold: None,
+            batch_codec: None,
         }
     }
 

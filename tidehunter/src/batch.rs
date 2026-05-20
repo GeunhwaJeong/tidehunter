@@ -9,16 +9,13 @@ use std::sync::Arc;
 pub struct WriteBatch {
     pub(crate) transaction: Transaction,
     db: Arc<Db>,
-    pub(crate) writes: Vec<WriteBatchWrite>,
+    /// `WalEntry::Record`/`WalEntry::Remove` collected here; the framing — one
+    /// frame per entry vs one compressed frame for the batch — is decided at
+    /// commit time in `Db::do_write_batch`.
+    pub(crate) writes: Vec<WalEntry>,
     pub(crate) tag: String,
     /// Operations to be applied to pending table on commit
     pub(crate) pending_ops: Vec<PendingOp>,
-}
-
-pub(crate) struct WriteBatchWrite {
-    pub prepared_write: PreparedWalWrite,
-    pub is_modified: bool,
-    pub ks: KeySpace,
 }
 
 pub(crate) enum PendingOp {
@@ -46,6 +43,14 @@ impl PendingOp {
     pub(crate) fn cell_id(&self) -> &CellId {
         match self {
             PendingOp::Insert { cell_id, .. } | PendingOp::Remove { cell_id, .. } => cell_id,
+        }
+    }
+
+    pub(crate) fn reduced_key(&self) -> &Bytes {
+        match self {
+            PendingOp::Insert { reduced_key, .. } | PendingOp::Remove { reduced_key, .. } => {
+                reduced_key
+            }
         }
     }
 }
@@ -98,7 +103,7 @@ impl WriteBatch {
         });
 
         // todo transaction state is corrupted on panic
-        self.prepare_write(WalEntry::Record(ks, k, v, false));
+        self.push_write(WalEntry::Record(ks, k, v, false));
     }
 
     /// Delete a key from the batch.
@@ -117,22 +122,11 @@ impl WriteBatch {
         });
 
         // todo transaction state is corrupted on panic
-        self.prepare_write(WalEntry::Remove(ks, k));
+        self.push_write(WalEntry::Remove(ks, k));
     }
 
-    fn prepare_write(&mut self, wal_entry: WalEntry) {
-        let (prepared_write, ks, is_modified) = match &wal_entry {
-            WalEntry::Record(ks, _key, _value, _relocated) => {
-                (PreparedWalWrite::new(&wal_entry), *ks, true)
-            }
-            WalEntry::Remove(ks, _key) => (PreparedWalWrite::new(&wal_entry), *ks, false),
-            _ => unreachable!("WalEntry::Record should be remove or record"),
-        };
-        self.writes.push(WriteBatchWrite {
-            is_modified,
-            ks,
-            prepared_write,
-        });
+    fn push_write(&mut self, entry: WalEntry) {
+        self.writes.push(entry);
         assert!(
             self.writes.len() < MAX_BATCH_LEN,
             "Batch exceeds max length {MAX_BATCH_LEN}"

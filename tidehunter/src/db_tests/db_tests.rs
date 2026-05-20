@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::compressed_batch::BatchCodec;
 use crate::config::Config;
 use crate::crc::CrcFrame;
 use crate::failpoints::FailPoint;
@@ -304,8 +305,19 @@ fn test_batch_lru() {
 
 #[test]
 fn test_batch_replay() {
+    test_batch_replay_impl(Config::small());
+}
+
+#[test]
+fn test_batch_replay_compressed() {
+    let mut config = Config::small();
+    config.batch_codec = Some(BatchCodec::Lz4);
+    test_batch_replay_impl(config);
+}
+
+fn test_batch_replay_impl(config: Config) {
     let dir = tempdir::TempDir::new("test_batch_replay").unwrap();
-    let config = Arc::new(Config::small());
+    let config = Arc::new(config);
     let (key_shape, ks) = KeyShape::new_single(4, 16, KeyType::uniform(16));
     {
         let db = Db::open(
@@ -323,6 +335,59 @@ fn test_batch_replay() {
     let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
     assert_eq!(Some(vec![15].into()), db.get(ks, &[5, 6, 7, 8]).unwrap());
     assert_eq!(Some(vec![17].into()), db.get(ks, &[6, 7, 8, 9]).unwrap());
+}
+
+/// With `batch_codec = Some(_)`, every entry in a batch shares one WAL
+/// position. Duplicate ops on the same key in one batch used to crash the
+/// promotion thread (`Index WAL position must be increasing`). The dedup
+/// pass should now collapse them to last-wins. Covers both repeated
+/// inserts and an insert-then-delete pair, with verification across
+/// reopen so replay also exercises the deduped frame.
+#[test]
+fn test_compressed_batch_dedups_duplicate_keys() {
+    let dir = tempdir::TempDir::new("test_compressed_dedup").unwrap();
+    let mut config = Config::small();
+    config.batch_codec = Some(BatchCodec::Lz4);
+    let config = Arc::new(config);
+    let (key_shape, ks) = KeyShape::new_single(4, 16, KeyType::uniform(16));
+
+    {
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            Metrics::new(),
+        )
+        .unwrap();
+
+        // Repeated inserts — last value wins.
+        let mut batch = db.write_batch();
+        batch.write(ks, vec![1, 2, 3, 4], vec![10]);
+        batch.write(ks, vec![1, 2, 3, 4], vec![20]);
+        batch.write(ks, vec![1, 2, 3, 4], vec![30]);
+        batch.commit().unwrap();
+        assert_eq!(Some(vec![30].into()), db.get(ks, &[1, 2, 3, 4]).unwrap());
+
+        // Insert-then-delete in one batch — delete wins.
+        let mut batch = db.write_batch();
+        batch.write(ks, vec![5, 6, 7, 8], vec![55]);
+        batch.delete(ks, vec![5, 6, 7, 8]);
+        batch.commit().unwrap();
+        assert_eq!(None, db.get(ks, &[5, 6, 7, 8]).unwrap());
+
+        // Delete-then-insert — insert wins.
+        let mut batch = db.write_batch();
+        batch.delete(ks, vec![9, 9, 9, 9]); // tombstone for a missing key (no-op)
+        batch.write(ks, vec![9, 9, 9, 9], vec![99]);
+        batch.commit().unwrap();
+        assert_eq!(Some(vec![99].into()), db.get(ks, &[9, 9, 9, 9]).unwrap());
+    }
+
+    // Reopen and re-verify — replay walks the same deduped frames.
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+    assert_eq!(Some(vec![30].into()), db.get(ks, &[1, 2, 3, 4]).unwrap());
+    assert_eq!(None, db.get(ks, &[5, 6, 7, 8]).unwrap());
+    assert_eq!(Some(vec![99].into()), db.get(ks, &[9, 9, 9, 9]).unwrap());
 }
 
 #[test]

@@ -185,6 +185,15 @@ pub(crate) fn from_wal_entry(entry: WalEntry, offset: u64, raw_size: usize) -> E
             position,
             raw_size,
         },
+        WalEntry::CompressedBatch(_codec, uncompressed_len, _body) => Entry {
+            entry_type: "compressed_batch".into(),
+            keyspace: 0,
+            key: vec![],
+            value: vec![],
+            value_len: uncompressed_len as i64,
+            position,
+            raw_size,
+        },
     }
 }
 

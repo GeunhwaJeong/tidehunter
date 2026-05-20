@@ -101,6 +101,7 @@ pub enum WalEntryKind {
     Record,
     Tombstone,
     Index,
+    CompressedBatch,
 }
 
 #[derive(Clone, Copy, Debug, EnumIter, EnumCount, AsRefStr, FromRepr)]

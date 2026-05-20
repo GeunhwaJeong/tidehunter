@@ -306,6 +306,15 @@ impl RelocationDriver {
     }
 
     fn wal_based_relocation(&mut self, db: Arc<Db>) -> DbResult<()> {
+        // todo: support compressed-batch frames in the terminal_position scan
+        // below. Today it only matches `WalEntry::Record(..)`, so records
+        // buried inside a `CompressedBatch` never see the relocation filter
+        // (e.g. `Decision::StopRelocation` is silently skipped). Until that
+        // path decompresses inner entries, refuse to run with the codec on.
+        assert!(
+            db.config.batch_codec.is_none(),
+            "wal-based relocation does not support Config::batch_codec yet"
+        );
         let upper_limit = db.wal_writer.last_processed().as_u64();
         let min_wal_position = db.wal.min_wal_position();
         let mut wal_iterator = db.wal.wal_iterator(min_wal_position)?;
@@ -328,7 +337,14 @@ impl RelocationDriver {
                 terminal_position = position.offset();
                 break;
             }
-            if let WalEntry::Record(ks, key, value, _relocated) = WalEntry::from_bytes(raw_entry) {
+            let entry = WalEntry::from_bytes(raw_entry);
+            assert!(
+                !matches!(entry, WalEntry::CompressedBatch(..)),
+                "wal-based relocation reached a CompressedBatch frame at {} but does not yet \
+                 understand its inner records (todo)",
+                position.offset()
+            );
+            if let WalEntry::Record(ks, key, value, _relocated) = entry {
                 let ksd = db.key_shape.ks(ks);
                 if let Some(filter) = ksd.relocation_filter()
                     && let Decision::StopRelocation = filter(&key, &value)
@@ -372,9 +388,11 @@ impl RelocationDriver {
                 .large_table
                 .get_index_for_cell(db.ks_context(cell.keyspace), &cell.cell_id, db.as_ref())?
                 .unwrap_or(IndexTable::default().into());
-            for (_reduced_key, position) in index.iter() {
+            let context = db.ks_context(cell.keyspace);
+            for (reduced_key, position) in index.iter() {
                 if position.offset() < target_position
-                    && let Some((key, value)) = db.read_record(position)?
+                    && let Some((key, value)) =
+                        db.read_record_for_indexed_key(context, position, reduced_key.as_ref())?
                 {
                     batch.write(key, value);
                     self.metrics
@@ -452,14 +470,15 @@ impl RelocationDriver {
         // - Optional key-only decision callback in RelocationFilter trait
         // - Skip WAL value reads when key-only decisions are possible
         // - Fall back to current value-based approach when needed
-        let keyspace_desc = &db.ks_context(cell_ref.keyspace).ks_config;
+        let ks_context = db.ks_context(cell_ref.keyspace);
+        let keyspace_desc = &ks_context.ks_config;
         for (key, position) in index.iter() {
             if position.offset() >= effective_limit {
                 continue;
             }
 
             // Read the actual value from WAL
-            let value = match db.read_record(position)? {
+            let value = match db.read_record_for_indexed_key(ks_context, position, key.as_ref())? {
                 Some((_, val)) => val,
                 None => {
                     // Entry might have been deleted or corrupted, skip it
