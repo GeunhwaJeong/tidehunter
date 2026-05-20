@@ -3960,7 +3960,13 @@ fn test_auto_sharding_concurrent() {
 
     let (key_shape, ks) = KeyShape::new_single(8, 2, KeyType::uniform(1));
     let metrics = Metrics::new();
-    let db = Db::open(dir.path(), key_shape, config.clone(), metrics.clone()).unwrap();
+    let mut db = Db::open(
+        dir.path(),
+        key_shape.clone(),
+        config.clone(),
+        metrics.clone(),
+    )
+    .unwrap();
 
     let state: Arc<Mutex<HashMap<Vec<u8>, Slot>>> = Arc::default();
 
@@ -4074,6 +4080,21 @@ fn test_auto_sharding_concurrent() {
         // force-relocation candidates.
         if iter >= iterations / 2 {
             db.force_rebuild_control_region().unwrap();
+        }
+
+        // In the last third of iterations, drop and re-open every third
+        // iteration so subsequent threads exercise reads/writes against
+        // freshly-replayed sharded cells.
+        let last_third_start = iterations * 2 / 3;
+        if iter >= last_third_start && (iter - last_third_start).is_multiple_of(3) {
+            drop(db);
+            db = Db::open(
+                dir.path(),
+                key_shape.clone(),
+                config.clone(),
+                metrics.clone(),
+            )
+            .unwrap();
         }
     }
 
