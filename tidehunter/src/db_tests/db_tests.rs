@@ -4075,6 +4075,69 @@ fn test_auto_sharding_concurrent() {
             "reverse iterator/shadow mismatch at iter {iter}",
         );
 
+        // Spot-check iteration starting from a random key in the middle of
+        // the pool so the cell-seek path for both directions is exercised at
+        // positions other than the keyspace boundaries.
+        let mut start_rng = StdRng::seed_from_u64((iter as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        for check_idx in 0..2 {
+            let start_key = start_rng.gen_range(0..POOL_SIZE).to_le_bytes().to_vec();
+
+            let mut fwd_iter = db.iterator(ks);
+            fwd_iter.set_lower_bound(start_key.clone());
+            let fwd_pairs: Vec<(Vec<u8>, Vec<u8>)> = fwd_iter
+                .map(|r| {
+                    let (k, v) = r.unwrap();
+                    (k.as_ref().to_vec(), v.as_ref().to_vec())
+                })
+                .collect();
+            for window in fwd_pairs.windows(2) {
+                assert!(
+                    window[0].0 < window[1].0,
+                    "forward iterator from random key must yield strictly ascending keys \
+                     at iter {iter} check {check_idx}",
+                );
+            }
+            let mut expected_fwd: Vec<(Vec<u8>, Vec<u8>)> = snap
+                .iter()
+                .filter(|(k, _)| k.as_slice() >= start_key.as_slice())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            expected_fwd.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                fwd_pairs, expected_fwd,
+                "forward iterator from random key mismatch at iter {iter} check {check_idx} \
+                 start_key={start_key:?}",
+            );
+
+            let mut rev_iter = db.iterator(ks);
+            rev_iter.set_upper_bound(start_key.clone());
+            rev_iter.reverse();
+            let rev_pairs: Vec<(Vec<u8>, Vec<u8>)> = rev_iter
+                .map(|r| {
+                    let (k, v) = r.unwrap();
+                    (k.as_ref().to_vec(), v.as_ref().to_vec())
+                })
+                .collect();
+            for window in rev_pairs.windows(2) {
+                assert!(
+                    window[0].0 > window[1].0,
+                    "reverse iterator from random key must yield strictly descending keys \
+                     at iter {iter} check {check_idx}",
+                );
+            }
+            let mut expected_rev: Vec<(Vec<u8>, Vec<u8>)> = snap
+                .iter()
+                .filter(|(k, _)| k.as_slice() < start_key.as_slice())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            expected_rev.sort_by(|a, b| b.0.cmp(&a.0));
+            assert_eq!(
+                rev_pairs, expected_rev,
+                "reverse iterator from random key mismatch at iter {iter} check {check_idx} \
+                 start_key={start_key:?}",
+            );
+        }
+
         // After the midpoint, snapshot the control region every iteration so
         // the low-occupancy index files left behind by heavy churn become
         // force-relocation candidates.
