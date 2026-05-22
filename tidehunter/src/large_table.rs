@@ -5,7 +5,7 @@ use crate::context::{KsContext, LookupResult, LookupSource};
 use crate::control::RelocateFiles;
 use crate::flusher::{FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread};
 use crate::index::index_format::{Direction, IndexFormat, IndexIterCaches};
-use crate::index::index_table::{IndexTable, IndexWalPosition};
+use crate::index::index_table::IndexTable;
 use crate::index::levels::{INLINE_LEVELS, IndexLevels};
 use crate::index::pending_table::{CommittedChange, PendingTable, Transaction};
 use crate::index::utils::{NextEntryResult, merge_levels_next_entry};
@@ -1694,14 +1694,22 @@ impl LargeTableEntry {
             "apply_replay_buffer expects a fresh entry — replay never auto-loads L0",
         );
         self.mark_dirty(buf.first_position);
+        let mut entries = buf.entries;
+        // Sort by (key ASC, offset DESC) so that for runs of equal keys the
+        // highest-position (latest) write comes first; `dedup_by` then keeps
+        // exactly that entry per key.
+        entries.sort_unstable_by(|a, b| {
+            a.0.as_ref()
+                .cmp(b.0.as_ref())
+                .then_with(|| b.1.offset().cmp(&a.1.offset()))
+        });
+        entries.dedup_by(|a, b| a.0.as_ref() == b.0.as_ref());
         if let Some(bloom_filter) = &mut self.bloom_filter {
-            for key in buf.entries.keys() {
+            for (key, _) in entries.iter() {
                 bloom_filter.insert(&key.as_ref());
             }
         }
-        let mut sorted: Vec<(Bytes, IndexWalPosition)> = buf.entries.into_iter().collect();
-        sorted.sort_unstable_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
-        self.data = ArcCow::new_owned(IndexTable::from_sorted_entries(sorted));
+        self.data = ArcCow::new_owned(IndexTable::from_sorted_entries(entries));
         self.report_loaded_keys_count();
     }
 

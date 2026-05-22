@@ -7,20 +7,22 @@
 //!   1. **No reads.** `entry.data` is write-only during replay (no concurrent
 //!      reads, no auto-load of L0). So we can defer all storage updates
 //!      until the end of replay.
-//!   2. **High overwrite rate.** Many WAL records overwrite the same key
-//!      across epochs (especially `objects`). Deduplicating in a HashMap
-//!      keyed by `(ks, cell, key)` collapses overwrites in-place — the
-//!      latest write wins by virtue of WAL monotonicity and `HashMap::insert`
-//!      overwrite semantics.
+//!   2. **Sequential, monotonic WAL.** Each record's position is strictly
+//!      greater than the previous one. Per-cell writes accumulate in
+//!      insertion order in a `Vec`; a single sort + dedup pass at the end
+//!      resolves overwrites (latest position wins per key).
 //!
-//! End of replay drains the buffer via [`crate::large_table::LargeTable::apply_replay_buffer`],
-//! which takes each cell's row lock exactly once (compare: the per-record
-//! path takes the row lock for every WAL record). Per-cell entries are sorted
-//! and converted to the flat buffer format in one shot.
+//! The buffer accumulates raw per-cell `Vec<(Bytes, IndexWalPosition)>` —
+//! no hashing on the hot insert path. End of replay drains the buffer via
+//! [`crate::large_table::LargeTable::apply_replay_buffer`], which takes each
+//! cell's row lock exactly once (compare: the per-record path takes the row
+//! lock for every WAL record). Per-cell entries are sorted, deduped, and
+//! converted to the flat buffer format in one shot.
 //!
 //! Compared to the per-record path that drives `IndexTable::checked_insert`
 //! per WAL record:
 //!   - No `BTreeMap::insert` (O(log N) memcmps per insert).
+//!   - No HashMap hash work per insert — push is `O(1)` and hash-free.
 //!   - No row lock acquired per record.
 //!   - No `entry_mut` lookup per record.
 //!   - `report_loaded_keys_count` collapsed to one call per cell.
@@ -32,26 +34,27 @@ use crate::key_shape::{KeyShape, KeySpace};
 use minibytes::Bytes;
 use std::collections::HashMap;
 
-/// Per-cell accumulator: deduplicates writes by key and tracks the first
-/// WAL position observed (needed to preserve `mark_dirty`'s `last_processed`
-/// invariant — `last_processed` is set on the `Empty → Dirty` transition,
-/// which in the per-record path receives the first write's position).
+/// Per-cell accumulator. Stores writes in insertion (WAL) order — overwrite
+/// resolution is deferred to `apply` time via sort + dedup. Tracks the first
+/// WAL position observed because `mark_dirty`'s `last_processed` invariant
+/// anchors on the `Empty → Dirty` transition (= first write).
 pub(crate) struct CellReplayBuffer {
-    pub(crate) entries: HashMap<Bytes, IndexWalPosition>,
+    pub(crate) entries: Vec<(Bytes, IndexWalPosition)>,
     pub(crate) first_position: WalPosition,
 }
 
 impl CellReplayBuffer {
     fn new(first_position: WalPosition) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: Vec::new(),
             first_position,
         }
     }
 }
 
 /// Replay-wide accumulator. Outer slot indexed by keyspace; inner HashMap
-/// keyed by `CellId`. Each cell holds its own dedup'd write set.
+/// keyed by `CellId` (one-time HashMap lookup to bucket each write into its
+/// cell's `Vec` — that's the only hash work on the replay hot path).
 pub(crate) struct ReplayBuffer {
     by_ks: Vec<HashMap<CellId, CellReplayBuffer>>,
 }
@@ -69,7 +72,7 @@ impl ReplayBuffer {
             .or_insert_with(|| CellReplayBuffer::new(position));
         cell_buf
             .entries
-            .insert(key, IndexWalPosition::new_modified(position));
+            .push((key, IndexWalPosition::new_modified(position)));
     }
 
     pub(crate) fn remove(&mut self, ks: KeySpace, cell: CellId, key: Bytes, position: WalPosition) {
@@ -78,7 +81,7 @@ impl ReplayBuffer {
             .or_insert_with(|| CellReplayBuffer::new(position));
         cell_buf
             .entries
-            .insert(key, IndexWalPosition::new_removed(position));
+            .push((key, IndexWalPosition::new_removed(position)));
     }
 
     /// Drop any buffered writes for cells in the inclusive range
