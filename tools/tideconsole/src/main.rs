@@ -7,6 +7,14 @@ use rustyline::{Config, DefaultEditor};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// Match sui-node's global allocator so perf measurements taken against
+// tideconsole (especially WAL replay benchmarks) reflect production
+// allocator behavior. sui-node sets the same allocator in
+// `crates/sui-node/src/main.rs`.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static JEMALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser)]
 #[command(
     name = "tideconsole",

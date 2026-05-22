@@ -12,6 +12,12 @@ rustyline = "14"
 hex = "0.4.3"
 parking_lot = { workspace = true }
 
+# Match sui-node's allocator so perf measurements (especially WAL replay)
+# reflect production behavior. sui-node uses tikv-jemallocator 0.5 with the
+# same features; see crates/sui-node/Cargo.toml in the sui repo.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.5", features = ["disable_initial_exec_tls"] }
+
 [dev-dependencies]
 tempfile = "3.0"
 criterion = { version = "0.5", features = ["html_reports"] }
