@@ -398,6 +398,36 @@ impl LargeTable {
         Ok(())
     }
 
+    /// Replay-only insert path. Bypasses checks that are only relevant for
+    /// live concurrent writes:
+    ///   - `promote_pending_for`: replay has no in-flight transactions, so
+    ///     `pending_data` is always empty — the HashMap lookup is wasted work.
+    ///   - `skip_stale_update`: WAL records are processed strictly in
+    ///     monotonically-increasing offset order during replay, so the check
+    ///     `last_position > wal_position` can never fire. The same monotonic
+    ///     ordering is still enforced by `checked_insert`'s debug assertion.
+    ///   - Value LRU push: replay churns the value cache (each cell sees
+    ///     millions of records, far more than the cache holds, so almost
+    ///     every push evicts). The cache ends up holding a random tail of
+    ///     recent writes rather than hot data — not worth the cost.
+    ///   - `too_many_dirty` / flush trigger: `flush_supported()` is false for
+    ///     the replay loader anyway, so this is dead code for replay.
+    ///   - `max_index_size` / `index_size` metrics: noisy during replay
+    ///     (every cell's BTreeMap grows unbounded until end-of-replay).
+    pub fn replay_insert(&self, context: &KsContext, reduced_key: Bytes, v: WalPosition) {
+        let (mut row, cell) = self.row(context, &reduced_key);
+        let entry = self.entry_mut(&mut row, &cell);
+        entry.replay_insert(reduced_key, v);
+    }
+
+    /// Replay-only remove path. See `replay_insert` for rationale; same
+    /// reasoning applies to tombstones.
+    pub fn replay_remove(&self, context: &KsContext, k: Bytes, v: WalPosition) {
+        let (mut row, cell) = self.row(context, &k);
+        let entry = self.entry_mut(&mut row, &cell);
+        entry.replay_remove(k, v);
+    }
+
     /// Apply a batch of pending operations that all share the same mutex shard,
     /// acquiring the mutex only once.
     pub(crate) fn apply_pending_batch(
@@ -1621,6 +1651,22 @@ impl LargeTableEntry {
         self.data.make_mut().remove(k, v);
         self.report_loaded_keys_count();
         true
+    }
+
+    /// Replay-only insert path — see `LargeTable::replay_insert` for the
+    /// invariants that make the skipped work redundant.
+    fn replay_insert(&mut self, k: Bytes, v: WalPosition) {
+        self.mark_dirty(v);
+        self.insert_bloom_filter(&k);
+        self.data.make_mut().insert(k, v);
+        self.report_loaded_keys_count();
+    }
+
+    /// Replay-only remove path — see `LargeTable::replay_insert`.
+    fn replay_remove(&mut self, k: Bytes, v: WalPosition) {
+        self.mark_dirty(v);
+        self.data.make_mut().remove(k, v);
+        self.report_loaded_keys_count();
     }
 
     fn promote_pending(&mut self) {

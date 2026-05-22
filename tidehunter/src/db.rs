@@ -94,8 +94,7 @@ impl Db {
         );
         let contexts = KsContextVec::new(&key_shape, config.clone(), metrics.clone());
         let wal_iterator = wal.wal_iterator(control_region.last_position())?;
-        let wal_writer =
-            Self::replay_wal(&contexts, &large_table, wal_iterator, &indexes, &metrics)?;
+        let wal_writer = Self::replay_wal(&contexts, &large_table, wal_iterator, &metrics)?;
         let last_index_position = control_region.last_index_wal_position();
         let index_writer = indexes.writer_after(last_index_position)?;
         let control_region_store = Mutex::new(control_region_store);
@@ -897,7 +896,6 @@ impl Db {
         contexts: &KsContextVec,
         large_table: &LargeTable,
         mut wal_iterator: WalIterator,
-        indexes: &Wal,
         metrics: &Metrics,
     ) -> DbResult<WalWriter> {
         let mut batch = VecDeque::new();
@@ -927,17 +925,15 @@ impl Db {
                 continue;
             }
             match entry {
-                WalEntry::Record(ks, k, v, relocated) => {
+                WalEntry::Record(ks, k, _v, relocated) => {
                     metrics.replayed_wal_records.inc();
                     if relocated {
                         // Nothing needs to be done for the relocated record
                         continue;
                     }
                     let context = contexts.ks_context(ks);
-                    let full_key = k.clone();
                     let reduced_key = context.ks_config.reduced_key_bytes(k);
-                    let guard = WalGuard::replay_guard(position);
-                    large_table.insert(context, reduced_key, full_key, guard, &v, indexes)?;
+                    large_table.replay_insert(context, reduced_key, position);
                 }
                 WalEntry::Index(_ks, _bytes) => {
                     unreachable!("Should not have index entries in wal");
@@ -946,8 +942,7 @@ impl Db {
                     metrics.replayed_wal_records.inc();
                     let context = contexts.ks_context(ks);
                     let reduced_key = context.ks_config.reduced_key_bytes(k);
-                    let guard = WalGuard::replay_guard(position);
-                    large_table.remove(context, reduced_key, guard, indexes)?;
+                    large_table.replay_remove(context, reduced_key, position);
                 }
                 WalEntry::BatchStart(size) => {
                     batch_start_position = Some(position.offset());
@@ -968,25 +963,15 @@ impl Db {
                     for inner in InnerIter::new(decompressed) {
                         metrics.replayed_wal_records.inc();
                         match inner {
-                            WalEntry::Record(ks, key, value, _relocated) => {
+                            WalEntry::Record(ks, key, _value, _relocated) => {
                                 let context = contexts.ks_context(ks);
-                                let full_key = key.clone();
                                 let reduced_key = context.ks_config.reduced_key_bytes(key);
-                                let guard = WalGuard::replay_guard(position);
-                                large_table.insert(
-                                    context,
-                                    reduced_key,
-                                    full_key,
-                                    guard,
-                                    &value,
-                                    indexes,
-                                )?;
+                                large_table.replay_insert(context, reduced_key, position);
                             }
                             WalEntry::Remove(ks, key) => {
                                 let context = contexts.ks_context(ks);
                                 let reduced_key = context.ks_config.reduced_key_bytes(key);
-                                let guard = WalGuard::replay_guard(position);
-                                large_table.remove(context, reduced_key, guard, indexes)?;
+                                large_table.replay_remove(context, reduced_key, position);
                             }
                             other => panic!(
                                 "Unexpected inner entry in CompressedBatch at {position:?}: {other:?}"
