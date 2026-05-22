@@ -1,7 +1,7 @@
 use crate::batch::{PendingOp, RelocatedWriteBatch, WriteBatch};
 use crate::cell::CellId;
 use crate::compressed_batch::{
-    BatchCodec, CompressedBatch, InnerIter, decompress_wal_entry, find_record, find_record_by,
+    BatchCodec, CompressedBatch, decompress_wal_entry, find_record, find_record_by,
 };
 use crate::config::Config;
 use crate::context::{DbOpKind, KsContext, KsContextVec, ReadType, WalEntryKind};
@@ -19,16 +19,15 @@ use crate::lock::DbLock;
 use crate::metrics::{Metrics, TimerExt};
 use crate::relocation::updates::RelocationUpdates;
 use crate::relocation::{RelocationCommand, RelocationDriver, RelocationStrategy, Relocator};
-use crate::replay_buffer::ReplayBuffer;
 use crate::state_snapshot;
 use crate::wal::layout::WalKind;
 use crate::wal::position::{LastProcessed, WalFileId, WalPosition};
 use crate::wal::tracker::WalGuard;
-use crate::wal::{PreparedWalWrite, Wal, WalError, WalIterator, WalRandomRead, WalWriter};
+use crate::wal::{PreparedWalWrite, Wal, WalError, WalRandomRead, WalWriter};
 use bytes::{Buf, BufMut, BytesMut};
 use minibytes::Bytes;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -94,8 +93,13 @@ impl Db {
         );
         let contexts = KsContextVec::new(&key_shape, config.clone(), metrics.clone());
         let wal_iterator = wal.wal_iterator(control_region.last_position())?;
-        let wal_writer =
-            Self::replay_wal(&contexts, &large_table, &key_shape, wal_iterator, &metrics)?;
+        let wal_writer = crate::wal_replay::replay_wal(
+            &contexts,
+            &large_table,
+            &key_shape,
+            wal_iterator,
+            &metrics,
+        )?;
         let last_index_position = control_region.last_index_wal_position();
         let index_writer = indexes.writer_after(last_index_position)?;
         let control_region_store = Mutex::new(control_region_store);
@@ -891,114 +895,6 @@ impl Db {
         let context = self.large_table.ks_context(ks);
         context.inc_read(kind, read_type);
         context.inc_read_bytes(kind, read_type, entry.len() as u64);
-    }
-
-    fn replay_wal(
-        contexts: &KsContextVec,
-        large_table: &LargeTable,
-        key_shape: &KeyShape,
-        mut wal_iterator: WalIterator,
-        metrics: &Metrics,
-    ) -> DbResult<WalWriter> {
-        // Accumulate per-cell writes in a local buffer. End-of-replay drains
-        // it into `large_table` in bulk — one row lock per shard rather than
-        // one row lock per WAL record, and one sort + flat build per cell
-        // rather than per-record BTreeMap inserts.
-        let mut buffer = ReplayBuffer::new(key_shape);
-        let mut batch = VecDeque::new();
-        let mut batch_remaining = 0;
-        let mut batch_start_position: Option<u64> = None;
-        let writer = loop {
-            let (position, entry) = if batch_remaining == 0 && !batch.is_empty() {
-                // Processing complete batch - clear the start position
-                batch_start_position = None;
-                batch.pop_front().expect("invariant checked")
-            } else {
-                let entry = wal_iterator.next();
-                if matches!(entry, Err(WalError::Crc(_) | WalError::EndOfWal)) {
-                    break wal_iterator.into_writer(batch_start_position);
-                }
-                let (position, raw_entry) = entry?;
-                let entry = WalEntry::from_bytes(raw_entry);
-                (position, entry)
-            };
-            if batch_remaining > 0 {
-                assert!(
-                    matches!(entry, WalEntry::Record(..) | WalEntry::Remove(..)),
-                    "encountered entry {entry:?} at position {position:?} during replay, while expected record or tombstone"
-                );
-                batch_remaining -= 1;
-                batch.push_back((position, entry));
-                continue;
-            }
-            match entry {
-                WalEntry::Record(ks, k, _v, relocated) => {
-                    metrics.replayed_wal_records.inc();
-                    if relocated {
-                        // Nothing needs to be done for the relocated record
-                        continue;
-                    }
-                    let context = contexts.ks_context(ks);
-                    let reduced_key = context.ks_config.reduced_key_bytes(k);
-                    let cell = context.ks_config.cell_id(&reduced_key);
-                    buffer.insert(ks, cell, reduced_key, position);
-                }
-                WalEntry::Index(_ks, _bytes) => {
-                    unreachable!("Should not have index entries in wal");
-                }
-                WalEntry::Remove(ks, k) => {
-                    metrics.replayed_wal_records.inc();
-                    let context = contexts.ks_context(ks);
-                    let reduced_key = context.ks_config.reduced_key_bytes(k);
-                    let cell = context.ks_config.cell_id(&reduced_key);
-                    buffer.remove(ks, cell, reduced_key, position);
-                }
-                WalEntry::BatchStart(size) => {
-                    batch_start_position = Some(position.offset());
-                    batch = VecDeque::with_capacity(size as usize);
-                    batch_remaining = size;
-                }
-                WalEntry::DropCells(ks, from_cell, to_cell) => {
-                    metrics.replayed_wal_records.inc();
-                    // Drop on both sides: the buffer (so pre-drop writes
-                    // don't resurrect at apply time) and `large_table` (in
-                    // case the cells exist as Unloaded entries from a CR
-                    // snapshot loaded at replay start).
-                    buffer.drop_cells_in_range(ks, &from_cell, &to_cell);
-                    let context = contexts.ks_context(ks);
-                    large_table.drop_cells_in_range(context, &from_cell, &to_cell);
-                }
-                entry @ WalEntry::CompressedBatch(..) => {
-                    // A compressed batch is one durable WAL frame — either it
-                    // CRC-verifies (full batch present) or it does not. There
-                    // is no half-state, so we apply every inner entry
-                    // unconditionally; all of them share `position`.
-                    let decompressed = decompress_wal_entry(entry).expect("matched above");
-                    for inner in InnerIter::new(decompressed) {
-                        metrics.replayed_wal_records.inc();
-                        match inner {
-                            WalEntry::Record(ks, key, _value, _relocated) => {
-                                let context = contexts.ks_context(ks);
-                                let reduced_key = context.ks_config.reduced_key_bytes(key);
-                                let cell = context.ks_config.cell_id(&reduced_key);
-                                buffer.insert(ks, cell, reduced_key, position);
-                            }
-                            WalEntry::Remove(ks, key) => {
-                                let context = contexts.ks_context(ks);
-                                let reduced_key = context.ks_config.reduced_key_bytes(key);
-                                let cell = context.ks_config.cell_id(&reduced_key);
-                                buffer.remove(ks, cell, reduced_key, position);
-                            }
-                            other => panic!(
-                                "Unexpected inner entry in CompressedBatch at {position:?}: {other:?}"
-                            ),
-                        }
-                    }
-                }
-            }
-        };
-        large_table.apply_replay_buffer(buffer);
-        Ok(writer)
     }
 
     pub fn rebuild_control_region(&self) -> DbResult<u64> {

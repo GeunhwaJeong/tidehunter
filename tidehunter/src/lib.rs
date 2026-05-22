@@ -30,6 +30,7 @@ mod replay_buffer;
 mod runtime;
 mod state_snapshot;
 mod thread_util;
+mod wal_replay;
 
 pub(crate) mod wal;
 
