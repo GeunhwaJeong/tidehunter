@@ -761,6 +761,24 @@ impl IndexTable {
         }
     }
 
+    /// Build a flat-backed IndexTable from a vector of entries that the caller
+    /// has already sorted by key. Used by the replay accumulator path to skip
+    /// the BTreeMap on the hot insert path — replay batches per-cell writes
+    /// into a HashMap, then converts them in bulk via a single sort + flat
+    /// build. `data` is empty; `key_size` is `None` (varlen flat), matching
+    /// what `promote_to_flat` produces from a default IndexTable.
+    pub(crate) fn from_sorted_entries(entries: Vec<(Bytes, IndexWalPosition)>) -> Self {
+        let dirty_count = entries.iter().filter(|(_, iwp)| !iwp.is_clean()).count();
+        let flat = build_flat_bytes(entries, None);
+        IndexTable {
+            data: BTreeMap::new(),
+            key_bytes: 0,
+            flat,
+            key_size: None,
+            dirty_count,
+        }
+    }
+
     /// Deserializes IndexTable from bytes.
     ///
     /// Loaded entries populate `flat` (not the BTreeMap `data`): on-disk blobs
@@ -1226,7 +1244,7 @@ impl IndexWalPosition {
         }
     }
 
-    fn new_modified(w: WalPosition) -> Self {
+    pub(crate) fn new_modified(w: WalPosition) -> Self {
         debug_assert_ne!(w, WalPosition::INVALID);
         Self {
             offset: w.offset(),
@@ -1235,7 +1253,7 @@ impl IndexWalPosition {
         }
     }
 
-    fn new_removed(w: WalPosition) -> Self {
+    pub(crate) fn new_removed(w: WalPosition) -> Self {
         debug_assert_ne!(w, WalPosition::INVALID);
         Self {
             offset: w.offset(),

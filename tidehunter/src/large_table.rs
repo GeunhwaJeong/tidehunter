@@ -5,7 +5,7 @@ use crate::context::{KsContext, LookupResult, LookupSource};
 use crate::control::RelocateFiles;
 use crate::flusher::{FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread};
 use crate::index::index_format::{Direction, IndexFormat, IndexIterCaches};
-use crate::index::index_table::IndexTable;
+use crate::index::index_table::{IndexTable, IndexWalPosition};
 use crate::index::levels::{INLINE_LEVELS, IndexLevels};
 use crate::index::pending_table::{CommittedChange, PendingTable, Transaction};
 use crate::index::utils::{NextEntryResult, merge_levels_next_entry};
@@ -16,6 +16,7 @@ use crate::primitives::arc_cow::ArcCow;
 use crate::primitives::range_from_excluding::next_key_in_tree;
 use crate::primitives::sharded_mutex::ShardedMutex;
 use crate::relocation::updates::RelocationUpdates;
+use crate::replay_buffer::{CellReplayBuffer, ReplayBuffer};
 use crate::runtime;
 use crate::wal::WalRandomRead;
 use crate::wal::layout::WalLayout;
@@ -399,34 +400,56 @@ impl LargeTable {
         Ok(())
     }
 
-    /// Replay-only insert path. Bypasses checks that are only relevant for
-    /// live concurrent writes:
-    ///   - `promote_pending_for`: replay has no in-flight transactions, so
-    ///     `pending_data` is always empty — the HashMap lookup is wasted work.
-    ///   - `skip_stale_update`: WAL records are processed strictly in
-    ///     monotonically-increasing offset order during replay, so the check
-    ///     `last_position > wal_position` can never fire. The same monotonic
-    ///     ordering is still enforced by `checked_insert`'s debug assertion.
-    ///   - Value LRU push: replay churns the value cache (each cell sees
-    ///     millions of records, far more than the cache holds, so almost
-    ///     every push evicts). The cache ends up holding a random tail of
-    ///     recent writes rather than hot data — not worth the cost.
-    ///   - `too_many_dirty` / flush trigger: `flush_supported()` is false for
-    ///     the replay loader anyway, so this is dead code for replay.
-    ///   - `max_index_size` / `index_size` metrics: noisy during replay
-    ///     (every cell's BTreeMap grows unbounded until end-of-replay).
-    pub fn replay_insert(&self, context: &KsContext, reduced_key: Bytes, v: WalPosition) {
-        let (mut row, cell) = self.row(context, &reduced_key);
-        let entry = self.entry_mut(&mut row, &cell);
-        entry.replay_insert(reduced_key, v);
-    }
-
-    /// Replay-only remove path. See `replay_insert` for rationale; same
-    /// reasoning applies to tombstones.
-    pub fn replay_remove(&self, context: &KsContext, k: Bytes, v: WalPosition) {
-        let (mut row, cell) = self.row(context, &k);
-        let entry = self.entry_mut(&mut row, &cell);
-        entry.replay_remove(k, v);
+    /// Drain a [`ReplayBuffer`] accumulated by `Db::replay_wal` and apply
+    /// each cell's writes in bulk.
+    ///
+    /// The replay loop accumulates per-cell HashMaps in a local buffer (no
+    /// locks at all). This method walks the buffer once per keyspace,
+    /// groups cells by mutex shard, and acquires each row lock at most
+    /// once — instead of the row-lock-per-record cost of the live path.
+    ///
+    /// Per-cell apply also skips the BTreeMap insert path entirely: entries
+    /// land directly in the cell's flat buffer via
+    /// `IndexTable::from_sorted_entries`. The HashMap dedupes overwrites
+    /// before sort, so the sort runs on unique-keys-per-cell, not WAL records.
+    ///
+    /// Live-write checks intentionally skipped (replay is sequential, no
+    /// in-flight transactions, no concurrent writers):
+    ///   - `promote_pending_for` / `pending_data` (always empty)
+    ///   - `skip_stale_update` (WAL is monotonic; later-position wins
+    ///     naturally via HashMap overwrite semantics)
+    ///   - Value LRU (churns + evicts during replay, ends up holding a
+    ///     random tail; not worth the cost)
+    ///   - `too_many_dirty` / flush trigger (replay loader has
+    ///     `flush_supported() = false`)
+    ///   - `max_index_size` / `index_size` per-record metric updates
+    pub(crate) fn apply_replay_buffer(&self, mut buffer: ReplayBuffer) {
+        for ks_idx in 0..buffer.num_keyspaces() {
+            let by_cell = buffer.take_ks(ks_idx);
+            if by_cell.is_empty() {
+                continue;
+            }
+            let ks_table = &self.table[ks_idx];
+            // Group cells by mutex shard so we take each row lock exactly once.
+            let mut by_shard: HashMap<usize, Vec<(CellId, CellReplayBuffer)>> = HashMap::new();
+            for (cell, buf) in by_cell {
+                let mutex_idx = ks_table.context.ks_config.mutex_for_cell(&cell);
+                by_shard.entry(mutex_idx).or_default().push((cell, buf));
+            }
+            // Shards are independent — apply them in parallel. Each rayon
+            // worker takes a single row lock and drains every cell on it.
+            let by_shard_vec: Vec<(usize, Vec<(CellId, CellReplayBuffer)>)> =
+                by_shard.into_iter().collect();
+            by_shard_vec.into_par_iter().for_each(|(mutex_idx, cells)| {
+                let mut row = ks_table
+                    .rows
+                    .lock(mutex_idx, &ks_table.context.large_table_contention);
+                for (cell, buf) in cells {
+                    let entry = self.entry_mut(&mut row, &cell);
+                    entry.apply_replay_buffer(buf);
+                }
+            });
+        }
     }
 
     /// Apply a batch of pending operations that all share the same mutex shard,
@@ -1653,19 +1676,32 @@ impl LargeTableEntry {
         true
     }
 
-    /// Replay-only insert path — see `LargeTable::replay_insert` for the
-    /// invariants that make the skipped work redundant.
-    fn replay_insert(&mut self, k: Bytes, v: WalPosition) {
-        self.mark_dirty(v);
-        self.insert_bloom_filter(&k);
-        self.data.make_mut().insert(k, v);
-        self.report_loaded_keys_count();
-    }
-
-    /// Replay-only remove path — see `LargeTable::replay_insert`.
-    fn replay_remove(&mut self, k: Bytes, v: WalPosition) {
-        self.mark_dirty(v);
-        self.data.make_mut().remove(k, v);
+    /// Drain a [`CellReplayBuffer`] into this entry. See
+    /// `LargeTable::apply_replay_buffer` for the broader rationale.
+    ///
+    /// During replay the cell is in `Empty` or `Unloaded` state (no
+    /// `maybe_load` call) and `entry.data` is the default IndexTable, so we
+    /// can replace it wholesale with a flat buffer built from the sorted
+    /// entries. `mark_dirty` is fed the *first* WAL position observed for
+    /// the cell so that `last_processed` matches what the per-record path
+    /// would have anchored on the `Empty → Dirty` transition.
+    fn apply_replay_buffer(&mut self, buf: CellReplayBuffer) {
+        if buf.entries.is_empty() {
+            return;
+        }
+        debug_assert!(
+            self.data.is_empty(),
+            "apply_replay_buffer expects a fresh entry — replay never auto-loads L0",
+        );
+        self.mark_dirty(buf.first_position);
+        if let Some(bloom_filter) = &mut self.bloom_filter {
+            for key in buf.entries.keys() {
+                bloom_filter.insert(&key.as_ref());
+            }
+        }
+        let mut sorted: Vec<(Bytes, IndexWalPosition)> = buf.entries.into_iter().collect();
+        sorted.sort_unstable_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+        self.data = ArcCow::new_owned(IndexTable::from_sorted_entries(sorted));
         self.report_loaded_keys_count();
     }
 

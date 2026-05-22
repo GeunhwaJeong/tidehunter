@@ -26,6 +26,7 @@ mod math;
 pub mod metrics;
 mod primitives;
 mod relocation;
+mod replay_buffer;
 mod runtime;
 mod state_snapshot;
 mod thread_util;

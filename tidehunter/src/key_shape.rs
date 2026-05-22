@@ -700,6 +700,12 @@ impl KeySpace {
     pub fn as_u8(&self) -> u8 {
         self.0
     }
+
+    /// Index for slice-based per-keyspace storage. Crate-internal — matches
+    /// the layout used by `KsContextVec` and friends.
+    pub(crate) fn index(&self) -> usize {
+        self.0 as usize
+    }
 }
 
 impl Deref for KeySpaceDesc {
