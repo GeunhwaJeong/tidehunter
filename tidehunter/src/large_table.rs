@@ -403,15 +403,21 @@ impl LargeTable {
     /// Drain a [`ReplayBuffer`] accumulated by `Db::replay_wal` and apply
     /// each cell's writes in bulk.
     ///
-    /// The replay loop accumulates per-cell HashMaps in a local buffer (no
+    /// `cutoff` is the WAL offset above which buffered entries are silently
+    /// discarded — used to drop a partial `BatchStart` group whose record
+    /// count was never reached. The replay loop passes `u64::MAX` when no
+    /// partial batch is in flight (the common case). Because per-cell
+    /// entries are pushed in WAL order, the cutoff translates to a single
+    /// `partition_point` + `truncate` inside each cell.
+    ///
+    /// The replay loop accumulates per-cell vectors in a local buffer (no
     /// locks at all). This method walks the buffer once per keyspace,
     /// groups cells by mutex shard, and acquires each row lock at most
     /// once — instead of the row-lock-per-record cost of the live path.
     ///
     /// Per-cell apply also skips the BTreeMap insert path entirely: entries
     /// land directly in the cell's flat buffer via
-    /// `IndexTable::from_sorted_entries`. The HashMap dedupes overwrites
-    /// before sort, so the sort runs on unique-keys-per-cell, not WAL records.
+    /// `IndexTable::from_sorted_entries`.
     ///
     /// Live-write checks intentionally skipped (replay is sequential, no
     /// in-flight transactions, no concurrent writers):
@@ -423,7 +429,7 @@ impl LargeTable {
     ///   - `too_many_dirty` / flush trigger (replay loader has
     ///     `flush_supported() = false`)
     ///   - `max_index_size` / `index_size` per-record metric updates
-    pub(crate) fn apply_replay_buffer(&self, mut buffer: ReplayBuffer) {
+    pub(crate) fn apply_replay_buffer(&self, mut buffer: ReplayBuffer, cutoff: u64) {
         for ks_idx in 0..buffer.num_keyspaces() {
             let by_cell = buffer.take_ks(ks_idx);
             if by_cell.is_empty() {
@@ -446,7 +452,7 @@ impl LargeTable {
                     .lock(mutex_idx, &ks_table.context.large_table_contention);
                 for (cell, buf) in cells {
                     let entry = self.entry_mut(&mut row, &cell);
-                    entry.apply_replay_buffer(buf);
+                    entry.apply_replay_buffer(buf, cutoff);
                 }
             });
         }
@@ -1679,15 +1685,30 @@ impl LargeTableEntry {
     /// Drain a [`CellReplayBuffer`] into this entry. See
     /// `LargeTable::apply_replay_buffer` for the broader rationale.
     ///
+    /// `cutoff` is the WAL offset above which entries belong to an
+    /// incomplete `BatchStart` group and must be dropped. Entries are
+    /// pushed in WAL order, so the cutoff resolves to a single
+    /// `partition_point` + `truncate`.
+    ///
     /// During replay the cell is in `Empty` or `Unloaded` state (no
     /// `maybe_load` call) and `entry.data` is the default IndexTable, so we
     /// can replace it wholesale with a flat buffer built from the sorted
     /// entries. `mark_dirty` is fed the *first* WAL position observed for
     /// the cell so that `last_processed` matches what the per-record path
     /// would have anchored on the `Empty → Dirty` transition.
-    fn apply_replay_buffer(&mut self, mut entries: CellReplayBuffer) {
+    fn apply_replay_buffer(&mut self, mut entries: CellReplayBuffer, cutoff: u64) {
         if entries.is_empty() {
             return;
+        }
+        // Discard entries from an incomplete `BatchStart` group. Entries
+        // were pushed in WAL order so they're monotonic by offset; a
+        // single binary search finds the cut.
+        if cutoff != u64::MAX {
+            let cut = entries.partition_point(|(_, iwp)| iwp.offset() < cutoff);
+            entries.truncate(cut);
+            if entries.is_empty() {
+                return;
+            }
         }
         debug_assert!(
             self.data.is_empty(),

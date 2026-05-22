@@ -8,6 +8,24 @@
 //!   - one per-cell sort + flat-buffer build instead of per-record BTreeMap
 //!     inserts (see `replay_buffer` for the per-cell accumulator).
 //!
+//! ## BatchStart handling
+//!
+//! A `WalEntry::BatchStart(N)` declares the next `N` frames as a single
+//! atomic unit — if any of them is missing (CRC fail or EOF before the
+//! count is reached) the whole batch must be discarded. The straightforward
+//! approach was to buffer those `N` entries into a `VecDeque` and only
+//! dispatch once the batch completed; profiling showed the deque was a
+//! ~26% bottleneck because its 88-byte slots get evicted from L1 between
+//! the push pass and the drain pass.
+//!
+//! Instead we apply each in-batch record inline, the same as any other
+//! WAL record, while remembering the BatchStart's WAL offset. If the batch
+//! is interrupted, `apply_replay_buffer` receives that offset as a cutoff
+//! and silently drops any per-cell entries with `iwp.offset() >= cutoff`.
+//! Per-cell entries are pushed in WAL order — the per-cell buffer is
+//! already sorted by offset — so the cutoff translates to a single
+//! `partition_point` + `truncate` at apply time.
+//!
 //! Lives in its own module so `db.rs` doesn't carry the loop body.
 
 use crate::compressed_batch::{InnerIter, decompress_wal_entry};
@@ -18,7 +36,6 @@ use crate::large_table::LargeTable;
 use crate::metrics::Metrics;
 use crate::replay_buffer::ReplayBuffer;
 use crate::wal::{WalError, WalIterator, WalWriter};
-use std::collections::VecDeque;
 
 pub(crate) fn replay_wal(
     contexts: &KsContextVec,
@@ -28,36 +45,54 @@ pub(crate) fn replay_wal(
     metrics: &Metrics,
 ) -> DbResult<WalWriter> {
     let mut buffer = ReplayBuffer::new(key_shape);
-    // Buffer for `BatchStart` collections — holds decoded entries inside a
-    // single user-level batch until the batch is fully collected and we can
-    // apply its records.
-    let mut batch: VecDeque<(crate::WalPosition, WalEntry)> = VecDeque::new();
+    // Number of records still expected inside the currently-open
+    // BatchStart group. `0` means we're not inside a batch.
     let mut batch_remaining: u32 = 0;
+    // WAL offset of the BatchStart frame. `Some(_)` only while a batch
+    // is open; serves both as the `into_writer` rewind argument and as
+    // the apply-time cutoff if replay terminates with a partial batch.
     let mut batch_start_position: Option<u64> = None;
 
     let writer = loop {
-        let (position, entry) = if batch_remaining == 0 && !batch.is_empty() {
-            // Finished collecting a BatchStart group; emit its records.
-            batch_start_position = None;
-            batch.pop_front().expect("invariant checked")
-        } else {
-            let entry = wal_iterator.next();
-            if matches!(entry, Err(WalError::Crc(_) | WalError::EndOfWal)) {
-                break wal_iterator.into_writer(batch_start_position);
-            }
-            let (position, raw_entry) = entry?;
-            let entry = WalEntry::from_bytes(raw_entry);
-            (position, entry)
-        };
+        let entry = wal_iterator.next();
+        if matches!(entry, Err(WalError::Crc(_) | WalError::EndOfWal)) {
+            break wal_iterator.into_writer(batch_start_position);
+        }
+        let (position, raw_entry) = entry?;
+        let entry = WalEntry::from_bytes(raw_entry);
+
+        // Inside a BatchStart group: apply inline and tick down the
+        // counter. The `batch_start_position` carried forward lets us
+        // drop these records at apply time if the batch never completes.
         if batch_remaining > 0 {
-            assert!(
-                matches!(entry, WalEntry::Record(..) | WalEntry::Remove(..)),
-                "encountered entry {entry:?} at position {position:?} during replay, while expected record or tombstone"
-            );
+            match entry {
+                WalEntry::Record(ks, k, _v, relocated) => {
+                    metrics.replayed_wal_records.inc();
+                    if !relocated {
+                        let context = contexts.ks_context(ks);
+                        let reduced_key = context.ks_config.reduced_key_bytes(k);
+                        let cell = context.ks_config.cell_id(&reduced_key);
+                        buffer.insert(ks, cell, reduced_key, position);
+                    }
+                }
+                WalEntry::Remove(ks, k) => {
+                    metrics.replayed_wal_records.inc();
+                    let context = contexts.ks_context(ks);
+                    let reduced_key = context.ks_config.reduced_key_bytes(k);
+                    let cell = context.ks_config.cell_id(&reduced_key);
+                    buffer.remove(ks, cell, reduced_key, position);
+                }
+                other => panic!(
+                    "encountered entry {other:?} at position {position:?} during replay, while expected record or tombstone"
+                ),
+            }
             batch_remaining -= 1;
-            batch.push_back((position, entry));
+            if batch_remaining == 0 {
+                batch_start_position = None;
+            }
             continue;
         }
+
         match entry {
             WalEntry::Record(ks, k, _v, relocated) => {
                 metrics.replayed_wal_records.inc();
@@ -82,7 +117,6 @@ pub(crate) fn replay_wal(
             }
             WalEntry::BatchStart(size) => {
                 batch_start_position = Some(position.offset());
-                batch = VecDeque::with_capacity(size as usize);
                 batch_remaining = size;
             }
             WalEntry::DropCells(ks, from_cell, to_cell) => {
@@ -124,6 +158,11 @@ pub(crate) fn replay_wal(
             }
         }
     };
-    large_table.apply_replay_buffer(buffer);
+    // If replay ended mid-batch, anything we already buffered at or after
+    // `batch_start_position` is from an incomplete batch and must be
+    // discarded. `None` (= complete or no batch) maps to `u64::MAX` =
+    // "keep everything".
+    let cutoff = batch_start_position.unwrap_or(u64::MAX);
+    large_table.apply_replay_buffer(buffer, cutoff);
     Ok(writer)
 }
