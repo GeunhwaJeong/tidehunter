@@ -1685,16 +1685,19 @@ impl LargeTableEntry {
     /// entries. `mark_dirty` is fed the *first* WAL position observed for
     /// the cell so that `last_processed` matches what the per-record path
     /// would have anchored on the `Empty → Dirty` transition.
-    fn apply_replay_buffer(&mut self, buf: CellReplayBuffer) {
-        if buf.entries.is_empty() {
+    fn apply_replay_buffer(&mut self, mut entries: CellReplayBuffer) {
+        if entries.is_empty() {
             return;
         }
         debug_assert!(
             self.data.is_empty(),
             "apply_replay_buffer expects a fresh entry — replay never auto-loads L0",
         );
-        self.mark_dirty(buf.first_position);
-        let mut entries = buf.entries;
+        // `entries` was pushed in WAL order, so `entries[0]` has the earliest
+        // position for this cell — anchor `mark_dirty` on it. Only the offset
+        // matters for `last_processed`; `len` is irrelevant.
+        let first_offset = entries[0].1.offset();
+        self.mark_dirty(WalPosition::new(first_offset, 0));
         // Sort by (key ASC, offset DESC) so that for runs of equal keys the
         // highest-position (latest) write comes first; `dedup_by` then keeps
         // exactly that entry per key.
