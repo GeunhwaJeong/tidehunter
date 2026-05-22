@@ -1708,8 +1708,15 @@ impl LargeTableEntry {
         });
         entries.dedup_by(|a, b| a.0.as_ref() == b.0.as_ref());
         if let Some(bloom_filter) = &mut self.bloom_filter {
-            for (key, _) in entries.iter() {
-                bloom_filter.insert(&key.as_ref());
+            // Match the live path: only inserts populate the bloom; tombstones
+            // do not. A key whose last replay write is a `Removed` tombstone
+            // and that has no value in any deeper level would otherwise show
+            // up as a false-positive "maybe present" until the next bloom
+            // rebuild.
+            for (key, iwp) in entries.iter() {
+                if !iwp.is_removed() {
+                    bloom_filter.insert(&key.as_ref());
+                }
             }
         }
         self.data = ArcCow::new_owned(IndexTable::from_sorted_entries(entries));
