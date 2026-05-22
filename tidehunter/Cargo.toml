@@ -17,7 +17,7 @@ serde_yaml = "0.9.21"
 rand = {workspace = true}
 prometheus = {workspace = true}
 tokio = { version = "1.36.0", features = ["full"], optional = true}
-bloom = "0.3.2"
+fastbloom = "0.17"
 lru = "0.12.2"
 blake2 = { version = "0.10.6" }
 rayon = "1.5.3"

@@ -21,7 +21,7 @@ use crate::wal::WalRandomRead;
 use crate::wal::layout::WalLayout;
 use crate::wal::position::{LastProcessed, WalFileId, WalPosition};
 use crate::wal::tracker::WalGuard;
-use bloom::{ASMS, BloomFilter};
+use fastbloom::BloomFilter;
 use lru::LruCache;
 use minibytes::Bytes;
 use parking_lot::{MutexGuard, RwLock};
@@ -239,7 +239,8 @@ impl LargeTable {
                     let rows = row_cells.into_par_iter().map(|cells| {
                         let entries = cells.into_iter().map(|(cell, entry_data)| {
                             let bloom_filter = context.ks_config.bloom_filter().map(|opts| {
-                                let mut filter = BloomFilter::with_rate(opts.rate, opts.count);
+                                let mut filter = BloomFilter::with_false_pos(opts.rate as f64)
+                                    .expected_items(opts.count as usize);
                                 // Rebuild the cell-wide bloom by walking every on-disk
                                 // level. With a single level this loads one blob; with
                                 // multiple levels it unions keys across all blobs, which
@@ -1508,10 +1509,9 @@ impl LargeTableEntry {
     }
 
     pub fn new_empty(context: KsContext, cell: CellId, unload_jitter: usize) -> Self {
-        let bloom_filter = context
-            .ks_config
-            .bloom_filter()
-            .map(|params| BloomFilter::with_rate(params.rate, params.count));
+        let bloom_filter = context.ks_config.bloom_filter().map(|params| {
+            BloomFilter::with_false_pos(params.rate as f64).expected_items(params.count as usize)
+        });
         Self::new_with_state(
             context,
             cell,
@@ -2584,7 +2584,7 @@ mod tests {
 
     #[test]
     fn test_bloom_size() {
-        let f = BloomFilter::with_rate(0.01, 8000);
+        let f = BloomFilter::with_false_pos(0.01).expected_items(8000);
         println!("hashes: {}, bytes: {}", f.num_hashes(), f.num_bits() / 8);
     }
 

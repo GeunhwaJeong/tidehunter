@@ -24,7 +24,6 @@ use crate::wal::layout::WalKind;
 use crate::wal::position::{LastProcessed, WalFileId, WalPosition};
 use crate::wal::tracker::WalGuard;
 use crate::wal::{PreparedWalWrite, Wal, WalError, WalIterator, WalRandomRead, WalWriter};
-use bloom::needed_bits;
 use bytes::{Buf, BufMut, BytesMut};
 use minibytes::Bytes;
 use parking_lot::Mutex;
@@ -1145,7 +1144,15 @@ impl Db {
                         .with_label_values(&[ks.name(), "index_cache"])
                         .set(cache_estimate as i64);
                     if let Some(bloom_filter) = ks.bloom_filter() {
-                        let bloom_size = needed_bits(bloom_filter.rate, bloom_filter.count) / 8;
+                        // Bits needed for a classic bloom filter at false-positive rate p
+                        // holding n items: m = -n * ln(p) / (ln 2)^2. The on-disk layout
+                        // is now fastbloom's block bloom, which sizes similarly; this
+                        // estimate is for a Prometheus metric so the approximation is fine.
+                        let n = bloom_filter.count as f64;
+                        let p = bloom_filter.rate as f64;
+                        let bits = (-n * p.ln() / (std::f64::consts::LN_2 * std::f64::consts::LN_2))
+                            .ceil() as usize;
+                        let bloom_size = bits / 8;
                         let bloom_estimate = bloom_size * num_cells;
                         self.metrics
                             .memory_estimate
