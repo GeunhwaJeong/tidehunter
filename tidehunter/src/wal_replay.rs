@@ -116,6 +116,22 @@ pub(crate) fn replay_wal(
                 buffer.remove(ks, cell, reduced_key, position);
             }
             WalEntry::BatchStart(size) => {
+                // `BatchStart(0)` is unreachable from the writer: only
+                // `Db::write_batch_into_wal` (`db.rs:649`) constructs
+                // a `BatchStart`, with `entries.len() as u32`, and
+                // `Db::do_write_batch` (`db.rs:439-441`) short-circuits
+                // empty batches before that call. CRC has already
+                // validated this frame's bytes, so a 0 here is a writer
+                // bug, not random corruption. Asserting loudly is
+                // strictly better than skipping silently — a silent skip
+                // would mask the bug and a forged 0 here would still be
+                // catastrophic anyway (it would latch
+                // `batch_start_position` forever and the apply-time
+                // cutoff would drop every record past this frame).
+                assert!(
+                    size > 0,
+                    "WalEntry::BatchStart(0) at {position:?} — writer invariant violated"
+                );
                 batch_start_position = Some(position.offset());
                 batch_remaining = size;
             }
