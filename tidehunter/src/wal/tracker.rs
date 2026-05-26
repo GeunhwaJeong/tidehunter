@@ -120,6 +120,14 @@ impl WalTracker {
         self.mapper.delete_files(files);
     }
 
+    /// Returns `true` while the underlying mapper thread is running.
+    /// Used by `WalWriter::get_writeable_map` to surface a mapper panic
+    /// (which would otherwise leave the writer spinning forever) as a
+    /// loud panic on the writer thread.
+    pub(crate) fn is_mapper_alive(&self) -> bool {
+        self.mapper.is_alive()
+    }
+
     #[cfg(test)]
     pub fn barrier(&self) {
         use crate::latch::Latch;

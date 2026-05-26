@@ -139,6 +139,16 @@ impl WalWriter {
             self.wal.metrics.wal_write_wait.inc();
             thread::sleep(Duration::from_millis(1));
             attempts += 1;
+            // ~Once a second, sanity-check that the mapper thread is
+            // still alive. If it died (panic, OOM, anything), no one
+            // will ever create this map and the writer would otherwise
+            // spin forever; surface that as a loud panic instead.
+            if attempts.is_multiple_of(1000) && !self.wal_tracker.is_mapper_alive() {
+                panic!(
+                    "wal-mapper thread is no longer running; \
+                     writer cannot make progress on map {map:?}"
+                );
+            }
             if attempts.is_multiple_of(10 * 1000) {
                 println!(
                     "Still waiting for writable map {map:?} after {} seconds",

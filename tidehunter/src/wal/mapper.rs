@@ -187,6 +187,16 @@ impl WalMapper {
         Self { jh, sender }
     }
 
+    /// Returns `true` while the mapper thread is still running. Flips
+    /// to `false` once the thread exits — cleanly via channel close
+    /// *or* via panic. The writer's spin loop polls this so a mapper
+    /// crash surfaces as a panic on the writer thread instead of an
+    /// indefinite wait. The `Drop` impl below `take()`s `jh` to join,
+    /// so callers post-drop see `false`.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.jh.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
     #[cfg(test)]
     pub fn new_unstarted() -> (Self, mpsc::Receiver<WalMapperMessage>) {
         let (sender, receiver) = mpsc::sync_channel(1024);
