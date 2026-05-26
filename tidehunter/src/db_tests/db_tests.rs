@@ -390,6 +390,136 @@ fn test_compressed_batch_dedups_duplicate_keys() {
     assert_eq!(Some(vec![99].into()), db.get(ks, &[9, 9, 9, 9]).unwrap());
 }
 
+/// Reproduce the production crash window where a writer wrote a skip
+/// marker that terminates fragment M but the process died before
+/// fragment M+1's file was created. The relevant code window is in
+/// `WalWriter::multi_write` (`wal/mod.rs:81-122`) between the
+/// `write_skip_marker` call and the subsequent `get_writeable_map`,
+/// during which the mapper thread is asked to create the new file.
+///
+/// On replay this manifests as: iterator reads through fragment M,
+/// hits the skip marker, advances `self.position` into fragment M+1,
+/// then `make_map` returns `EndOfWal` because the file is missing.
+/// Without the fix, `WalIterator::into_writer` then tripped two
+/// "position must be in current map" assertions. With the fix the
+/// recovered `WalWriter` must:
+///   1. Open the Db without panicking.
+///   2. Surface only the records that survived (record A in fragment M).
+///   3. Be able to materialise fragment M+1 on a fresh insert and
+///      land it at the start of that fragment.
+///   4. Persist that fresh insert across another close/open cycle.
+#[test]
+fn test_replay_recovers_from_missing_next_fragment_file() {
+    let dir =
+        tempdir::TempDir::new("test_replay_recovers_from_missing_next_fragment_file").unwrap();
+    // One fragment per WAL file so the missing fragment maps to a
+    // single, easy-to-remove on-disk file.
+    let mut config = Config::small();
+    config.frag_size = 8 * 1024;
+    config.wal_file_size = 8 * 1024;
+    let config = Arc::new(config);
+    let (key_shape, ks) = KeyShape::new_single(16, 16, KeyType::uniform(16));
+
+    let key_a = vec![0x01u8; 16];
+    let key_b = vec![0x02u8; 16];
+    let key_c = vec![0x03u8; 16];
+    // 5000-byte values: one record's frame fits in an 8 KiB fragment,
+    // two don't — `multi_write` writes a skip marker and places the
+    // second record at the start of fragment 1.
+    let value_a = vec![0xAAu8; 5000];
+    let value_b = vec![0xBBu8; 5000];
+    let value_c = vec![0xCCu8; 32];
+
+    // Phase 1: write two large records. Drop the Db so background
+    // threads (mapper, tracker, syncer, flusher) join cleanly before we
+    // touch on-disk WAL files.
+    {
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            Metrics::new(),
+        )
+        .unwrap();
+        db.insert(ks, key_a.clone(), value_a.clone()).unwrap();
+        db.insert(ks, key_b.clone(), value_b.clone()).unwrap();
+    }
+
+    let file_0 = dir.path().join("wal_0000000000000000");
+    let file_1 = dir.path().join("wal_0000000000000001");
+    assert!(file_0.exists(), "file 0 should exist after phase 1");
+    assert!(file_1.exists(), "file 1 should exist after phase 1");
+
+    // Phase 2: simulate the production crash window by truncating all
+    // WAL files past file 0. We must remove *every* file >= 1, not
+    // just file 1, because the live writer's mapper had already
+    // pre-created `INITIAL_MAPS_BUFFER` files ahead — leaving any of
+    // those on disk would produce a sparse `{0, 2, 3, ...}` layout that
+    // a real crash cannot produce (writers create files strictly
+    // sequentially; GC only deletes prefixes). The post-crash on-disk
+    // layout is always a contiguous prefix.
+    let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+    for entry in entries {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or("");
+        if let Some(id_str) = name.strip_prefix("wal_")
+            && let Ok(id) = u64::from_str_radix(id_str, 16)
+            && id >= 1
+        {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    assert!(file_0.exists(), "file 0 should still exist after deletion");
+    assert!(!file_1.exists(), "file 1 should have been removed");
+
+    // Phase 3: re-open. Replay walks file 0, hits the skip marker,
+    // tries to load fragment 1 and gets `EndOfWal` from `make_map`.
+    // Previously `WalIterator::into_writer` panicked here; with the
+    // fix, the Db opens, surfaces only record A (record B's file is
+    // gone), and accepts a fresh insert that materialises fragment 1
+    // and lands at its start.
+    {
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            Metrics::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get(ks, &key_a).unwrap(),
+            Some(value_a.clone().into()),
+            "record A in fragment 0 should survive the crash"
+        );
+        assert_eq!(
+            db.get(ks, &key_b).unwrap(),
+            None,
+            "record B was in the deleted fragment 1 — must be absent",
+        );
+        db.insert(ks, key_c.clone(), value_c.clone()).unwrap();
+        assert_eq!(
+            db.get(ks, &key_c).unwrap(),
+            Some(value_c.clone().into()),
+            "fresh insert after recovery must be readable",
+        );
+    }
+    assert!(
+        file_1.exists(),
+        "writer should have materialised fragment 1's file when accepting the fresh insert",
+    );
+
+    // Phase 4: re-open one more time. The fresh insert in phase 3 must
+    // be durable across another close/replay cycle; record A still
+    // survives; record B is still absent.
+    {
+        let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+        assert_eq!(db.get(ks, &key_a).unwrap(), Some(value_a.into()));
+        assert_eq!(db.get(ks, &key_b).unwrap(), None);
+        assert_eq!(db.get(ks, &key_c).unwrap(), Some(value_c.into()));
+    }
+}
+
 #[test]
 fn test_corrupted_batch_replay() {
     let dir = tempdir::TempDir::new("test_corrupted_batch_replay").unwrap();

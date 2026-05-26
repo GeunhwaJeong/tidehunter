@@ -507,7 +507,13 @@ impl WalIterator {
             syncer,
             self.wal.metrics.clone(),
         );
-        assert_eq!(self.wal.layout.locate(position).0, self.map.id);
+        // The writer doesn't use `self.map` directly — it looks up the
+        // correct map via `get_writeable_map` against `self.wal.maps`,
+        // creating the file/mapping on demand via the mapper thread if
+        // missing. So `position` being in a fragment we never loaded
+        // (e.g. crash between `write_skip_marker` and `get_writeable_map`,
+        // see `clear_fragment_from_position` doc) is fine — the writer
+        // will materialise it on first write.
         let wal_tracker = WalTracker::start(
             self.wal.layout.clone(),
             mapper,
@@ -524,9 +530,23 @@ impl WalIterator {
     }
 
     /// Fills fragment with zeroes from given position to the end of the fragment.
+    ///
+    /// If `position` falls in a fragment we don't currently have mapped
+    /// this is a no-op: typically replay consumed a skip marker that
+    /// advanced `self.position` into the next fragment but `make_map`
+    /// then returned `EndOfWal` (the file for that fragment doesn't
+    /// exist yet). This can happen in production after a crash between
+    /// `multi_write`'s `write_skip_marker` and `get_writeable_map`
+    /// steps: the skip marker is on disk but the next fragment's file
+    /// was never created. There's no data to zero in a fragment that
+    /// doesn't exist; the writer that takes over from this iterator
+    /// will create the file lazily via the mapper thread when its first
+    /// write lands there.
     fn clear_fragment_from_position(&self, position: u64) {
         let (map_id, offset) = self.wal.layout.locate(position);
-        assert_eq!(map_id, self.map.id, "position must be in current map");
+        if map_id != self.map.id {
+            return;
+        }
 
         let map_range = self.wal.layout.map_range(map_id);
         let fragment_size = (map_range.end - map_range.start) as usize;
