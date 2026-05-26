@@ -74,13 +74,16 @@ impl ReplayBuffer {
     }
 
     pub(crate) fn insert(&mut self, ks: KeySpace, cell: CellId, key: Bytes, position: WalPosition) {
+        // Detach: a zero-copy slice would pin its backing buffer (a
+        // multi-MB decompressed `CompressedBatch` body, or a WAL mmap
+        // region) for the rest of replay.
         self.cell_mut(ks, cell)
-            .push((key, IndexWalPosition::new_modified(position)));
+            .push((key.into_owned(), IndexWalPosition::new_modified(position)));
     }
 
     pub(crate) fn remove(&mut self, ks: KeySpace, cell: CellId, key: Bytes, position: WalPosition) {
         self.cell_mut(ks, cell)
-            .push((key, IndexWalPosition::new_removed(position)));
+            .push((key.into_owned(), IndexWalPosition::new_removed(position)));
     }
 
     fn cell_mut(&mut self, ks: KeySpace, cell: CellId) -> &mut CellReplayBuffer {
