@@ -138,11 +138,13 @@ impl Iterator for InnerIter {
 
 /// Linear-scan the decompressed body for a record matching `(target_ks, target_key)`.
 ///
-/// Returns the value bytes (a zero-copy slice into `decompressed`) if found.
-/// Tombstones for `target_key` are ignored — point lookups never see them
-/// because the index removes the entry on a tombstone batch commit. Batch
-/// dedup at write time guarantees at most one matching record per
-/// `(target_ks, target_key)`.
+/// Returns the value bytes if found. Tombstones for `target_key` are ignored —
+/// point lookups never see them because the index removes the entry on a
+/// tombstone batch commit. Batch dedup at write time guarantees at most one
+/// matching record per `(target_ks, target_key)`.
+///
+/// The returned `Bytes` is detached from `decompressed` — see `find_record_by`
+/// for the rationale.
 pub(crate) fn find_record(
     decompressed: &Bytes,
     target_ks: KeySpace,
@@ -156,6 +158,11 @@ pub(crate) fn find_record(
 /// closure that re-derives the indexed key from each candidate's full key and
 /// compares it to the target. Batch dedup at write time guarantees at most one
 /// matching record per indexed key.
+///
+/// Returned `(key, value)` bytes are detached from `decompressed`: callers
+/// stash them in long-lived structures (LRU cache, relocation batches), and a
+/// zero-copy slice would pin the multi-MB decompressed buffer behind a small
+/// key/value pair via its Arc owner.
 pub(crate) fn find_record_by<F>(
     decompressed: &Bytes,
     target_ks: KeySpace,
@@ -169,7 +176,7 @@ where
             && ks == target_ks
             && matches(key.as_ref())
         {
-            return Some((key, value));
+            return Some((key.into_owned(), value.into_owned()));
         }
     }
     None
