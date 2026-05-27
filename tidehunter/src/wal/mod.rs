@@ -528,6 +528,7 @@ impl WalIterator {
             self.wal.layout.clone(),
             mapper,
             LastProcessed::new(position),
+            self.wal.metrics.clone(),
         );
         let allocator = WalAllocator::new(self.wal.layout.clone(), position);
         WalWriter {

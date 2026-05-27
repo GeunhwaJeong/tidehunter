@@ -3,6 +3,7 @@ use super::position::LastProcessed;
 use crate::WalLayout;
 #[cfg(test)]
 use crate::latch::LatchGuard;
+use crate::metrics::Metrics;
 use crate::wal::allocator::AllocationResult;
 use crate::wal::mapper::WalMapper;
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
@@ -49,6 +50,7 @@ struct WalTrackerThread {
     state: WalTrackerState,
     mapper: Arc<WalMapper>,
     layout: WalLayout,
+    metrics: Arc<Metrics>,
 }
 
 struct WalTrackerState {
@@ -68,7 +70,12 @@ enum WalTrackerMessageKind {
 }
 
 impl WalTracker {
-    pub fn start(layout: WalLayout, mapper: WalMapper, last_processed: LastProcessed) -> Self {
+    pub fn start(
+        layout: WalLayout,
+        mapper: WalMapper,
+        last_processed: LastProcessed,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let atomic_last_processed = Arc::new(AtomicU64::new(last_processed.as_u64()));
         let mapper = Arc::new(mapper);
@@ -78,6 +85,7 @@ impl WalTracker {
             last_processed: atomic_last_processed.clone(),
             mapper: mapper.clone(),
             layout,
+            metrics,
         };
         let jh = thread::Builder::new()
             .name("wal-tracker".to_string())
@@ -217,6 +225,9 @@ impl WalTrackerThread {
             if let Some(position) = position {
                 self.last_processed
                     .store(position.as_u64(), Ordering::SeqCst);
+                self.metrics
+                    .wal_last_processed_position
+                    .set(position.as_u64() as i64);
             }
         }
     }
@@ -336,6 +347,7 @@ mod tests {
             layout.clone(),
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
+            Metrics::new(),
         );
         let guard1 = tracker.allocated(a.clone());
         let guard2 = tracker.allocated(b.clone());
@@ -347,6 +359,7 @@ mod tests {
             layout.clone(),
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
+            Metrics::new(),
         );
         let guard1 = tracker.allocated(a.clone());
         let guard3 = tracker.allocated(c.clone());
@@ -357,6 +370,7 @@ mod tests {
             layout.clone(),
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
+            Metrics::new(),
         );
         let guard3 = tracker.allocated(c.clone());
         let guard2 = tracker.allocated(b.clone());
