@@ -317,7 +317,7 @@ impl RelocationDriver {
         );
         let upper_limit = db.wal_writer.last_processed().as_u64();
         let min_wal_position = db.wal.min_wal_position();
-        let mut wal_iterator = db.wal.wal_iterator(min_wal_position)?;
+        let mut wal_iterator = db.wal.wal_iterator_for_scan(min_wal_position)?;
 
         // Calculate the maximum amount we can reclaim based on configured percentage
         let max_target_position = min_wal_position

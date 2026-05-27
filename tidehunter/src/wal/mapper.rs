@@ -407,6 +407,23 @@ impl WalMaps {
         map_id: MapId,
         wal_mmap_bytes: MetricIntGauge,
     ) -> &Map {
+        let map = Self::create_map(file, layout, map_id, wal_mmap_bytes);
+        assert!(self.maps.insert(map_id, map).is_none());
+        if self.maps.len() > layout.max_maps {
+            self.maps.pop_first();
+        }
+        self.maps.get(&map_id).unwrap()
+    }
+
+    /// mmap a single WAL fragment without inserting it into the cache.
+    /// Used by the scan-mode iterator that doesn't need the map handoff
+    /// to a writer.
+    pub fn create_map(
+        file: &File,
+        layout: &WalLayout,
+        map_id: MapId,
+        wal_mmap_bytes: MetricIntGauge,
+    ) -> Map {
         let range = layout.map_range(map_id);
         let data = unsafe {
             let mut options = memmap2::MmapOptions::new();
@@ -419,15 +436,10 @@ impl WalMaps {
                 .expect("Failed to mmap on wal file");
             TrackingMMapMut::new(mmap, wal_mmap_bytes).into()
         };
-        let map = Map {
+        Map {
             id: map_id,
             writeable: true,
             data,
-        };
-        assert!(self.maps.insert(map_id, map).is_none());
-        if self.maps.len() > layout.max_maps {
-            self.maps.pop_first();
         }
-        self.maps.get(&map_id).unwrap()
     }
 }

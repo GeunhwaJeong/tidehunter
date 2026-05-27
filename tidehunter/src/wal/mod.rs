@@ -54,6 +54,11 @@ pub struct WalIterator {
     map: Map,
     position: u64,
     skip_crc: bool,
+    /// When false, the iterator does not populate `maps` (each fragment
+    /// it mmaps is dropped as soon as the cursor advances past it) and
+    /// `into_writer` panics — the writer needs the accumulated mmaps as
+    /// its initial `WalMaps`. Set by `new_for_scan` vs `new_for_writer`.
+    for_writer: bool,
 }
 
 #[derive(Clone)]
@@ -355,9 +360,22 @@ impl Wal {
         Ok(())
     }
 
-    /// Iterate wal from the position after given position
-    pub fn wal_iterator(self: &Arc<Self>, position: u64) -> Result<WalIterator, WalError> {
-        WalIterator::new(self.clone(), position)
+    /// Iterate wal from the position after given position. The returned
+    /// iterator does not retain mmapped fragments past the cursor and
+    /// cannot be turned into a writer — use `wal_iterator_for_writer`
+    /// for that.
+    pub fn wal_iterator_for_scan(self: &Arc<Self>, position: u64) -> Result<WalIterator, WalError> {
+        WalIterator::new_for_scan(self.clone(), position)
+    }
+
+    /// Like `wal_iterator_for_scan`, but retains every mmapped fragment in the
+    /// iterator's `WalMaps` so they can be handed off to a `WalWriter`
+    /// via `into_writer`.
+    pub fn wal_iterator_for_writer(
+        self: &Arc<Self>,
+        position: u64,
+    ) -> Result<WalIterator, WalError> {
+        WalIterator::new_for_writer(self.clone(), position)
     }
 
     /// Returns wal writer positions after a given valid write position.
@@ -371,7 +389,7 @@ impl Wal {
         } else {
             0
         };
-        let iterator = self.wal_iterator(position)?;
+        let iterator = self.wal_iterator_for_writer(position)?;
         Ok(iterator.into_writer(None))
     }
 
@@ -410,7 +428,21 @@ impl Wal {
 }
 
 impl WalIterator {
-    fn new(wal: Arc<Wal>, position: u64) -> Result<Self, WalError> {
+    /// Scan-mode iterator. Fragments are mmapped on demand for the
+    /// cursor and dropped as soon as the cursor advances past them;
+    /// `into_writer` panics on this iterator.
+    fn new_for_scan(wal: Arc<Wal>, position: u64) -> Result<Self, WalError> {
+        Self::new_impl(wal, position, false)
+    }
+
+    /// Writer-mode iterator. Every fragment the iterator opens is
+    /// retained in `WalMaps` so that `into_writer` can hand them to
+    /// the resulting `WalWriter`.
+    fn new_for_writer(wal: Arc<Wal>, position: u64) -> Result<Self, WalError> {
+        Self::new_impl(wal, position, true)
+    }
+
+    fn new_impl(wal: Arc<Wal>, position: u64, for_writer: bool) -> Result<Self, WalError> {
         let mut maps = WalMaps::default();
         let (map_id, _) = wal.layout.locate(position);
         let files = wal.files.load();
@@ -420,6 +452,7 @@ impl WalIterator {
             &files,
             &mut maps,
             wal.metrics.wal_mmap_bytes.clone(),
+            for_writer,
         )?
         .expect("First map must be available"); // todo check this is actually true
         Ok(Self {
@@ -428,6 +461,7 @@ impl WalIterator {
             position,
             map,
             skip_crc: false,
+            for_writer,
         })
     }
 
@@ -463,6 +497,7 @@ impl WalIterator {
                 &files,
                 &mut self.maps,
                 self.wal.metrics.wal_mmap_bytes.clone(),
+                self.for_writer,
             )?
             else {
                 return Err(WalError::EndOfWal);
@@ -492,6 +527,7 @@ impl WalIterator {
         files: &WalFiles,
         maps: &mut WalMaps,
         wal_mmap_bytes: MetricIntGauge,
+        for_writer: bool,
     ) -> Result<Option<Map>, WalError> {
         // Check if the file still exists before trying to extend it.
         // GC may have removed the file asynchronously (via the mapper thread)
@@ -500,10 +536,23 @@ impl WalIterator {
             return Ok(None);
         };
         Wal::extend_to_map_id(layout, file, map_id)?;
-        Ok(Some(maps.map(file, layout, map_id, wal_mmap_bytes).clone()))
+        if for_writer {
+            Ok(Some(maps.map(file, layout, map_id, wal_mmap_bytes).clone()))
+        } else {
+            Ok(Some(WalMaps::create_map(
+                file,
+                layout,
+                map_id,
+                wal_mmap_bytes,
+            )))
+        }
     }
 
     pub fn into_writer(self, position_override: Option<u64>) -> WalWriter {
+        assert!(
+            self.for_writer,
+            "into_writer called on a scan-mode WalIterator — construct via wal_iterator_for_writer"
+        );
         let position = position_override.unwrap_or(self.position);
 
         self.clear_fragment_from_position(position);
@@ -696,7 +745,7 @@ mod tests {
         let large = vec![1u8; 1024 - 8 - CrcFrame::CRC_HEADER_LENGTH * 3 - 9];
         {
             let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
-            let writer = wal.wal_iterator(0).unwrap().into_writer(None);
+            let writer = wal.wal_iterator_for_writer(0).unwrap().into_writer(None);
             let pos = writer
                 .write(&PreparedWalWrite::new(&vec![1, 2, 3]))
                 .unwrap();
@@ -712,7 +761,7 @@ mod tests {
         }
         {
             let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
-            let mut wal_iterator = wal.wal_iterator(0).unwrap();
+            let mut wal_iterator = wal.wal_iterator_for_writer(0).unwrap();
             assert_bytes(&[1, 2, 3], wal_iterator.next());
             assert_bytes(&[], wal_iterator.next());
             assert_bytes(&large, wal_iterator.next());
@@ -727,7 +776,7 @@ mod tests {
         }
         {
             let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
-            let mut wal_iterator = wal.wal_iterator(0).unwrap();
+            let mut wal_iterator = wal.wal_iterator_for_scan(0).unwrap();
             let p1 = assert_bytes(&[1, 2, 3], wal_iterator.next());
             let p2 = assert_bytes(&[], wal_iterator.next());
             let p3 = assert_bytes(&large, wal_iterator.next());
@@ -755,7 +804,7 @@ mod tests {
             kind: WalKind::Replay,
         };
         let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
-        let wal_writer = wal.wal_iterator(0).unwrap().into_writer(None);
+        let wal_writer = wal.wal_iterator_for_writer(0).unwrap().into_writer(None);
         let wal_writer = Arc::new(wal_writer);
         let threads = 8u64;
         let writes_per_thread = 256u64;
@@ -780,7 +829,7 @@ mod tests {
         drop(wal);
         println!("Phase 2");
         let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
-        let mut iterator = wal.wal_iterator(0).unwrap();
+        let mut iterator = wal.wal_iterator_for_scan(0).unwrap();
         while let Ok((_, value)) = iterator.next() {
             let value = u64::from_be_bytes(value[..].try_into().unwrap());
             if !all_writes.remove(&value) {
@@ -817,7 +866,7 @@ mod tests {
             kind: WalKind::Replay,
         };
         let wal = Wal::open(dir.path(), layout, Metrics::new()).unwrap();
-        let wal_iterator = wal.wal_iterator(0).unwrap();
+        let wal_iterator = wal.wal_iterator_for_writer(0).unwrap();
         let writer = wal_iterator.into_writer(None);
 
         // Write some data and get a guard
@@ -870,7 +919,7 @@ mod tests {
         // Write an entry into the WAL and extract just the position (not the guard)
         let position = {
             let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
-            let writer = wal.wal_iterator(0).unwrap().into_writer(None);
+            let writer = wal.wal_iterator_for_writer(0).unwrap().into_writer(None);
             writer
                 .write(&PreparedWalWrite::new(&vec![1, 2, 3]))
                 .unwrap()
@@ -902,7 +951,7 @@ mod tests {
             kind: WalKind::Replay,
         };
         let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
-        let writer = wal.wal_iterator(0).unwrap().into_writer(None);
+        let writer = wal.wal_iterator_for_writer(0).unwrap().into_writer(None);
         for i in 0..100 {
             let mut data = vec![0; 256];
             data[0] = i as u8;
@@ -925,7 +974,7 @@ mod tests {
         assert_eq!(wal_files.len(), 5);
 
         let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
-        let mut wal_iterator = wal.wal_iterator(0).unwrap();
+        let mut wal_iterator = wal.wal_iterator_for_scan(0).unwrap();
 
         for i in 0..100 {
             let (_, data) = wal_iterator.next().unwrap();
@@ -947,7 +996,7 @@ mod tests {
         };
 
         let wal = Arc::new(Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap());
-        let writer = wal.wal_iterator(0).unwrap().into_writer(None);
+        let writer = wal.wal_iterator_for_writer(0).unwrap().into_writer(None);
 
         // Use a seeded RNG for reproducibility
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);

@@ -249,12 +249,11 @@ pub(crate) fn register(engine: &mut Engine) {
             let mut payload_sizes: Vec<usize> = Vec::new();
 
             for offset in &valid_offsets {
-                let mut iter =
-                    index_wal
-                        .wal_iterator(*offset)
-                        .map_err(|e| -> Box<EvalAltResult> {
-                            format!("Failed to seek index WAL to {offset:#x}: {e:?}").into()
-                        })?;
+                let mut iter = index_wal.wal_iterator_for_scan(*offset).map_err(
+                    |e| -> Box<EvalAltResult> {
+                        format!("Failed to seek index WAL to {offset:#x}: {e:?}").into()
+                    },
+                )?;
 
                 match iter.next() {
                     Ok((_pos, raw_bytes)) => {

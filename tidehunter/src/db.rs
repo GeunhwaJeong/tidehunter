@@ -92,7 +92,7 @@ impl Db {
             indexes.as_ref(),
         );
         let contexts = KsContextVec::new(&key_shape, config.clone(), metrics.clone());
-        let wal_iterator = wal.wal_iterator(control_region.last_position())?;
+        let wal_iterator = wal.wal_iterator_for_writer(control_region.last_position())?;
         let wal_writer = crate::wal_replay::replay_wal(
             &contexts,
             &large_table,

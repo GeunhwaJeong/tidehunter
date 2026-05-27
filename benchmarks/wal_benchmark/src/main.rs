@@ -180,7 +180,7 @@ fn main() {
         let wal =
             Wal::open(&wal_path, wal_layout.clone(), metrics.clone()).expect("Failed to open WAL");
         let wal_writer = Arc::new(
-            wal.wal_iterator(0)
+            wal.wal_iterator_for_writer(0)
                 .expect("Failed to create WAL iterator")
                 .into_writer(None),
         );

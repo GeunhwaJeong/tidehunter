@@ -29,7 +29,7 @@ where
         .map_err(|e| -> Box<EvalAltResult> { format!("Failed to open WAL: {e:?}").into() })?;
 
     let mut iter = wal
-        .wal_iterator(start_pos)
+        .wal_iterator_for_scan(start_pos)
         .map_err(|e| -> Box<EvalAltResult> {
             format!("Failed to create WAL iterator: {e:?}").into()
         })?;
@@ -391,7 +391,7 @@ pub(crate) fn register(engine: &mut Engine) {
                 )?;
 
             let mut iter = index_wal
-                .wal_iterator(offset)
+                .wal_iterator_for_scan(offset)
                 .map_err(|e| -> Box<EvalAltResult> {
                     format!("Failed to create index WAL iterator at offset {offset}: {e:?}").into()
                 })?;
