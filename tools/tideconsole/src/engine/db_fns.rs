@@ -30,6 +30,19 @@ pub(crate) fn register(engine: &mut Engine) {
         },
     );
 
+    // --- db.ensure_open() ---
+    // require_db() triggers lazy WAL replay; this gives the user a clean no-op
+    // trigger without needing a dummy get whose key size may not match the
+    // keyspace's fixed key size.
+    engine.register_fn(
+        "ensure_open",
+        |h: &mut DbHandle| -> Result<(), Box<EvalAltResult>> {
+            h.require_db()?;
+            println!("db opened");
+            Ok(())
+        },
+    );
+
     // --- db.put(ks, key_hex, value_hex) ---
     engine.register_fn(
         "put",
@@ -120,6 +133,7 @@ pub(crate) fn register(engine: &mut Engine) {
         println!("Database methods (call as db.method(...)):");
         println!("  db.get(ks, key_hex)                  Look up a key; returns value hex or ()");
         println!("  db.exists(ks, key_hex)               Check if a key exists");
+        println!("  db.ensure_open()                     Open the DB and run WAL replay (no other side effect)");
         println!("  db.put(ks, key_hex, value_hex)       Write a key-value record");
         println!("  db.delete(ks, key_hex)               Delete a key");
         println!("  db.scan(ks, visitor)                 Iterate all live keys in a keyspace");
