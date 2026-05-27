@@ -382,6 +382,7 @@ impl RelocationDriver {
                 continue;
             }
             // For keyspaces without relocation filter, relocate entries
+            let batch_limit = db.config.relocation_batch_max_bytes();
             let mut batch =
                 RelocatedWriteBatch::new(cell.keyspace, cell.cell_id.clone(), target_position);
             let index = db
@@ -399,9 +400,19 @@ impl RelocationDriver {
                         .relocation_kept
                         .with_label_values(&[ks.name()])
                         .inc();
+                    if batch.size_bytes() >= batch_limit {
+                        db.write_relocated_batch(batch)?;
+                        batch = RelocatedWriteBatch::new(
+                            cell.keyspace,
+                            cell.cell_id.clone(),
+                            target_position,
+                        );
+                    }
                 }
             }
-            db.write_relocated_batch(batch)?;
+            if !batch.is_empty() {
+                db.write_relocated_batch(batch)?;
+            }
         }
         db.rebuild_control_region_from(target_position)?;
         db.wal_writer.gc(std::cmp::min(

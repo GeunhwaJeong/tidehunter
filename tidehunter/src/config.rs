@@ -46,6 +46,17 @@ pub struct Config {
     /// Maximum percentage of disk space that relocation can reclaim in a single run (0-100)
     #[serde(default = "default_relocation_max_reclaim_pct")]
     pub relocation_max_reclaim_pct: u8,
+    /// Maximum size (bytes) of an in-memory batch held during WAL-based relocation.
+    ///
+    /// Bounds memory consumed by the relocator thread while relocating data for a single
+    /// cell: once the batch reaches this size it is flushed and a fresh batch is started
+    /// for the remaining entries in the same cell. Higher values consume more memory but
+    /// result in fewer intermediate index rewrites; lower values cap peak memory at the
+    /// cost of extra flushes.
+    ///
+    /// `None` (default) resolves to `frag_size * 2`.
+    #[serde(default)]
+    pub relocation_batch_max_bytes: Option<usize>,
     /// Minimum live-byte occupancy (percent of `wal_file_size`) for an index WAL file to be
     /// kept as-is. Files below this threshold (excluding the most recently written file) get
     /// their cells force-relocated on the next snapshot, freeing the file for GC. 0 disables
@@ -128,6 +139,7 @@ impl Default for Config {
             wal_file_size: 10 * (1 << 30), // 10Gb
             relocation_strategy: RelocationStrategy::default(),
             relocation_max_reclaim_pct: default_relocation_max_reclaim_pct(),
+            relocation_batch_max_bytes: None,
             index_min_occupancy_pct: default_index_min_occupancy_pct(),
             metrics_enabled: true,
             commit_pool_size: 0,
@@ -157,6 +169,7 @@ impl Config {
             relocation_strategy: RelocationStrategy::default(),
             metrics_enabled: true,
             relocation_max_reclaim_pct: 100,
+            relocation_batch_max_bytes: None,
             index_min_occupancy_pct: default_index_min_occupancy_pct(),
             commit_pool_size: 0,
             num_pending_promotion_threads: default_num_pending_promotion_threads(),
@@ -225,6 +238,11 @@ impl Config {
 
     pub fn snapshot_written_bytes(&self) -> u64 {
         self.snapshot_written_bytes
+    }
+
+    pub fn relocation_batch_max_bytes(&self) -> usize {
+        self.relocation_batch_max_bytes
+            .unwrap_or(self.frag_size as usize * 2)
     }
 
     pub fn gen_dirty_keys_jitter(&self, rng: &mut impl Rng) -> usize {

@@ -623,6 +623,7 @@ impl Db {
             ks,
             cell_id,
             last_processed,
+            size_bytes: _,
         } = batch;
         let context = self.ks_context(ks);
 

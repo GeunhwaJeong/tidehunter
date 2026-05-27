@@ -58,6 +58,7 @@ impl PendingOp {
 pub(crate) struct RelocatedWriteBatch {
     pub(crate) prepared_writes: Vec<PreparedWalWrite>,
     pub(crate) keys: Vec<Bytes>,
+    pub(crate) size_bytes: usize,
     pub(crate) last_processed: u64,
     pub(crate) ks: KeySpace,
     pub(crate) cell_id: CellId,
@@ -144,6 +145,7 @@ impl RelocatedWriteBatch {
             last_processed,
             keys: Default::default(),
             prepared_writes: Default::default(),
+            size_bytes: 0,
             ks,
             cell_id,
         }
@@ -152,8 +154,13 @@ impl RelocatedWriteBatch {
     pub fn write(&mut self, key: Bytes, value: Bytes) {
         let write =
             PreparedWalWrite::new(&WalEntry::Record(self.ks, key.clone(), value.clone(), true));
+        self.size_bytes += write.len();
         self.prepared_writes.push(write);
         self.keys.push(key);
+    }
+
+    pub fn size_bytes(&self) -> usize {
+        self.size_bytes
     }
 
     pub fn is_empty(&self) -> bool {
