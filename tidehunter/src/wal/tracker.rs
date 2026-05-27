@@ -3,7 +3,7 @@ use super::position::LastProcessed;
 use crate::WalLayout;
 #[cfg(test)]
 use crate::latch::LatchGuard;
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, TimerExt};
 use crate::wal::allocator::AllocationResult;
 use crate::wal::mapper::WalMapper;
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
@@ -201,6 +201,7 @@ impl WalGuardMaker {
 impl WalTrackerThread {
     pub fn run(mut self) {
         for message in self.receiver {
+            let _timer = self.metrics.wal_tracker_time_mcs.clone().mcs_timer();
             #[allow(clippy::let_underscore_lock)]
             let _ = message.mutex.lock();
             let position = match message.kind {

@@ -271,7 +271,7 @@ impl WalMapperThread {
             self.make_map(map_id);
         }
         while let Ok(message) = self.receiver.recv() {
-            let timer = Instant::now();
+            let _timer = self.metrics.wal_mapper_time_mcs.clone().mcs_timer();
             match message {
                 WalMapperMessage::MapFinalized(map_to_sync_id) => {
                     let map_to_sync = self.maps.maps.get_mut(&map_to_sync_id);
@@ -299,9 +299,6 @@ impl WalMapperThread {
                     // dropping _cb to release receiver
                 }
             }
-            self.metrics
-                .wal_mapper_time_mcs
-                .inc_by(timer.elapsed().as_micros() as u64);
         }
     }
 

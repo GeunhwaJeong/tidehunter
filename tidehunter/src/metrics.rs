@@ -188,6 +188,7 @@ pub struct Metrics {
     pub db_op_mcs: MetricHistogramVec,
     pub map_time_mcs: MetricHistogram,
     pub wal_mapper_time_mcs: MetricIntCounter,
+    pub wal_tracker_time_mcs: MetricIntCounter,
     pub wal_unlinker_time_mcs: MetricIntCounterVec,
     /// Number of times the unlink worker's `Arc::try_unwrap` failed because a
     /// reader (or anything else) still held a clone of `Arc<File>`. One
@@ -406,6 +407,7 @@ impl Metrics {
             db_op_mcs: histogram_vec!("db_op", &["op", "ks"], db_op_buckets, registry, enabled),
             map_time_mcs: histogram!("map_time_mcs", lookup_buckets.clone(), registry, enabled),
             wal_mapper_time_mcs: counter!("wal_mapper_time_mcs", registry, enabled),
+            wal_tracker_time_mcs: counter!("wal_tracker_time_mcs", registry, enabled),
             wal_unlinker_time_mcs: counter_vec!(
                 "wal_unlinker_time_mcs",
                 &["kind"],
