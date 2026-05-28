@@ -13,6 +13,7 @@ pub struct WalSyncer {
 struct WalSyncerThread {
     receiver: mpsc::Receiver<SyncRequest>,
     metrics: Arc<Metrics>,
+    kind: &'static str,
 }
 
 struct SyncRequest {
@@ -21,9 +22,13 @@ struct SyncRequest {
 }
 
 impl WalSyncer {
-    pub fn start(metrics: Arc<Metrics>) -> Self {
+    pub fn start(metrics: Arc<Metrics>, kind: &'static str) -> Self {
         let (sender, receiver) = mpsc::channel();
-        let syncer_thread = WalSyncerThread { receiver, metrics };
+        let syncer_thread = WalSyncerThread {
+            receiver,
+            metrics,
+            kind,
+        };
         let jh = thread::Builder::new()
             .name("wal-syncer".to_string())
             .spawn(move || syncer_thread.run())
@@ -59,6 +64,7 @@ impl WalSyncerThread {
             // todo we can also monitor here number of dangling maps to make sure it does not happen
             self.metrics
                 .wal_synced_position
+                .with_label_values(&[self.kind])
                 .set(request.end_position as i64);
         }
     }

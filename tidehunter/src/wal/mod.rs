@@ -557,7 +557,7 @@ impl WalIterator {
 
         self.clear_fragment_from_position(position);
 
-        let syncer = WalSyncer::start(self.wal.metrics.clone());
+        let syncer = WalSyncer::start(self.wal.metrics.clone(), self.wal.layout.kind.name());
         self.wal.maps.store(Arc::new(self.maps));
         let mapper = WalMapper::start(
             self.wal.maps.clone(),

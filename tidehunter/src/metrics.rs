@@ -183,7 +183,7 @@ pub struct Metrics {
 
     pub large_table_contention: MetricHistogramVec,
     pub wal_write_wait: MetricIntCounter,
-    pub wal_synced_position: MetricIntGauge,
+    pub wal_synced_position: MetricIntGaugeVec,
     pub wal_last_processed_position: MetricIntGaugeVec,
     pub db_op_mcs: MetricHistogramVec,
     pub map_time_mcs: MetricHistogram,
@@ -402,7 +402,7 @@ impl Metrics {
                 enabled
             ),
             wal_write_wait: counter!("wal_write_wait", registry, enabled),
-            wal_synced_position: gauge!("wal_synced_position", registry, enabled),
+            wal_synced_position: gauge_vec!("wal_synced_position", &["kind"], registry, enabled),
             wal_last_processed_position: gauge_vec!(
                 "wal_last_processed_position",
                 &["kind"],
