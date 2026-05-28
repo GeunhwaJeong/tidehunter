@@ -228,6 +228,7 @@ impl WalTrackerThread {
                     .store(position.as_u64(), Ordering::SeqCst);
                 self.metrics
                     .wal_last_processed_position
+                    .with_label_values(&[self.layout.kind.name()])
                     .set(position.as_u64() as i64);
             }
         }
