@@ -202,6 +202,7 @@ pub struct Metrics {
     pub snapshot_force_unload: MetricIntCounterVec,
     pub snapshot_forced_relocation: MetricIntCounterVec,
     pub snapshot_written_bytes: MetricIntCounter,
+    pub relocation_written_bytes: MetricIntCounter,
     pub rebuild_control_region_time_mcs: MetricHistogram,
     pub large_table_init_mcs: MetricIntCounterVec,
 
@@ -458,6 +459,7 @@ impl Metrics {
                 enabled
             ),
             snapshot_written_bytes: counter!("snapshot_written_bytes", registry, enabled),
+            relocation_written_bytes: counter!("relocation_written_bytes", registry, enabled),
             rebuild_control_region_time_mcs: histogram!(
                 "rebuild_control_region_time_mcs",
                 rebuild_buckets,

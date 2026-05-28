@@ -623,10 +623,13 @@ impl Db {
             ks,
             cell_id,
             last_processed,
-            size_bytes: _,
+            size_bytes,
         } = batch;
         let context = self.ks_context(ks);
 
+        self.metrics
+            .relocation_written_bytes
+            .inc_by(size_bytes as u64);
         let positions = self.write_relocated_batch_into_wal(&prepared_writes)?;
         let mut updates = RelocationUpdates::new(last_processed);
         for (pos, key) in positions.into_iter().zip(keys.into_iter()) {
