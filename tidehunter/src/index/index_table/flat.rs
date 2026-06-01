@@ -19,12 +19,12 @@
 // The flat buffer is purely in-memory and never persisted.
 // ---------------------------------------------------------------------------
 
-use super::{IndexEntryKind, IndexWalPosition};
+use super::{IndexEntryKind, IndexWalPosition, data_latest_per_key};
 use crate::wal::position::{LastProcessed, WalPosition};
 use bytes::BytesMut;
 use minibytes::Bytes;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 // ---- Variable-length helpers (operate on the flat buffer directly) --------
 
@@ -385,30 +385,29 @@ impl<'a> Iterator for FlatIter<'a> {
 // Merge writer (flat + BTreeMap → new flat) used by `promote_to_flat`
 // ---------------------------------------------------------------------------
 
-/// Walk the merge of `flat` (decoded via `FlatIter`) with the sorted `btree`,
-/// invoking `f` once per emitted entry in sorted-key order. BTreeMap entries
-/// override flat entries when the keys are equal.
+/// Walk the merge of `flat` (decoded via `FlatIter`) with the sorted `data`
+/// set, invoking `f` once per emitted entry in sorted-key order. Data
+/// entries override flat entries when the keys are equal.
 ///
-/// BTreeMap entries whose WAL offset is at or above `last_processed` are
-/// **skipped** (and on equal keys the existing flat entry is kept instead) —
-/// this preserves the "flat contains only processed entries" invariant that
-/// callers rely on. Pass `LastProcessed::new(u64::MAX)` to merge everything.
+/// For each key, `data` may carry multiple positions — only the *latest*
+/// (largest IWP) participates in the merge. If that latest is unprocessed
+/// (offset >= last_processed), the entire key is skipped (and any matching
+/// flat entry is kept as-is). Pass `LastProcessed::new(u64::MAX)` to merge
+/// everything.
 fn merge_walk(
     flat: &[u8],
     key_size: Option<usize>,
-    btree: &BTreeMap<Bytes, IndexWalPosition>,
+    data: &BTreeSet<(Bytes, IndexWalPosition)>,
     last_processed: LastProcessed,
     mut f: impl FnMut(&[u8], IndexWalPosition),
 ) {
     let mut flat_iter = FlatIter::new(flat, key_size);
-    let mut btree_iter = btree
-        .iter()
-        .filter(|(_, v)| last_processed.is_processed(*v));
+    let mut data_iter = data_latest_per_key(data).filter(|(_, v)| last_processed.is_processed(*v));
     let mut flat_cur = flat_iter.next();
-    let mut btree_cur = btree_iter.next();
+    let mut data_cur = data_iter.next();
 
     loop {
-        let order = match (&flat_cur, &btree_cur) {
+        let order = match (&flat_cur, &data_cur) {
             (None, None) => break,
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
@@ -421,28 +420,28 @@ fn merge_walk(
                 flat_cur = flat_iter.next();
             }
             Ordering::Greater => {
-                let (bk, biwp) = btree_cur.take().unwrap();
+                let (bk, biwp) = data_cur.take().unwrap();
                 f(bk.as_ref(), *biwp);
-                btree_cur = btree_iter.next();
+                data_cur = data_iter.next();
             }
             Ordering::Equal => {
-                // BTreeMap entry overrides flat entry on equal keys.
+                // Data entry overrides flat entry on equal keys.
                 flat_cur = flat_iter.next();
-                let (bk, biwp) = btree_cur.take().unwrap();
+                let (bk, biwp) = data_cur.take().unwrap();
                 f(bk.as_ref(), *biwp);
-                btree_cur = btree_iter.next();
+                data_cur = data_iter.next();
             }
         }
     }
 }
 
-/// Merge `flat` and `btree` into a new flat buffer with a single allocation.
+/// Merge `flat` and `data` into a new flat buffer with a single allocation.
 ///
-/// `last_processed` filters the BTreeMap side: only entries with WAL offset
-/// strictly below `last_processed` are promoted into the new flat. Unprocessed
-/// BTreeMap entries are skipped, including on equal-key overlaps with flat
-/// (the existing flat entry is kept). Pass `LastProcessed::new(u64::MAX)` to
-/// merge everything.
+/// `last_processed` filters the data side: for each key, only the *latest*
+/// position participates and only if its WAL offset is strictly below
+/// `last_processed`. Keys whose latest position is unprocessed are skipped
+/// entirely (the existing flat entry, if any, is kept). Pass
+/// `LastProcessed::new(u64::MAX)` to merge everything.
 ///
 /// Two passes over the merge:
 ///  1. Sizing: count emitted entries (and total key bytes for var-len) and
@@ -453,13 +452,13 @@ fn merge_walk(
 pub(super) fn merge_into_flat(
     flat: &[u8],
     key_size: Option<usize>,
-    btree: &BTreeMap<Bytes, IndexWalPosition>,
+    data: &BTreeSet<(Bytes, IndexWalPosition)>,
     last_processed: LastProcessed,
 ) -> (Bytes, usize) {
     let mut entry_count: usize = 0;
     let mut total_key_bytes: usize = 0;
     let mut dirty_count: usize = 0;
-    merge_walk(flat, key_size, btree, last_processed, |key, iwp| {
+    merge_walk(flat, key_size, data, last_processed, |key, iwp| {
         entry_count += 1;
         total_key_bytes += key.len();
         if !iwp.is_clean() {
@@ -477,7 +476,7 @@ pub(super) fn merge_into_flat(
             let elem_size = ks + WalPosition::LENGTH;
             let total_size = entry_count * elem_size;
             let mut out = BytesMut::with_capacity(total_size);
-            merge_walk(flat, key_size, btree, last_processed, |key, iwp| {
+            merge_walk(flat, key_size, data, last_processed, |key, iwp| {
                 debug_assert_eq!(key.len(), ks, "key length mismatch in fixed flat");
                 out.extend_from_slice(key);
                 out.extend_from_slice(&iwp.offset.to_be_bytes());
@@ -499,7 +498,7 @@ pub(super) fn merge_into_flat(
             out.resize(offsets_start + 4 * entry_count, 0);
             let data_start = out.len();
             let mut i: usize = 0;
-            merge_walk(flat, key_size, btree, last_processed, |key, iwp| {
+            merge_walk(flat, key_size, data, last_processed, |key, iwp| {
                 let entry_offset: u32 = (out.len() - data_start)
                     .try_into()
                     .expect("flat buffer exceeds u32 offset range");
