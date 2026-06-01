@@ -24,7 +24,9 @@ use std::ops::Bound;
 #[doc(hidden)]
 pub struct IndexTable {
     /// Write buffer: new entries land here before the next `promote_to_flat` call.
-    /// After `promote_to_flat` this is always empty.
+    /// `promote_to_flat` drains only entries whose WAL offset is below the
+    /// supplied `last_processed`; unprocessed (in-flight) entries remain here
+    /// until a later promote observes a high enough `last_processed`.
     data: BTreeMap<Bytes, IndexWalPosition>,
     /// Sum of all key lengths currently in `data`. Maintained incrementally.
     key_bytes: usize,
@@ -44,6 +46,21 @@ pub struct IndexTable {
     ///
     /// Stores Clean, Modified, and Removed entries. Entries in `data` (the write
     /// buffer) take priority over entries in `flat` for the same key.
+    ///
+    /// **Invariant (set by `promote_to_flat`):** every entry written here has WAL
+    /// `offset` strictly below the `last_processed` threshold passed to the
+    /// promote that introduced it. Because `last_processed` is monotonically
+    /// non-decreasing, this is the property `has_unprocessed` and
+    /// `retain_unprocessed` rely on to treat flat as fully processed against any
+    /// later caller-supplied `last_processed`.
+    ///
+    /// Disk-loaded flat is the one exception: a flushed-to-disk blob can carry
+    /// in-flight (unprocessed) entries from its snapshot. `maybe_load` →
+    /// `merge_dirty_no_clean` (see `mod.rs:165`) compensates by re-inserting
+    /// every prior in-memory entry — including the contents of the old
+    /// `flat` — into the *new* `data` BTreeMap, so any unprocessed entry from
+    /// disk-loaded flat is also reachable via `data` and the
+    /// `has_unprocessed`/`retain_unprocessed` contract still holds.
     flat: Bytes,
     /// Fixed key size for this key space, or `None` for variable-length keys.
     /// Determines which flat format is used.
@@ -471,8 +488,11 @@ impl IndexTable {
     }
 
     pub fn len(&self) -> usize {
-        // Note: may slightly overcount when BTreeMap has entries that also exist in flat,
-        // but the error window is small (only during period between promote_to_flat calls).
+        // Note: may overcount when a key is present in both flat and data. With
+        // the `promote_to_flat` invariant this happens whenever a still-unprocessed
+        // BTreeMap write shadows an existing flat entry for the same key — the
+        // overlap persists until the BTreeMap side becomes processed and a later
+        // promote folds it into flat (or until the entry is removed).
         self.flat_len() + self.data.len()
     }
 
@@ -962,36 +982,29 @@ impl IndexTable {
     }
 
     /// Retain only unprocessed entries (those with WAL offset >= last_processed).
-    /// Walks both the BTreeMap write buffer and the flat buffer; processed entries
-    /// are dropped from either side.
     ///
-    /// We cannot clear `self.flat` unconditionally: `promote_flat_job` can move
-    /// still-pending writes from the BTreeMap into flat between the flush
-    /// snapshot capture and this callback. Those entries' WAL offsets exceed
-    /// `last_processed` and must survive — the new on-disk blob written by the
-    /// flusher does not contain them (it was built from the snapshot, which
-    /// observed them in the BTreeMap, but `clean_self` / compactor passes can
-    /// drop them on the way to disk if the keys appear deleted at snapshot
-    /// time). Dropping them here as well would leave a window where neither
-    /// the on-disk index nor the in-memory overlay holds the durable WAL
-    /// entry — observed in production as a dirty-overlay loss after a clean
-    /// flush completion.
+    /// Callers (`clear_after_flush`) pass a `last_processed` value at or above
+    /// every threshold ever used by `promote_to_flat` on this entry, so by
+    /// invariant every flat entry is processed and `flat` is cleared
+    /// unconditionally. The BTreeMap still holds entries on both sides of the
+    /// boundary and is filtered.
     pub fn retain_unprocessed(&mut self, last_processed: LastProcessed) {
-        self.retain_flat(|_, iwp| {
-            if last_processed.is_processed(&iwp) {
-                None
-            } else {
-                Some(iwp)
-            }
-        });
+        self.flat = Bytes::default();
         self.retain(|_, v| !last_processed.is_processed(v));
-        // retain_flat doesn't track dirty_count; recompute.
+        // `retain` only tracks BTreeMap dirty deltas — the flat dirty contribution
+        // we just dropped is folded into a fresh recount.
         self.dirty_count = self.count_dirty_slow();
     }
 
     /// Returns true if this index table has any unprocessed entries.
-    /// Only the BTreeMap (write buffer) needs to be checked: flat entries are always
-    /// at or below last_processed when this is called (promote runs before capture).
+    ///
+    /// Only the BTreeMap (write buffer) needs to be checked. By the
+    /// `promote_to_flat` invariant every flat entry has WAL offset below the
+    /// threshold observed at its most recent promote, and the caller always
+    /// passes a `last_processed` at or above that threshold (it is either the
+    /// `pending_last_processed` that bounded the promote, or the current
+    /// loader position which is monotonically larger). So flat is guaranteed
+    /// fully processed and contributes no unprocessed entries.
     pub fn has_unprocessed(&self, last_processed: LastProcessed) -> bool {
         self.data
             .iter()
@@ -1108,39 +1121,72 @@ impl IndexTable {
         self.flat.len()
     }
 
-    /// Move ALL entries from the BTreeMap (write buffer) into the flat array, merging
-    /// with any existing flat content. BTreeMap is empty after this call.
-    /// BTreeMap entries override flat entries for the same key.
+    /// Promote BTreeMap entries below `last_processed` into the flat array,
+    /// merging with any existing flat content. Entries at or above
+    /// `last_processed` are unprocessed (still in flight in the WAL) and remain
+    /// in the BTreeMap. BTreeMap entries override flat entries for the same key.
+    ///
+    /// This is the only path that grows `flat`, so it establishes the invariant
+    /// that **every flat entry has WAL offset < the `last_processed` snapshot
+    /// observed at its most recent promote**. Callers downstream (`has_unprocessed`,
+    /// `retain_unprocessed`, `clean_self` tombstone stripping) rely on this:
+    /// because `last_processed` is monotonically non-decreasing, any later call
+    /// observing a `LastProcessed` value L sees all flat entries as processed
+    /// (offset < L).
+    ///
+    /// Pass `LastProcessed::new(u64::MAX)` to promote unconditionally (used by
+    /// the test-only `promote_to_flat_force`).
     #[cfg(not(test))]
     const PROMOTE_THRESHOLD: usize = 128;
     #[cfg(test)]
     const PROMOTE_THRESHOLD: usize = 0;
 
     /// Returns `true` if the flat buffer was updated, `false` if nothing changed.
-    pub fn promote_to_flat(&mut self) -> bool {
-        self.promote_to_flat_inner(Self::PROMOTE_THRESHOLD)
+    pub fn promote_to_flat(&mut self, last_processed: LastProcessed) -> bool {
+        self.promote_to_flat_inner(Self::PROMOTE_THRESHOLD, last_processed)
     }
 
-    /// Test-only variant that bypasses `PROMOTE_THRESHOLD`. Lets concurrent tests
-    /// reliably open the `insert → promote → remove → FlushLoaded` window that
-    /// triggers the `clean_self` stale-record bug, without needing 128+ keys per
-    /// cell.
+    /// Test-only variant that bypasses `PROMOTE_THRESHOLD` but still respects
+    /// the `last_processed` filter — the threshold check is the only
+    /// difference from `promote_to_flat`. Lets concurrent tests reliably open
+    /// the `insert → promote → remove → FlushLoaded` window without needing
+    /// 128+ keys per cell, while exercising the same partition behavior
+    /// `promote_flat_job` uses in production. Callers must capture
+    /// `last_processed` the same way prod does (see `promote_flat_job`).
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn promote_to_flat_force(&mut self) -> bool {
-        self.promote_to_flat_inner(0)
+    pub fn promote_to_flat_force(&mut self, last_processed: LastProcessed) -> bool {
+        self.promote_to_flat_inner(0, last_processed)
     }
 
-    fn promote_to_flat_inner(&mut self, threshold: usize) -> bool {
+    fn promote_to_flat_inner(&mut self, threshold: usize, last_processed: LastProcessed) -> bool {
+        // O(1) cap on entry: if the whole BTreeMap is under the threshold there
+        // is nothing meaningful to drain. If it isn't but every entry happens
+        // to be unprocessed, the merge below is a no-op (rare; not worth a
+        // separate scan to detect).
         if self.data.len() <= threshold {
             return false;
         }
 
-        let (new_flat, dirty_count) = merge_into_flat(&self.flat, self.key_size, &self.data);
+        let (new_flat, flat_dirty) =
+            merge_into_flat(&self.flat, self.key_size, &self.data, last_processed);
 
         self.flat = new_flat;
-        self.dirty_count = dirty_count;
-        self.key_bytes = 0;
-        self.data.clear();
+        // Retain only unprocessed entries; processed ones now live in flat.
+        let mut remaining_key_bytes: usize = 0;
+        let mut remaining_dirty: usize = 0;
+        self.data.retain(|k, v| {
+            if last_processed.is_processed(v) {
+                false
+            } else {
+                remaining_key_bytes += k.len();
+                if !v.is_clean() {
+                    remaining_dirty += 1;
+                }
+                true
+            }
+        });
+        self.key_bytes = remaining_key_bytes;
+        self.dirty_count = flat_dirty + remaining_dirty;
         true
     }
 
@@ -1492,27 +1538,74 @@ mod tests {
     }
 
     #[test]
-    fn test_retain_unprocessed_preserves_flat_unprocessed() {
-        // Regression: `promote_flat_job` can move a still-pending write from
-        // BTreeMap into flat between flush snapshot and `update_flushed_index`.
-        // `retain_unprocessed` must walk flat (not clear it unconditionally),
-        // otherwise the unprocessed entry is lost from in-memory state.
+    fn test_promote_to_flat_retains_unprocessed() {
+        // Invariant: `promote_to_flat` only drains entries strictly below
+        // `last_processed`; unprocessed entries stay in the BTreeMap so that
+        // `clear_after_flush` (which assumes flat is fully processed) does not
+        // observe them in flat. Without this the previously-fixed dirty-overlay
+        // loss can resurface.
         let mut index = IndexTable::default();
         index.insert(vec![1].into(), WalPosition::test_value(100));
         index.insert(vec![2].into(), WalPosition::test_value(200));
         index.insert(vec![3].into(), WalPosition::test_value(500));
 
-        // Simulate `promote_flat_job` moving BTreeMap → flat.
-        index.promote_to_flat_force();
-        assert!(index.data_btree_is_empty());
-        assert_eq!(index.len(), 3);
+        // last_processed = 300: 100 and 200 are processed and promote into
+        // flat; 500 is unprocessed and stays in the BTreeMap.
+        index.promote_to_flat(LastProcessed::new(300));
 
-        // last_processed = 300: positions 100, 200 are processed; 500 is not.
+        assert_eq!(index.flat_len(), 2);
+        assert_eq!(index.data.len(), 1);
+        assert_eq!(
+            index.data.get(&Bytes::from(vec![3])).map(|v| v.offset),
+            Some(500)
+        );
+
+        // Retaining unprocessed against the same threshold clears flat
+        // (everything in it is processed) and keeps the BTreeMap entry.
         index.retain_unprocessed(LastProcessed::new(300));
-
-        assert!(index.get(&[1]).is_none());
-        assert!(index.get(&[2]).is_none());
+        assert!(index.flat.is_empty());
+        assert_eq!(index.get(&[1]), None);
+        assert_eq!(index.get(&[2]), None);
         assert_eq!(index.get(&[3]), Some(WalPosition::test_value(500)));
+    }
+
+    #[test]
+    fn test_promote_to_flat_equal_key_unprocessed_keeps_flat() {
+        // Coverage for `merge_walk`'s Equal-key handling under the filter: an
+        // unprocessed BTreeMap write that shadows an existing flat entry must
+        // (1) be skipped from the merge (the unprocessed value cannot be
+        // promoted) and (2) leave the existing flat entry in place. The
+        // BTreeMap entry stays as the in-memory shadow and read priority.
+        let mut index = IndexTable::default();
+        index.insert(vec![7].into(), WalPosition::test_value(100));
+        // First promote: K@100 lands in flat.
+        index.promote_to_flat(LastProcessed::new(200));
+        assert_eq!(index.flat_len(), 1);
+        assert!(index.data.is_empty());
+
+        // Overwrite K with an unprocessed position (offset 500 > threshold 300).
+        index.insert(vec![7].into(), WalPosition::test_value(500));
+        assert_eq!(index.data.len(), 1);
+
+        // Second promote with threshold 300: K@500 is unprocessed, so the merge
+        // skips it and the existing flat K@100 stays put. K@500 remains in the
+        // BTreeMap.
+        index.promote_to_flat(LastProcessed::new(300));
+        assert_eq!(index.flat_len(), 1);
+        assert_eq!(index.data.len(), 1);
+        assert_eq!(
+            index.data.get(&Bytes::from(vec![7])).map(|v| v.offset),
+            Some(500)
+        );
+        // Read returns the BTreeMap value (newer write shadows flat).
+        assert_eq!(index.get(&[7]), Some(WalPosition::test_value(500)));
+
+        // Once last_processed catches up past 500, a follow-up promote folds
+        // K@500 into flat, overwriting the stale K@100 entry.
+        index.promote_to_flat(LastProcessed::new(600));
+        assert_eq!(index.flat_len(), 1);
+        assert!(index.data.is_empty());
+        assert_eq!(index.get(&[7]), Some(WalPosition::test_value(500)));
     }
 
     #[test]
@@ -1620,7 +1713,7 @@ mod tests {
             .values_mut()
             .for_each(|v| *v = v.as_clean_modified());
 
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
 
         // BTreeMap should be empty after promotion.
         assert!(table.data.is_empty());
@@ -1643,7 +1736,7 @@ mod tests {
             .values_mut()
             .for_each(|v| *v = v.as_clean_modified());
         // First promotion: flat gets [1, 2].
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
 
         // Now remove key [1] (goes to BTreeMap as Removed).
         table.remove(vec![1].into(), WalPosition::test_value(10));
@@ -1658,7 +1751,7 @@ mod tests {
         });
 
         // Second promotion: flat has [1]=Removed, [2]=Clean, [3]=Clean — all 3 entries.
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         assert_eq!(table.flat_len(), 3);
         assert_eq!(table.get(&[1]), Some(WalPosition::INVALID)); // Removed → INVALID
         assert_eq!(table.get(&[2]), Some(WalPosition::test_value(2)));
@@ -1675,7 +1768,7 @@ mod tests {
             .data
             .values_mut()
             .for_each(|v| *v = v.as_clean_modified());
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
 
         // Forward traversal after promotion.
         let next = table.next_entry(Some(vec![1, 2, 3, 7].into()), false);
@@ -1712,7 +1805,7 @@ mod tests {
             .for_each(|v| *v = v.as_clean_modified());
 
         table.key_size = Some(4);
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
 
         assert!(table.data.is_empty());
         assert_eq!(table.flat_len(), 3);
@@ -1736,7 +1829,7 @@ mod tests {
             .values_mut()
             .for_each(|v| *v = v.as_clean_modified());
         table.key_size = Some(4);
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
 
         // Forward from k4(10) → k4(20)
         let next = table.next_entry(Some(k4(10)), false).unwrap();
@@ -1769,7 +1862,7 @@ mod tests {
             .values_mut()
             .for_each(|v| *v = v.as_clean_modified());
         table.key_size = Some(4);
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         assert_eq!(table.flat_len(), 2);
 
         // Remove k4(10); tombstone stays in BTreeMap.
@@ -1784,7 +1877,7 @@ mod tests {
             }
         });
         table.key_size = Some(4);
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
 
         // flat: [10]=Removed, [20]=Clean, [30]=Clean — Removed entry stays in flat.
         assert_eq!(table.flat_len(), 3);
@@ -1811,7 +1904,7 @@ mod tests {
         // All entries are Modified (not yet flushed).
         assert_eq!(table.dirty_count(), 3);
 
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
 
         // BTreeMap should be completely empty: all entries moved to flat.
         assert!(table.data.is_empty());
@@ -1849,7 +1942,7 @@ mod tests {
             .entry(vec![3].into())
             .and_modify(|v| *v = v.as_clean_modified());
 
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
 
         assert!(table.data.is_empty());
         assert_eq!(table.flat_len(), 3);
@@ -1867,7 +1960,7 @@ mod tests {
         // matching flat entry, otherwise clean_self leaks a stale record.
         let mut table = IndexTable::default();
         table.insert(vec![1].into(), WalPosition::test_value(1));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         // flat: [1]=Modified, data: empty
         assert_eq!(table.flat_len(), 1);
 
@@ -1889,7 +1982,7 @@ mod tests {
         table.insert(vec![1].into(), WalPosition::test_value(1));
         table.insert(vec![2].into(), WalPosition::test_value(2));
         // First promotion with Modified entries.
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         assert_eq!(table.flat_len(), 2);
         assert_eq!(table.dirty_count(), 2);
 
@@ -1899,7 +1992,7 @@ mod tests {
         // dirty_count: 2 (flat Modified) + 1 (Removed) + 1 (new Modified) = 4
         assert_eq!(table.dirty_count(), 4);
 
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         // flat: [1]=Removed, [2]=Modified, [3]=Modified — Removed entry stays in flat.
         assert_eq!(table.flat_len(), 3);
         assert_eq!(table.dirty_count(), 3);
@@ -1917,7 +2010,7 @@ mod tests {
         let mut table = IndexTable::default();
         table.insert(vec![1].into(), WalPosition::test_value(1));
         table.insert(vec![2].into(), WalPosition::test_value(2));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         // New entry added after promote stays in BTreeMap.
         table.insert(vec![3].into(), WalPosition::test_value(3));
 
@@ -1933,7 +2026,7 @@ mod tests {
         let mut table = IndexTable::default();
         table.insert(vec![1].into(), WalPosition::test_value(10));
         table.insert(vec![3].into(), WalPosition::test_value(30));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         // New entry between existing flat entries.
         table.insert(vec![2].into(), WalPosition::test_value(20));
         // Delete a flat entry via BTreeMap tombstone.
@@ -1957,7 +2050,7 @@ mod tests {
         let mut table = IndexTable::default();
         table.insert(vec![1].into(), WalPosition::test_value(10));
         table.insert(vec![3].into(), WalPosition::test_value(30));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         table.insert(vec![2].into(), WalPosition::test_value(20));
         table.remove(vec![3].into(), WalPosition::test_value(35));
 
@@ -1974,7 +2067,7 @@ mod tests {
             .data
             .values_mut()
             .for_each(|v| *v = v.as_clean_modified());
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         // New entry after promote (in BTreeMap).
         table.insert(vec![2].into(), WalPosition::test_value(20));
 
@@ -2044,7 +2137,7 @@ mod tests {
             .data
             .values_mut()
             .for_each(|v| *v = v.as_clean_modified());
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         // [2] and [4] stay in BTreeMap.
         table.insert(vec![2].into(), WalPosition::test_value(20));
         table.insert(vec![4].into(), WalPosition::test_value(40));
@@ -2092,7 +2185,7 @@ mod tests {
         let mut dirty = IndexTable::default();
         dirty.insert(vec![2].into(), WalPosition::test_value(25));
         dirty.insert(vec![3].into(), WalPosition::test_value(35));
-        dirty.promote_to_flat();
+        dirty.promote_to_flat(LastProcessed::new(u64::MAX));
 
         self_table.merge_dirty_and_clean(&dirty);
 
@@ -2167,7 +2260,7 @@ mod tests {
         let mut dirty = IndexTable::default();
         dirty.insert(vec![2].into(), WalPosition::test_value(20));
         dirty.insert(vec![3].into(), WalPosition::test_value(30));
-        dirty.promote_to_flat();
+        dirty.promote_to_flat(LastProcessed::new(u64::MAX));
 
         self_table.merge_dirty_no_clean(&dirty);
 
@@ -2183,7 +2276,7 @@ mod tests {
         original.insert(vec![1].into(), WalPosition::test_value(2));
         original.insert(vec![2].into(), WalPosition::test_value(3));
         original.insert(vec![3].into(), WalPosition::test_value(4));
-        original.promote_to_flat();
+        original.promote_to_flat(LastProcessed::new(u64::MAX));
 
         // current: clone of original, plus new entries [4, 5] in BTreeMap.
         let mut current = original.clone();
@@ -2217,7 +2310,7 @@ mod tests {
         // current was cloned from original, then promoted (simulating promote_flat_job),
         // then accepted a new write after promotion.
         let mut current = original.clone();
-        current.promote_to_flat();
+        current.promote_to_flat(LastProcessed::new(u64::MAX));
         assert!(current.data.is_empty());
         assert!(!current.flat.is_empty());
         current.insert(vec![4].into(), WalPosition::test_value(5));
@@ -2246,7 +2339,7 @@ mod tests {
         original.insert(vec![2].into(), WalPosition::test_value(3));
 
         let mut current = original.clone();
-        current.promote_to_flat();
+        current.promote_to_flat(LastProcessed::new(u64::MAX));
         // Overwrite key [1] with a newer position in self.data.
         current.insert(vec![1].into(), WalPosition::test_value(10));
 
@@ -2291,7 +2384,7 @@ mod tests {
             (vec![9].into(), iwp_modified(3)),
         ]);
 
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
         assert_eq!(dirty, 2);
         let entries = decode_flat(&new_flat, None);
         assert_eq!(
@@ -2315,11 +2408,11 @@ mod tests {
         table.insert(vec![1].into(), WalPosition::test_value(1));
         table.insert(vec![2].into(), WalPosition::test_value(2));
         table.insert(vec![3].into(), WalPosition::test_value(3));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
         let btree: BTreeMap<Bytes, IndexWalPosition> = BTreeMap::new();
 
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
         // All three flat entries are Modified.
         assert_eq!(dirty, 3);
         // Output equals input bytes (same entries, same order, same encoding).
@@ -2332,7 +2425,7 @@ mod tests {
         let mut table = IndexTable::default();
         table.insert(vec![1].into(), WalPosition::test_value(1));
         table.insert(vec![3].into(), WalPosition::test_value(3));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
 
         // btree: [1]=Modified@10 (overrides flat), [2]=Modified@2 (new)
@@ -2341,7 +2434,7 @@ mod tests {
             (vec![2].into(), iwp_modified(2)),
         ]);
 
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
         // 3 emitted entries, all dirty (Modified).
         assert_eq!(dirty, 3);
         let entries = decode_flat(&new_flat, None);
@@ -2366,7 +2459,7 @@ mod tests {
         table.insert(vec![1].into(), WalPosition::test_value(1));
         table.insert(vec![4].into(), WalPosition::test_value(4));
         table.insert(vec![7].into(), WalPosition::test_value(7));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
 
         let btree: BTreeMap<Bytes, IndexWalPosition> = BTreeMap::from_iter([
@@ -2375,7 +2468,7 @@ mod tests {
             (vec![8].into(), iwp_clean(8)),
         ]);
 
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
         // 3 flat dirty (Modified) + 0 btree dirty (Clean) = 3.
         assert_eq!(dirty, 3);
         let keys: Vec<Vec<u8>> = decode_flat(&new_flat, None)
@@ -2394,12 +2487,12 @@ mod tests {
         let mut table = IndexTable::default();
         table.insert(vec![1].into(), WalPosition::test_value(1));
         table.insert(vec![2].into(), WalPosition::test_value(2));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
         let btree: BTreeMap<Bytes, IndexWalPosition> =
             BTreeMap::from_iter([(vec![1].into(), iwp_removed(10))]);
 
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
         // Modified [2] from flat + Removed [1] from btree = 2 dirty.
         assert_eq!(dirty, 2);
         let entries = decode_flat(&new_flat, None);
@@ -2420,9 +2513,9 @@ mod tests {
         let mut table = IndexTable::default();
         table.insert(vec![1].into(), WalPosition::test_value(1));
         table.insert(vec![2].into(), WalPosition::test_value(2));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         table.remove(vec![1].into(), WalPosition::test_value(10));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         // flat now has [1]=Removed, [2]=Modified.
         let flat = table.flat.clone();
         // Sanity: flat really has the tombstone encoded.
@@ -2431,7 +2524,8 @@ mod tests {
         assert_eq!(pre[0].1.kind, IndexEntryKind::Removed);
 
         // Merge with empty btree — Removed must round-trip unchanged.
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &BTreeMap::new());
+        let (new_flat, dirty) =
+            merge_into_flat(&flat, None, &BTreeMap::new(), LastProcessed::new(u64::MAX));
         assert_eq!(dirty, 2); // Modified + Removed both dirty.
         let entries = decode_flat(&new_flat, None);
         assert_eq!(entries.len(), 2);
@@ -2449,14 +2543,14 @@ mod tests {
         // btree wins, the resulting entry must be Modified, not Removed.
         let mut table = IndexTable::default();
         table.insert(vec![1].into(), WalPosition::test_value(1));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         table.remove(vec![1].into(), WalPosition::test_value(10));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
 
         let btree: BTreeMap<Bytes, IndexWalPosition> =
             BTreeMap::from_iter([(vec![1].into(), iwp_modified(20))]);
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
         assert_eq!(dirty, 1);
         let entries = decode_flat(&new_flat, None);
         assert_eq!(entries.len(), 1);
@@ -2471,12 +2565,17 @@ mod tests {
         table.insert(k4(10), WalPosition::test_value(1));
         table.insert(k4(20), WalPosition::test_value(2));
         table.key_size = Some(4);
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         table.remove(k4(10), WalPosition::test_value(50));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
 
-        let (new_flat, dirty) = merge_into_flat(&flat, Some(4), &BTreeMap::new());
+        let (new_flat, dirty) = merge_into_flat(
+            &flat,
+            Some(4),
+            &BTreeMap::new(),
+            LastProcessed::new(u64::MAX),
+        );
         assert_eq!(dirty, 2);
         let entries = decode_flat(&new_flat, Some(4));
         assert_eq!(entries.len(), 2);
@@ -2492,7 +2591,7 @@ mod tests {
     fn test_merge_into_flat_empty_inputs() {
         let flat = Bytes::default();
         let btree: BTreeMap<Bytes, IndexWalPosition> = BTreeMap::new();
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
         assert!(new_flat.is_empty());
         assert_eq!(dirty, 0);
     }
@@ -2508,14 +2607,15 @@ mod tests {
             .values_mut()
             .for_each(|v| *v = v.as_clean_modified());
         table.key_size = Some(4);
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
 
         // btree overrides k4(10), inserts k4(20).
         let btree: BTreeMap<Bytes, IndexWalPosition> =
             BTreeMap::from_iter([(k4(10), iwp_modified(100)), (k4(20), iwp_modified(20))]);
 
-        let (new_flat, dirty) = merge_into_flat(&flat, Some(4), &btree);
+        let (new_flat, dirty) =
+            merge_into_flat(&flat, Some(4), &btree, LastProcessed::new(u64::MAX));
         // 2 btree Modified + 0 flat dirty (clean) = 2.
         assert_eq!(dirty, 2);
         let entries = decode_flat(&new_flat, Some(4));
@@ -2540,7 +2640,8 @@ mod tests {
             (k4(3), iwp_removed(3)),
         ]);
 
-        let (new_flat, dirty) = merge_into_flat(&flat, Some(4), &btree);
+        let (new_flat, dirty) =
+            merge_into_flat(&flat, Some(4), &btree, LastProcessed::new(u64::MAX));
         // Modified + Removed = 2 dirty (Clean is not dirty).
         assert_eq!(dirty, 2);
         let entries = decode_flat(&new_flat, Some(4));
@@ -2557,10 +2658,15 @@ mod tests {
         table.insert(k4(10), WalPosition::test_value(10));
         table.insert(k4(20), WalPosition::test_value(20));
         table.key_size = Some(4);
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
 
-        let (new_flat, dirty) = merge_into_flat(&flat, Some(4), &BTreeMap::new());
+        let (new_flat, dirty) = merge_into_flat(
+            &flat,
+            Some(4),
+            &BTreeMap::new(),
+            LastProcessed::new(u64::MAX),
+        );
         // Both flat entries are Modified.
         assert_eq!(dirty, 2);
         // Byte-identical: same entries, same order.
@@ -2580,7 +2686,7 @@ mod tests {
             .entry(vec![1].into())
             .and_modify(|v| *v = v.as_clean_modified());
         table.data.insert(vec![3].into(), iwp_removed(3));
-        table.promote_to_flat();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
         // flat now: [1]=Clean, [2]=Modified, [3]=Removed.
         let flat = table.flat.clone();
 
@@ -2590,7 +2696,7 @@ mod tests {
             (vec![4].into(), iwp_clean(4)),
         ]);
 
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree);
+        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
         // Emitted: [1]=Clean, [2]=Modified(btree-overrides), [3]=Removed, [4]=Clean.
         // Dirty: Modified + Removed = 2.
         assert_eq!(dirty, 2);
@@ -2614,7 +2720,7 @@ mod tests {
             (vec![7, 8, 9, 10, 11].into(), iwp_modified(4)),
         ]);
 
-        let (new_flat, _) = merge_into_flat(&flat, None, &btree);
+        let (new_flat, _) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
         // header: 4 + 4*4 = 20
         // entries: (14+1) + (14+2) + (14+3) + (14+5) = 15+16+17+19 = 67
         assert_eq!(new_flat.len(), 20 + 67);

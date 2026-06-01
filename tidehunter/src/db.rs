@@ -1259,7 +1259,7 @@ impl Db {
     /// the `clean_self` stale-record bug.
     #[cfg(feature = "test-utils")]
     pub fn test_promote_flat_force(&self) {
-        self.large_table.test_promote_flat_force()
+        self.large_table.test_promote_flat_force(self)
     }
 }
 

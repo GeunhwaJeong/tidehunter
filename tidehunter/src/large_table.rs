@@ -668,15 +668,24 @@ impl LargeTable {
                 // promote_pending must run before flush to ensure pending entries are applied
                 // before the flusher snapshots the index. The event-driven thread handles
                 // the common case; this is a 1-second catch-all for anything it missed.
-                let snapshots: Vec<(CellId, Arc<IndexTable>)> = {
+                //
+                // Capture each entry's promote threshold under the lock: if a flush is in
+                // flight (`pending_last_processed = Some(P)`) we must not promote past P,
+                // because `clear_after_flush` will run with that P and assume all flat
+                // entries are processed by it. Otherwise the current loader position is
+                // fine — it only ever advances, so a later observer sees the invariant
+                // "flat offset < observed last_processed" preserved.
+                let snapshots: Vec<(CellId, Arc<IndexTable>, LastProcessed)> = {
                     let mut row = mutex.lock();
+                    let loader_lp = loader.last_processed_wal_position();
                     let mut snapshots = Vec::with_capacity(row.entries.iter().count());
                     for entry in row.entries.iter_mut() {
                         let remaining =
                             entry.promote_pending_and_check_flush(loader, &self.flusher)?;
                         total_remaining += remaining;
+                        let threshold = entry.pending_last_processed.unwrap_or(loader_lp);
                         let arc = entry.data.clone_shared();
-                        snapshots.push((entry.cell.clone(), arc));
+                        snapshots.push((entry.cell.clone(), arc, threshold));
                     }
                     snapshots
                     // lock released here
@@ -687,11 +696,13 @@ impl LargeTable {
                 // (ArcCow semantics); the same_shared check below detects this and discards stale work.
                 let promoted: Vec<(CellId, Arc<IndexTable>, IndexTable)> = snapshots
                     .iter()
-                    .filter_map(|(cell, arc)| {
+                    .filter_map(|(cell, arc, threshold)| {
                         let mut table = (**arc).clone();
-                        table
-                            .promote_to_flat()
-                            .then_some((cell.clone(), arc.clone(), table))
+                        table.promote_to_flat(*threshold).then_some((
+                            cell.clone(),
+                            arc.clone(),
+                            table,
+                        ))
                     })
                     .collect();
 
@@ -729,17 +740,24 @@ impl LargeTable {
     /// reliably open the `insert → promote → remove → FlushLoaded` window
     /// that triggered the `clean_self` stale-record bug without needing
     /// 128+ keys per cell.
+    ///
+    /// The promote threshold is captured the same way `promote_flat_job`
+    /// does: `entry.pending_last_processed.unwrap_or(loader_lp)`. Passing
+    /// `u64::MAX` instead would promote unprocessed entries too and falsify
+    /// the test against the real production invariant.
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn test_promote_flat_force(&self) {
+    pub fn test_promote_flat_force<L: Loader>(&self, loader: &L) {
         for ks_table in &self.table {
             for mutex in ks_table.rows.mutexes() {
                 let mut row = mutex.lock();
+                let loader_lp = loader.last_processed_wal_position();
                 for entry in row.entries.iter_mut() {
                     if entry.data.data_btree_is_empty() {
                         continue;
                     }
+                    let threshold = entry.pending_last_processed.unwrap_or(loader_lp);
                     let table = entry.data.make_mut();
-                    table.promote_to_flat_force();
+                    table.promote_to_flat_force(threshold);
                 }
             }
         }
