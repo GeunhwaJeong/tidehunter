@@ -174,7 +174,7 @@ fn main() {
     let keys: Vec<Vec<u8>> = (0u8..25).map(|i| vec![i + b'a']).collect();
 
     let num_threads = 8;
-    let operations_per_thread = 32 * 5000;
+    let operations_per_thread = 64 * 5000;
     let total_operations = num_threads * operations_per_thread;
 
     // Check if progress bars should be disabled
