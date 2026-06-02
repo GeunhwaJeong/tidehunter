@@ -501,6 +501,81 @@ impl IndexTable {
         }
     }
 
+    /// Checkpoint variant of [`Self::next_entry`]: walks the index as of the
+    /// `last_processed` frontier. Per key, the data overlay contributes its
+    /// latest *processed* position (offset < `last_processed`); keys whose
+    /// positions all postdate the frontier are skipped, leaving any flat entry
+    /// for those keys visible. Flat is consulted unfiltered — every flat entry
+    /// is below the latched frontier by the `promote_to_flat` invariant (see
+    /// [`Self::get_at`]).
+    pub fn next_entry_at(
+        &self,
+        prev: Option<Bytes>,
+        reverse: bool,
+        last_processed: LastProcessed,
+    ) -> Option<(Bytes, WalPosition)> {
+        self.next_entry_directional_at(
+            prev.as_deref(),
+            Direction::from_bool(reverse),
+            last_processed,
+        )
+    }
+
+    /// As-of-`last_processed` counterpart of [`Self::next_entry_directional`].
+    /// Structurally identical, except the data side uses latest-*processed*
+    /// positions: candidates come from `data_next_{forward,reverse}_at`, and a
+    /// flat entry is shadowed only when the key's latest *processed* data
+    /// position is a tombstone.
+    fn next_entry_directional_at(
+        &self,
+        prev: Option<&[u8]>,
+        direction: Direction,
+        last_processed: LastProcessed,
+    ) -> Option<(Bytes, WalPosition)> {
+        let data_cand: Option<(Bytes, IndexWalPosition)> = match direction {
+            Direction::Forward => self.data_next_forward_at(prev, last_processed),
+            Direction::Backward => self.data_next_reverse_at(prev, last_processed),
+        };
+
+        let flat_step = |from: Option<&[u8]>| match direction {
+            Direction::Forward => self.flat_next_forward(from),
+            Direction::Backward => self.flat_next_reverse(from),
+        };
+
+        let mut flat_cand = flat_step(prev);
+        while let Some((ref fk, _)) = flat_cand {
+            if self
+                .data_get_latest_processed(fk.as_ref(), last_processed)
+                .map(|v| v.is_removed())
+                .unwrap_or(false)
+            {
+                let fk_clone = fk.clone();
+                flat_cand = flat_step(Some(fk_clone.as_ref()));
+            } else {
+                break;
+            }
+        }
+
+        match (data_cand, flat_cand) {
+            (None, None) => None,
+            (Some((bk, bv)), None) => Some((bk, bv.into_wal_position())),
+            (None, Some((fk, fv))) => Some((fk, fv)),
+            (Some((bk, bv)), Some((fk, fv))) => {
+                let cmp = bk.as_ref().cmp(fk.as_ref());
+                // Forward: smaller wins; Backward: larger wins. `data` wins ties.
+                let data_wins = match direction {
+                    Direction::Forward => cmp != Ordering::Greater,
+                    Direction::Backward => cmp != Ordering::Less,
+                };
+                if data_wins {
+                    Some((bk, bv.into_wal_position()))
+                } else {
+                    Some((fk, fv))
+                }
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         // Note: may overcount when a key is present in both flat and data. With
         // the `promote_to_flat` invariant this happens whenever a still-unprocessed
@@ -1306,6 +1381,43 @@ impl IndexTable {
         };
         let last = self.data.range((Bound::Unbounded, end)).next_back()?;
         Some((&last.0, &last.1))
+    }
+
+    /// As-of-`last_processed` forward step over `data`: the smallest key
+    /// strictly greater than `prev` that has at least one processed position,
+    /// paired with that key's latest processed `IndexWalPosition`. Keys whose
+    /// positions all postdate the frontier are skipped over.
+    fn data_next_forward_at(
+        &self,
+        prev: Option<&[u8]>,
+        last_processed: LastProcessed,
+    ) -> Option<(Bytes, IndexWalPosition)> {
+        let mut cursor: Option<Vec<u8>> = prev.map(|p| p.to_vec());
+        loop {
+            // Clone the key first so the borrow from `data_next_forward` ends
+            // before we re-borrow `self.data` in `data_get_latest_processed`.
+            let key = self.data_next_forward(cursor.as_deref())?.0.clone();
+            if let Some(iwp) = self.data_get_latest_processed(&key, last_processed) {
+                return Some((key, iwp));
+            }
+            cursor = Some(key.to_vec());
+        }
+    }
+
+    /// As-of-`last_processed` backward counterpart of [`Self::data_next_forward_at`].
+    fn data_next_reverse_at(
+        &self,
+        prev: Option<&[u8]>,
+        last_processed: LastProcessed,
+    ) -> Option<(Bytes, IndexWalPosition)> {
+        let mut cursor: Option<Vec<u8>> = prev.map(|p| p.to_vec());
+        loop {
+            let key = self.data_next_reverse(cursor.as_deref())?.0.clone();
+            if let Some(iwp) = self.data_get_latest_processed(&key, last_processed) {
+                return Some((key, iwp));
+            }
+            cursor = Some(key.to_vec());
+        }
     }
 
     /// Single-pass recount of `(data_key_bytes, dirty_count)`. Both counters

@@ -13,7 +13,7 @@ use crate::index::index_format::{IndexFormat, IndexIterCaches};
 use crate::index::index_table::IndexTable;
 use crate::index::levels::IndexLevels;
 use crate::iterators::IteratorResult;
-use crate::iterators::db_iterator::DbIterator;
+use crate::iterators::db_iterator::{DbIterator, IterationSource};
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc, KeyType};
 use crate::large_table::{GetResult, LargeTable, Loader, PendingBatchOp};
 use crate::lock::DbLock;
@@ -377,8 +377,11 @@ impl Db {
     ///
     /// The checkpoint pins the index frontier but does not itself hold WAL
     /// files from being reclaimed, so it is intended for short-lived reads.
-    pub fn checkpoint(self: &Arc<Self>) -> DbCheckpoint {
-        DbCheckpoint::new(self.clone(), self.wal_writer.latch())
+    ///
+    /// Returned as an `Arc` so it can back a [`DbCheckpoint::iterator`] (which
+    /// needs `Arc<Self>` to keep the latch alive for the iterator's lifetime).
+    pub fn checkpoint(self: &Arc<Self>) -> Arc<DbCheckpoint> {
+        Arc::new(DbCheckpoint::new(self.clone(), self.wal_writer.latch()))
     }
 
     pub fn exists(&self, ks: KeySpace, k: &[u8]) -> DbResult<bool> {
@@ -718,7 +721,7 @@ impl Db {
 
     /// Ordered iterator over DB in the specified range
     pub fn iterator(self: &Arc<Self>, ks: KeySpace) -> DbIterator {
-        DbIterator::new(self.clone(), ks)
+        DbIterator::new(IterationSource::Db(self.clone()), ks)
     }
 
     /// Returns true if this storage is empty.
@@ -773,6 +776,7 @@ impl Db {
             end_cell_exclusive,
             reverse,
             cache,
+            None,
         )?
         else {
             return Ok(None);

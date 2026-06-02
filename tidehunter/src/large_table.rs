@@ -1055,6 +1055,7 @@ impl LargeTable {
         end_cell_exclusive: &Option<CellId>,
         reverse: bool,
         caches: &mut IndexIterCaches,
+        last_processed: Option<LastProcessed>,
     ) -> Result<Option<IteratorResult<GetResult>>, L::Error> {
         let ks_table = self.ks_rows(&context.ks_config);
         loop {
@@ -1089,6 +1090,7 @@ impl LargeTable {
                     prev_key.clone(),
                     reverse,
                     caches,
+                    last_processed,
                 ),
                 None => WalkOutcome::Exhausted,
             };
@@ -1098,8 +1100,12 @@ impl LargeTable {
                     // Phase 3: re-acquire the row lock briefly to consult the
                     // per-entry LRU. Skipped entirely when no LRU is configured.
                     // If the entry was removed between phases, fall back to a
-                    // WAL read.
-                    let value = if context.ks_config.value_cache_size().is_some() {
+                    // WAL read. Checkpoint reads (`last_processed.is_some()`)
+                    // also skip the LRU: it holds the latest value, which may
+                    // postdate the checkpoint frontier.
+                    let value = if last_processed.is_none()
+                        && context.ks_config.value_cache_size().is_some()
+                    {
                         let mut row = ks_table.lock(mutex_idx, &context.large_table_contention);
                         if let Some(entry) = row.try_entry_mut(&cell) {
                             Self::lru_or_wal(entry, &key, val)
@@ -1210,12 +1216,19 @@ impl LargeTable {
         mut prev_key: Option<Bytes>,
         reverse: bool,
         caches: &mut IndexIterCaches,
+        last_processed: Option<LastProcessed>,
     ) -> WalkOutcome {
         let direction = Direction::from_bool(reverse);
         runtime::block_in_place(|| {
             let format = ks_config.index_format();
             loop {
-                let in_memory_next = plan.data.next_entry(prev_key.clone(), reverse);
+                // Checkpoint reads filter the in-memory overlay to positions
+                // below the latched frontier; on-disk levels need no filtering
+                // (every flat entry is already below it). See IndexTable::get_at.
+                let in_memory_next = match last_processed {
+                    Some(lp) => plan.data.next_entry_at(prev_key.clone(), reverse, lp),
+                    None => plan.data.next_entry(prev_key.clone(), reverse),
+                };
                 let mut candidates: SmallVec<[Option<(Bytes, WalPosition)>; 3]> = SmallVec::new();
                 candidates.push(in_memory_next);
                 for (level_idx, (position, reader)) in plan
@@ -1294,6 +1307,7 @@ impl LargeTable {
                 prev_key.clone(),
                 reverse,
                 caches,
+                None,
             );
             match walk_result {
                 WalkOutcome::Found(key, val) => {
