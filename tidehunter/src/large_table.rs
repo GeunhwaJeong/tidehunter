@@ -2463,6 +2463,17 @@ impl LargeTableEntry {
         if let Some(ref mut bloom) = self.bloom_filter {
             bloom.clear();
         }
+        // Drop cached values too. A cleared cell has no live entries, but the
+        // read path consults the value LRU *before* the `Empty` state check, so
+        // a retained entry would serve a stale value for a dropped key.
+        if let Some(value_lru) = &mut self.value_lru {
+            let freed: i64 = value_lru
+                .iter()
+                .map(|(k, (full_key, value))| (k.len() + full_key.len() + value.len()) as i64)
+                .sum();
+            value_lru.clear();
+            self.context.value_cache_size.add(-freed);
+        }
         self.last_processed = LastProcessed::none();
         self.report_loaded_keys_count();
     }

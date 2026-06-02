@@ -3853,6 +3853,50 @@ fn test_drop_cells_in_range_uniform() {
 }
 
 #[test]
+fn test_drop_cells_clears_value_cache() {
+    // Regression: drop_cells_in_range must invalidate the per-cell value LRU.
+    // For Uniform (Array-backed) keyspaces the entry is cleared in place rather
+    // than removed, and `get` consults the value LRU before the Empty-state
+    // check — so a retained cache entry would serve a stale value for a key
+    // whose cell was dropped.
+    let dir = tempdir::TempDir::new("test-drop-cells-value-cache").unwrap();
+    let mut ksb = KeyShapeBuilder::new();
+    let ksc = KeySpaceConfig::new().with_value_cache_size(512);
+    let ks = ksb.add_key_space_config("k", 10, 2, KeyType::uniform(2), ksc);
+    let key_shape = ksb.build();
+    let config = Arc::new(Config::small());
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+
+    // Cell 0 and cell 2; cell 2 is the control that must survive.
+    db.insert(ks, hex!("00000000000000000000"), vec![1])
+        .unwrap();
+    db.insert(ks, hex!("80000000000000000000"), vec![5])
+        .unwrap();
+    // Read both so the value LRU is populated.
+    assert_eq!(
+        Some(vec![1].into()),
+        db.get(ks, &hex!("00000000000000000000")).unwrap()
+    );
+    assert_eq!(
+        Some(vec![5].into()),
+        db.get(ks, &hex!("80000000000000000000")).unwrap()
+    );
+
+    let ksd = db.key_shape.ks(ks);
+    let (first_key, _) = ksd.cell_range(&crate::cell::CellId::Integer(0));
+    let (_, last_key) = ksd.cell_range(&crate::cell::CellId::Integer(1));
+    db.drop_cells_in_range(ks, &first_key, &last_key).unwrap();
+
+    // The dropped key must not be served stale from the value LRU.
+    assert_eq!(None, db.get(ks, &hex!("00000000000000000000")).unwrap());
+    // The untouched cell still serves its cached value.
+    assert_eq!(
+        Some(vec![5].into()),
+        db.get(ks, &hex!("80000000000000000000")).unwrap()
+    );
+}
+
+#[test]
 fn test_drop_cells_in_range_prefixed_uniform() {
     let dir = tempdir::TempDir::new("test-drop-cells-prefixed").unwrap();
     let (key_shape, ks) = KeyShape::new_single(10, 16, KeyType::from_prefix_bits(16));
