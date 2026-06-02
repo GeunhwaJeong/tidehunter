@@ -1,5 +1,6 @@
 use crate::batch::{PendingOp, RelocatedWriteBatch, WriteBatch};
 use crate::cell::CellId;
+use crate::checkpoint::DbCheckpoint;
 use crate::compressed_batch::{
     BatchCodec, CompressedBatch, decompress_wal_entry, find_record, find_record_by,
 };
@@ -360,6 +361,24 @@ impl Db {
             }
             GetResult::NotFound => Ok(None),
         }
+    }
+
+    /// Opens a checkpoint: a stable, point-in-time read view of the database as
+    /// of the current WAL frontier.
+    ///
+    /// Acquiring the checkpoint takes a [`WalTrackerLatch`], which (a) blocks
+    /// until every WAL position written before this call is recorded in the
+    /// in-memory index, and (b) pins the externally observed `last_processed`
+    /// at that frontier for as long as the returned [`DbCheckpoint`] is held.
+    /// Writes that land after this call sit at or above the frontier and stay
+    /// in the index overlay instead of being promoted into flat, so
+    /// [`DbCheckpoint::get`] can filter them out and keep returning the value
+    /// as of the checkpoint even as the live database advances.
+    ///
+    /// The checkpoint pins the index frontier but does not itself hold WAL
+    /// files from being reclaimed, so it is intended for short-lived reads.
+    pub fn checkpoint(self: &Arc<Self>) -> DbCheckpoint {
+        DbCheckpoint::new(self.clone(), self.wal_writer.latch())
     }
 
     pub fn exists(&self, ks: KeySpace, k: &[u8]) -> DbResult<bool> {
@@ -811,7 +830,7 @@ impl Db {
             .update_relocated_index(context, &cell, new_levels);
     }
 
-    fn read_record_check_key(
+    pub(crate) fn read_record_check_key(
         &self,
         context: &KsContext,
         k: &[u8],

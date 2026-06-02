@@ -397,6 +397,32 @@ impl IndexTable {
             .map(|iwp| iwp.into_wal_position())
     }
 
+    /// Checkpoint read: like [`Self::get`], but only considers index positions
+    /// whose WAL offset is processed relative to `last_processed` (offset <
+    /// `last_processed`). Positions at or above it — writes that landed after
+    /// the checkpoint frontier was captured — are ignored, so the returned
+    /// position is the latest value for `k` as of `last_processed`.
+    ///
+    /// The data overlay is searched for the latest *processed* position; if the
+    /// key only has unprocessed positions there (a write that postdates the
+    /// checkpoint), we fall through to `flat`. Falling through is correct
+    /// because, for any key, `data` entries always have a higher WAL offset
+    /// than a `flat` entry for the same key (data is the newer write buffer;
+    /// `promote_to_flat` only ever moves lower offsets down). So a processed
+    /// data entry, when present, is the freshest as-of-frontier value and wins.
+    ///
+    /// `flat` is always safe to consult in full: `promote_to_flat` only moves
+    /// entries below the externally observed `last_processed`, and a checkpoint
+    /// latch caps that value at its frontier, so every flat entry has offset
+    /// below the latch frontier and is processed relative to it.
+    pub fn get_at(&self, k: &[u8], last_processed: LastProcessed) -> Option<WalPosition> {
+        if let Some(p) = self.data_get_latest_processed(k, last_processed) {
+            return Some(p.into_wal_position());
+        }
+        self.flat_binary_search(k)
+            .map(|iwp| iwp.into_wal_position())
+    }
+
     /// Similar to `get`, but returns the WAL position of the update operation for both
     /// inserts and deletes.
     pub fn get_update_position(&self, k: &[u8]) -> Option<WalPosition> {
@@ -1200,6 +1226,36 @@ impl IndexTable {
         let lower = (key_bytes.clone(), IndexWalPosition::MIN);
         let upper = (key_bytes, IndexWalPosition::MAX);
         self.data.range(lower..=upper).next_back().map(|(_, v)| *v)
+    }
+
+    /// Latest `IndexWalPosition` recorded in `data` for `key` that is processed
+    /// relative to `last_processed` (offset < `last_processed`), or `None` if
+    /// the key has no processed position there.
+    ///
+    /// Within a same-key group the set is ordered by `(offset, len, kind)`, and
+    /// `LastProcessed::is_processed` depends only on `offset`, so the latest
+    /// processed entry is the last tuple strictly below the
+    /// `(offset = last_processed)` boundary.
+    fn data_get_latest_processed(
+        &self,
+        key: &[u8],
+        last_processed: LastProcessed,
+    ) -> Option<IndexWalPosition> {
+        let key_bytes = Bytes::from(key.to_vec());
+        let lower = (key_bytes.clone(), IndexWalPosition::MIN);
+        // Exclusive upper bound: the smallest IWP that is NOT processed. Any
+        // entry with `offset < last_processed` sorts strictly below it; any
+        // entry with `offset >= last_processed` sorts at or above it. This
+        // mirrors the strict `<` in `LastProcessed::is_processed`.
+        let upper = (
+            key_bytes,
+            IndexWalPosition {
+                offset: last_processed.as_u64(),
+                len: 0,
+                kind: IndexEntryKind::Clean,
+            },
+        );
+        self.data.range(lower..upper).next_back().map(|(_, v)| *v)
     }
 
     fn data_contains_key(&self, key: &[u8]) -> bool {

@@ -522,7 +522,6 @@ impl LargeTable {
         k: &[u8],
         loader: &L,
     ) -> Result<GetResult, L::Error> {
-        let ks = &context.ks_config;
         let (mut row, cell) = self.row(context, k);
         let entry = row.try_entry_mut(&cell);
         let Some(entry) = entry else {
@@ -575,17 +574,35 @@ impl LargeTable {
         // drop row to avoid holding mutex during IO
         drop(row);
 
+        Ok(self.lookup_disk_levels(context, index_readers, k))
+    }
+
+    /// Walk the on-disk index levels (readers already opened under the row
+    /// lock) for `k`, returning the first hit. Shared by the value [`Self::get`]
+    /// and checkpoint [`Self::get_checkpoint`] read paths — both consult disk
+    /// identically once the in-memory overlay misses.
+    ///
+    /// `readers` must be ordered shallowest level first and be non-empty
+    /// (callers short-circuit when there are no on-disk levels). The row lock
+    /// must already be dropped.
+    fn lookup_disk_levels(
+        &self,
+        context: &KsContext,
+        readers: SmallVec<[WalRandomRead; INLINE_LEVELS]>,
+        k: &[u8],
+    ) -> GetResult {
+        let ks = &context.ks_config;
         self.fp.fp_lookup_after_lock_drop();
         let now = Instant::now();
         // todo - consider only doing block_in_place for the syscall random reader
         // TODO: handle entries that may be removed by relocation but are still referenced in the index
         let (result, read_type, terminal_level) = runtime::block_in_place(|| {
-            // `index_readers` is non-empty (guarded by the `level_positions.is_empty()`
-            // check above), and the loop reassigns `last_read_type` on every iteration
+            // `readers` is non-empty (guarded by callers' `level_positions.is_empty()`
+            // check), and the loop reassigns `last_read_type` on every iteration
             // before the early-return branches can fire — so the init is just a seed.
-            let mut last_read_type = index_readers[0].read_type();
+            let mut last_read_type = readers[0].read_type();
             let mut last_level = 0usize;
-            for (level, reader) in index_readers.iter().enumerate() {
+            for (level, reader) in readers.iter().enumerate() {
                 last_read_type = reader.read_type();
                 last_level = level;
                 match ks
@@ -605,7 +622,61 @@ impl LargeTable {
         context
             .lookup_mcs_histogram(read_type)
             .observe(now.elapsed().as_micros() as f64);
-        Ok(context.report_lookup_result(result, LookupSource::for_level(terminal_level)))
+        context.report_lookup_result(result, LookupSource::for_level(terminal_level))
+    }
+
+    /// Checkpoint read: a point-in-time view of `k` as of the WAL frontier
+    /// `last_processed`, captured by a
+    /// [`crate::wal::tracker::WalTrackerLatch`].
+    ///
+    /// Differs from [`Self::get`] in two ways:
+    ///   - The value LRU and bloom filter are skipped. The LRU holds the latest
+    ///     value, which may postdate the checkpoint, and the bloom filter is a
+    ///     latest-state structure too — neither is safe for a historical read.
+    ///   - The in-memory overlay is probed with [`LargeTableEntry::get_at`],
+    ///     which ignores index positions at or above `last_processed` (writes
+    ///     that landed after the checkpoint frontier). On-disk levels are
+    ///     walked identically to `get`: every on-disk entry is below the
+    ///     latched frontier by the `promote_to_flat` invariant (see
+    ///     [`IndexTable::get_at`]), so no extra filtering is required there.
+    pub fn get_checkpoint<L: Loader>(
+        &self,
+        context: &KsContext,
+        k: &[u8],
+        last_processed: LastProcessed,
+        loader: &L,
+    ) -> Result<GetResult, L::Error> {
+        let (mut row, cell) = self.row(context, k);
+        let entry = row.try_entry_mut(&cell);
+        let Some(entry) = entry else {
+            return Ok(context.report_lookup_result(None, LookupSource::Prefix));
+        };
+
+        // Apply pending committed ops to the overlay before reading; the offset
+        // filter in `get_at` discards any that postdate the checkpoint. Mirrors
+        // the ordering in `get`.
+        entry.promote_pending();
+
+        if entry.state == LargeTableEntryState::Empty {
+            return Ok(context.report_lookup_result(None, LookupSource::Cache));
+        }
+        if entry.state != LargeTableEntryState::Unloaded
+            && let Some(found) = entry.get_at(k, last_processed)
+        {
+            return Ok(context.report_lookup_result(found.valid(), LookupSource::Cache));
+        }
+        let level_positions = entry.disk_levels_to_walk_for_key(k);
+        if level_positions.is_empty() {
+            return Ok(context.report_lookup_result(None, LookupSource::Cache));
+        }
+        let mut index_readers: SmallVec<[_; INLINE_LEVELS]> = SmallVec::new();
+        for pos in &level_positions {
+            index_readers.push(loader.index_reader(*pos)?);
+        }
+        // drop row to avoid holding mutex during IO
+        drop(row);
+
+        Ok(self.lookup_disk_levels(context, index_readers, k))
     }
 
     fn entry_mut<'a>(&self, row: &'a mut Row, cell: &CellId) -> &'a mut LargeTableEntry {
@@ -1868,6 +1939,17 @@ impl LargeTableEntry {
             panic!("Can't get in unloaded state");
         }
         self.data.get(k)
+    }
+
+    /// Checkpoint variant of [`Self::get`]: only considers overlay/flat index
+    /// positions processed relative to `last_processed`. Returns `None` when
+    /// the key has only positions that postdate the checkpoint frontier, so the
+    /// caller falls through to deeper on-disk levels. See [`IndexTable::get_at`].
+    pub fn get_at(&self, k: &[u8], last_processed: LastProcessed) -> Option<WalPosition> {
+        if self.state == LargeTableEntryState::Unloaded {
+            panic!("Can't get in unloaded state");
+        }
+        self.data.get_at(k, last_processed)
     }
 
     /// On-disk level positions the read path still needs to consult after

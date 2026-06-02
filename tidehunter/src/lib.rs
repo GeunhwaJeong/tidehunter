@@ -1,5 +1,6 @@
 pub mod batch;
 mod cell;
+pub mod checkpoint;
 #[doc(hidden)] // Used by tools/tideconsole for WAL compression estimation
 pub mod compressed_batch;
 pub mod config;
