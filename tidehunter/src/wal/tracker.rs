@@ -75,14 +75,30 @@ struct WalTrackerThread {
     /// gives the minimum latched position that caps the external value.
     latches: BTreeSet<(LastProcessed, u64)>,
     next_latch_id: u64,
+    /// Latch requests whose reply is deferred until `last_processed` reaches
+    /// their captured frontier (so every position below the latch position is
+    /// processed before the caller receives the latch).
+    pending_requests: Vec<PendingLatchRequest>,
     mapper: Arc<WalMapper>,
     layout: WalLayout,
     metrics: Arc<Metrics>,
 }
 
+struct PendingLatchRequest {
+    /// The captured frontier; the reply fires once `last_processed >= target`.
+    target: u64,
+    id: u64,
+    response: mpsc::Sender<(u64, LastProcessed)>,
+}
+
 struct WalTrackerState {
     pending: BTreeMap<u64, AllocationResult>,
     last_processed: LastProcessed,
+    /// The highest position the tracker has ever received (the end position of
+    /// any seen allocation, whether already processed or still in `pending`).
+    /// Equals `last_processed` when `pending` is empty, and is strictly greater
+    /// while there are out-of-order allocations awaiting a gap to be filled.
+    highest_seen: u64,
 }
 
 enum WalTrackerMessage {
@@ -95,7 +111,9 @@ enum WalTrackerMessage {
         result: AllocationResult,
     },
     /// Request a new latch. The tracker assigns an id, captures the current
-    /// internal `last_processed`, stores the latch, and replies with `(id, position)`.
+    /// received frontier as the latch position, and stores the latch. The reply
+    /// `(id, position)` is deferred until every position below the frontier has
+    /// been processed (`last_processed >= position`).
     LatchRequest(mpsc::Sender<(u64, LastProcessed)>),
     /// Release a previously acquired latch. Sent when [`WalTrackerLatch`] is dropped.
     LatchRelease { id: u64, position: LastProcessed },
@@ -119,6 +137,7 @@ impl WalTracker {
             last_processed: atomic_last_processed.clone(),
             latches: BTreeSet::new(),
             next_latch_id: 0,
+            pending_requests: Vec::new(),
             mapper: mapper.clone(),
             layout,
             metrics,
@@ -158,10 +177,17 @@ impl WalTracker {
 
     /// Acquires a latch that pins the externally observed `last_processed`.
     ///
-    /// Blocks until the tracker thread processes the request, which captures
-    /// the current internal `last_processed` as the latch position. While the
+    /// The latch position is the received frontier at the time the request is
+    /// processed — by FIFO, every allocation submitted before this call,
+    /// including any still out of order. The call blocks until all of those
+    /// positions are processed internally (`last_processed` reaches the
+    /// frontier), so on return every position below
+    /// [`WalTrackerLatch::position`] is in the in-memory index. While the
     /// returned [`WalTrackerLatch`] is held, [`Self::last_processed`] will not
     /// advance past that position. Dropping the latch releases it.
+    ///
+    /// The caller must not hold a `WalGuard` for a position below the frontier,
+    /// or the awaited position can never be processed and the call deadlocks.
     pub fn latch(&self) -> WalTrackerLatch {
         let (response, response_rx) = mpsc::channel();
         let message = WalTrackerMessage::LatchRequest(response);
@@ -252,9 +278,9 @@ impl WalGuardMaker {
 }
 
 impl WalTrackerLatch {
-    /// The internal `last_processed` captured when the latch was acquired.
-    /// The externally observed `last_processed` will not advance past this
-    /// position while the latch is held.
+    /// The captured frontier: every position below it was processed internally
+    /// before the latch was returned, and the externally observed
+    /// `last_processed` will not advance past it while the latch is held.
     pub fn position(&self) -> LastProcessed {
         self.position
     }
@@ -273,9 +299,11 @@ impl Drop for WalTrackerLatch {
 
 impl WalTrackerThread {
     pub fn run(mut self) {
-        // Iterate by reference so the loop body can call `self.publish()`
-        // (a method that borrows `self`) without `self.receiver` being moved.
-        for message in &self.receiver {
+        // `recv()` borrows only `self.receiver` for the duration of the call,
+        // leaving the loop body free to borrow `self` (e.g. `self.publish()`
+        // and `self.fulfill_pending_requests()`). The loop ends when all
+        // senders are dropped and `recv()` returns `Err`.
+        while let Ok(message) = self.receiver.recv() {
             let _timer = self.metrics.wal_tracker_time_mcs.clone().mcs_timer();
             match message {
                 WalTrackerMessage::AllocationMessage { mutex, result } => {
@@ -283,7 +311,7 @@ impl WalTrackerThread {
                     // i.e. the position is recorded in the in-memory index.
                     #[allow(clippy::let_underscore_lock)]
                     let _ = mutex.lock();
-                    self.state.add_processed(result, |processed| {
+                    let advanced = self.state.add_processed(result, |processed| {
                         if let Some(frag) =
                             self.layout.is_first_in_frag(processed.allocated_position())
                             && let Some(prev_frag) = frag.prev_map()
@@ -293,13 +321,30 @@ impl WalTrackerThread {
                             self.mapper.map_finalized(prev_frag);
                         }
                     });
+                    if advanced.is_some() {
+                        self.fulfill_pending_requests();
+                    }
                 }
                 WalTrackerMessage::LatchRequest(response) => {
                     let id = self.next_latch_id;
                     self.next_latch_id += 1;
-                    let position = self.state.last_processed;
+                    // Capture the received frontier. The latch is inserted now
+                    // (not at reply time) so it caps the external value during
+                    // the wait; the reply is deferred until last_processed
+                    // reaches the frontier. `highest_seen` is monotonic, so the
+                    // inserted position never lowers the existing latch minimum.
+                    let target = self.state.highest_seen;
+                    let position = LastProcessed::new(target);
                     self.latches.insert((position, id));
-                    response.send((id, position)).ok();
+                    if self.state.last_processed.as_u64() >= target {
+                        response.send((id, position)).ok();
+                    } else {
+                        self.pending_requests.push(PendingLatchRequest {
+                            target,
+                            id,
+                            response,
+                        });
+                    }
                 }
                 WalTrackerMessage::LatchRelease { id, position } => {
                     self.latches.remove(&(position, id));
@@ -344,6 +389,24 @@ impl WalTrackerThread {
             .with_label_values(&[kind])
             .set(self.latches.len() as i64);
     }
+
+    /// Replies to any deferred latch request whose captured frontier is now
+    /// fully processed (`target <= last_processed`). Called after each
+    /// allocation that advances `last_processed`.
+    fn fulfill_pending_requests(&mut self) {
+        let last_processed = self.state.last_processed.as_u64();
+        self.pending_requests.retain(|request| {
+            if request.target <= last_processed {
+                request
+                    .response
+                    .send((request.id, LastProcessed::new(request.target)))
+                    .ok();
+                false
+            } else {
+                true
+            }
+        });
+    }
 }
 
 impl WalTrackerState {
@@ -351,6 +414,7 @@ impl WalTrackerState {
         Self {
             pending: Default::default(),
             last_processed,
+            highest_seen: last_processed.as_u64(),
         }
     }
 
@@ -359,6 +423,7 @@ impl WalTrackerState {
         mut result: AllocationResult,
         mut callback: F,
     ) -> Option<LastProcessed> {
+        self.highest_seen = self.highest_seen.max(result.next_position());
         let previous_position = result.previous_position();
         if self.last_processed.as_u64() != previous_position {
             self.pending.insert(result.previous_position(), result);
@@ -611,5 +676,62 @@ mod tests {
         drop(l1);
         tracker.barrier();
         assert_eq!(tracker.last_processed().as_u64(), c.next_position());
+    }
+
+    #[test]
+    fn test_latch_waits_for_prior_positions() {
+        use std::sync::atomic::AtomicBool;
+
+        let layout = WalLayout::new_simple(32);
+        let allocator = WalAllocator::new(layout.clone(), 0);
+        let a = allocator.allocate(8);
+        let b = allocator.allocate(9);
+        let c = allocator.allocate(10);
+
+        let tracker = WalTracker::start(
+            layout.clone(),
+            WalMapper::new_unstarted().0,
+            LastProcessed::new(0),
+            Metrics::new(),
+        );
+
+        // Process `a`, then deliver `c` out of order so it sits in `pending`
+        // with a hole at `b`. The received frontier is now `c.next_position()`
+        // but last_processed is only `a.next_position()`.
+        drop(tracker.allocated(a.clone()));
+        tracker.barrier();
+        drop(tracker.allocated(c.clone()));
+        tracker.barrier();
+        assert_eq!(tracker.last_processed().as_u64(), a.next_position());
+
+        let done = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|s| {
+            let thread_done = done.clone();
+            let tracker = &tracker;
+            let handle = s.spawn(move || {
+                // Blocks until the hole at `b` is filled and last_processed
+                // reaches the captured frontier (c.next_position()).
+                let latch = tracker.latch();
+                thread_done.store(true, Ordering::SeqCst);
+                latch.position().as_u64()
+            });
+
+            // The latch request is now deferred: the hole at `b` is not filled,
+            // so the call must not have returned.
+            thread::sleep(Duration::from_millis(50));
+            assert!(
+                !done.load(Ordering::SeqCst),
+                "latch returned before the hole below its frontier was filled"
+            );
+
+            // Fill the hole: `b` drains `b` and `c`, last_processed reaches the
+            // frontier, and the deferred latch request is answered.
+            drop(tracker.allocated(b.clone()));
+            tracker.barrier();
+
+            let position = handle.join().unwrap();
+            assert!(done.load(Ordering::SeqCst));
+            assert_eq!(position, c.next_position());
+        });
     }
 }

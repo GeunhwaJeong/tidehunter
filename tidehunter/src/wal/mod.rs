@@ -175,10 +175,11 @@ impl WalWriter {
     }
 
     /// Acquires a latch that pins the externally observed `last_processed`
-    /// position (see [`WalTrackerLatch`]). While the returned latch is held,
-    /// [`Self::last_processed`] will not advance past the latch's
-    /// [`WalTrackerLatch::position`] (the value of `last_processed` captured
-    /// when the latch was acquired).
+    /// position (see [`WalTrackerLatch`]). Blocks until every position below the
+    /// latch's [`WalTrackerLatch::position`] (the received frontier captured
+    /// when the latch was acquired) has been processed into the in-memory index.
+    /// While the returned latch is held, [`Self::last_processed`] will not
+    /// advance past that position.
     pub fn latch(&self) -> WalTrackerLatch {
         self.wal_tracker.latch()
     }
