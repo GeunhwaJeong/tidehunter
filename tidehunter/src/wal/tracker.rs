@@ -3,7 +3,7 @@ use super::position::LastProcessed;
 use crate::WalLayout;
 #[cfg(test)]
 use crate::latch::LatchGuard;
-use crate::metrics::{Metrics, TimerExt};
+use crate::metrics::{MetricIntGauge, Metrics, TimerExt};
 use crate::wal::allocator::AllocationResult;
 use crate::wal::mapper::WalMapper;
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
@@ -82,6 +82,11 @@ struct WalTrackerThread {
     mapper: Arc<WalMapper>,
     layout: WalLayout,
     metrics: Arc<Metrics>,
+    /// Gauge handles resolved once for this tracker's fixed `kind` label, so
+    /// `publish()` avoids a `with_label_values` lookup on every WAL write.
+    metric_external: MetricIntGauge,
+    metric_internal: MetricIntGauge,
+    metric_active_latches: MetricIntGauge,
 }
 
 struct PendingLatchRequest {
@@ -131,6 +136,14 @@ impl WalTracker {
         let (sender, receiver) = mpsc::channel();
         let atomic_last_processed = Arc::new(AtomicU64::new(last_processed.as_u64()));
         let mapper = Arc::new(mapper);
+        let kind = layout.kind.name();
+        let metric_external = metrics
+            .wal_last_processed_position
+            .with_label_values(&[kind]);
+        let metric_internal = metrics
+            .wal_internal_last_processed_position
+            .with_label_values(&[kind]);
+        let metric_active_latches = metrics.wal_active_latches.with_label_values(&[kind]);
         let thread = WalTrackerThread {
             receiver,
             state: WalTrackerState::new_empty(last_processed),
@@ -141,6 +154,9 @@ impl WalTracker {
             mapper: mapper.clone(),
             layout,
             metrics,
+            metric_external,
+            metric_internal,
+            metric_active_latches,
         };
         let jh = thread::Builder::new()
             .name("wal-tracker".to_string())
@@ -321,8 +337,13 @@ impl WalTrackerThread {
                             self.mapper.map_finalized(prev_frag);
                         }
                     });
+                    // Only an allocation that advances last_processed can
+                    // change the external value or satisfy a deferred request.
                     if advanced.is_some() {
-                        self.fulfill_pending_requests();
+                        if !self.pending_requests.is_empty() {
+                            self.fulfill_pending_requests();
+                        }
+                        self.publish();
                     }
                 }
                 WalTrackerMessage::LatchRequest(response) => {
@@ -345,18 +366,18 @@ impl WalTrackerThread {
                             response,
                         });
                     }
+                    self.publish();
                 }
                 WalTrackerMessage::LatchRelease { id, position } => {
                     self.latches.remove(&(position, id));
+                    self.publish();
                 }
                 #[cfg(test)]
                 WalTrackerMessage::Barrier(_) => {
                     // Drop the barrier guard to unblock the caller. A barrier
-                    // changes no state, so skip publish() via `continue`.
-                    continue;
+                    // changes no state, so it does not publish.
                 }
-            };
-            self.publish();
+            }
         }
     }
 
@@ -364,9 +385,9 @@ impl WalTrackerThread {
     /// atomic and gauges.
     ///
     /// The external value is `min(internal, min position of any active latch)`.
-    /// Latch positions are captured from the monotonic internal value, so they
-    /// are always `<= internal`; the external value is therefore monotonically
-    /// non-decreasing.
+    /// Because latch positions are captured from the monotonic `highest_seen`,
+    /// the latch minimum is non-decreasing; combined with the monotonic
+    /// internal value, the external value is monotonically non-decreasing.
     fn publish(&self) {
         let internal = self.state.last_processed;
         let external = self
@@ -375,19 +396,9 @@ impl WalTrackerThread {
             .map_or(internal, |(min_position, _)| internal.min(*min_position));
         self.last_processed
             .store(external.as_u64(), Ordering::SeqCst);
-        let kind = self.layout.kind.name();
-        self.metrics
-            .wal_last_processed_position
-            .with_label_values(&[kind])
-            .set(external.as_u64() as i64);
-        self.metrics
-            .wal_internal_last_processed_position
-            .with_label_values(&[kind])
-            .set(internal.as_u64() as i64);
-        self.metrics
-            .wal_active_latches
-            .with_label_values(&[kind])
-            .set(self.latches.len() as i64);
+        self.metric_external.set(external.as_u64() as i64);
+        self.metric_internal.set(internal.as_u64() as i64);
+        self.metric_active_latches.set(self.latches.len() as i64);
     }
 
     /// Replies to any deferred latch request whose captured frontier is now
