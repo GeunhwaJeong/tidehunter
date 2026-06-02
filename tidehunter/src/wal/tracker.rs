@@ -7,7 +7,7 @@ use crate::metrics::{Metrics, TimerExt};
 use crate::wal::allocator::AllocationResult;
 use crate::wal::mapper::WalMapper;
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
@@ -44,10 +44,37 @@ pub struct WalGuardMaker {
     shared_guard: Rc<ArcMutexGuard<RawMutex, ()>>,
 }
 
+/// A latch pins the externally observed `last_processed` position.
+///
+/// While at least one latch is held, the value returned by
+/// [`WalTracker::last_processed`] is not advanced past the minimum position
+/// captured by any active latch, even though the tracker keeps processing
+/// allocations internally. This keeps in-memory index updates above that
+/// position considered unprocessed (they stay in the BTreeMap and are not
+/// promoted into flat). When all latches are dropped, the external value
+/// catches up to the internal one.
+///
+/// Dropping the latch releases it asynchronously by sending a message to the
+/// tracker thread.
+///
+/// This is a position-pinning latch and is unrelated to the synchronization
+/// primitive [`crate::latch::Latch`].
+pub struct WalTrackerLatch {
+    id: u64,
+    position: LastProcessed,
+    sender: mpsc::Sender<WalTrackerMessage>,
+}
+
 struct WalTrackerThread {
     receiver: mpsc::Receiver<WalTrackerMessage>,
+    /// Externally observed `last_processed`, read by [`WalTracker::last_processed`].
+    /// Capped by active latches; equals the internal value when no latch is held.
     last_processed: Arc<AtomicU64>,
     state: WalTrackerState,
+    /// Active latches keyed by `(captured position, id)`. The first element
+    /// gives the minimum latched position that caps the external value.
+    latches: BTreeSet<(LastProcessed, u64)>,
+    next_latch_id: u64,
     mapper: Arc<WalMapper>,
     layout: WalLayout,
     metrics: Arc<Metrics>,
@@ -58,13 +85,20 @@ struct WalTrackerState {
     last_processed: LastProcessed,
 }
 
-struct WalTrackerMessage {
-    mutex: Arc<Mutex<()>>,
-    kind: WalTrackerMessageKind,
-}
-
-enum WalTrackerMessageKind {
-    AllocationMessage(AllocationResult),
+enum WalTrackerMessage {
+    /// An allocation to be processed. The `mutex` is locked by `allocated()`
+    /// and held (via `WalGuard`) until the Db records the position in the
+    /// in-memory index; the tracker thread blocks on it before processing, so
+    /// the position is only accounted once it is durably in the index.
+    AllocationMessage {
+        mutex: Arc<Mutex<()>>,
+        result: AllocationResult,
+    },
+    /// Request a new latch. The tracker assigns an id, captures the current
+    /// internal `last_processed`, stores the latch, and replies with `(id, position)`.
+    LatchRequest(mpsc::Sender<(u64, LastProcessed)>),
+    /// Release a previously acquired latch. Sent when [`WalTrackerLatch`] is dropped.
+    LatchRelease { id: u64, position: LastProcessed },
     #[cfg(test)]
     Barrier(#[allow(dead_code)] LatchGuard),
 }
@@ -83,6 +117,8 @@ impl WalTracker {
             receiver,
             state: WalTrackerState::new_empty(last_processed),
             last_processed: atomic_last_processed.clone(),
+            latches: BTreeSet::new(),
+            next_latch_id: 0,
             mapper: mapper.clone(),
             layout,
             metrics,
@@ -102,9 +138,9 @@ impl WalTracker {
     pub fn allocated(&self, allocation_result: AllocationResult) -> WalGuardMaker {
         let mutex = Arc::new(Mutex::new(()));
         let guard = mutex.lock_arc();
-        let message = WalTrackerMessage {
+        let message = WalTrackerMessage::AllocationMessage {
             mutex,
-            kind: WalTrackerMessageKind::AllocationMessage(allocation_result),
+            result: allocation_result,
         };
         self.sender
             .as_ref()
@@ -118,6 +154,27 @@ impl WalTracker {
 
     pub fn last_processed(&self) -> LastProcessed {
         LastProcessed::new(self.last_processed.load(Ordering::SeqCst))
+    }
+
+    /// Acquires a latch that pins the externally observed `last_processed`.
+    ///
+    /// Blocks until the tracker thread processes the request, which captures
+    /// the current internal `last_processed` as the latch position. While the
+    /// returned [`WalTrackerLatch`] is held, [`Self::last_processed`] will not
+    /// advance past that position. Dropping the latch releases it.
+    pub fn latch(&self) -> WalTrackerLatch {
+        let (response, response_rx) = mpsc::channel();
+        let message = WalTrackerMessage::LatchRequest(response);
+        let sender = self.sender.as_ref().expect("WalTracker already dropped");
+        sender.send(message).ok();
+        let (id, position) = response_rx
+            .recv()
+            .expect("WalTracker thread terminated before replying to latch request");
+        WalTrackerLatch {
+            id,
+            position,
+            sender: sender.clone(),
+        }
     }
 
     pub fn min_wal_position_updated(&self, watermark: u64) {
@@ -140,11 +197,7 @@ impl WalTracker {
     pub fn barrier(&self) {
         use crate::latch::Latch;
         let (latch, guard) = Latch::new();
-        let mutex = Arc::new(Mutex::new(()));
-        let message = WalTrackerMessage {
-            mutex,
-            kind: WalTrackerMessageKind::Barrier(guard),
-        };
+        let message = WalTrackerMessage::Barrier(guard);
         self.sender
             .as_ref()
             .expect("WalTracker already dropped")
@@ -198,40 +251,98 @@ impl WalGuardMaker {
     }
 }
 
+impl WalTrackerLatch {
+    /// The internal `last_processed` captured when the latch was acquired.
+    /// The externally observed `last_processed` will not advance past this
+    /// position while the latch is held.
+    pub fn position(&self) -> LastProcessed {
+        self.position
+    }
+}
+
+impl Drop for WalTrackerLatch {
+    fn drop(&mut self) {
+        let message = WalTrackerMessage::LatchRelease {
+            id: self.id,
+            position: self.position,
+        };
+        // Best-effort: if the tracker is already gone, there is nothing to release.
+        self.sender.send(message).ok();
+    }
+}
+
 impl WalTrackerThread {
     pub fn run(mut self) {
-        for message in self.receiver {
+        // Iterate by reference so the loop body can call `self.publish()`
+        // (a method that borrows `self`) without `self.receiver` being moved.
+        for message in &self.receiver {
             let _timer = self.metrics.wal_tracker_time_mcs.clone().mcs_timer();
-            #[allow(clippy::let_underscore_lock)]
-            let _ = message.mutex.lock();
-            let position = match message.kind {
-                WalTrackerMessageKind::AllocationMessage(message) => {
-                    self.state.add_processed(message, |result| {
+            match message {
+                WalTrackerMessage::AllocationMessage { mutex, result } => {
+                    // Wait until every WalGuard for this allocation is dropped,
+                    // i.e. the position is recorded in the in-memory index.
+                    #[allow(clippy::let_underscore_lock)]
+                    let _ = mutex.lock();
+                    self.state.add_processed(result, |processed| {
                         if let Some(frag) =
-                            self.layout.is_first_in_frag(result.allocated_position())
+                            self.layout.is_first_in_frag(processed.allocated_position())
                             && let Some(prev_frag) = frag.prev_map()
                         {
                             // When the first position for frag is allocated and all positions before it are processed,
                             // Then the previous fragment can be finalized.
                             self.mapper.map_finalized(prev_frag);
                         }
-                    })
+                    });
+                }
+                WalTrackerMessage::LatchRequest(response) => {
+                    let id = self.next_latch_id;
+                    self.next_latch_id += 1;
+                    let position = self.state.last_processed;
+                    self.latches.insert((position, id));
+                    response.send((id, position)).ok();
+                }
+                WalTrackerMessage::LatchRelease { id, position } => {
+                    self.latches.remove(&(position, id));
                 }
                 #[cfg(test)]
-                WalTrackerMessageKind::Barrier(_) => {
-                    // Drop a barrier here
+                WalTrackerMessage::Barrier(_) => {
+                    // Drop the barrier guard to unblock the caller. A barrier
+                    // changes no state, so skip publish() via `continue`.
                     continue;
                 }
             };
-            if let Some(position) = position {
-                self.last_processed
-                    .store(position.as_u64(), Ordering::SeqCst);
-                self.metrics
-                    .wal_last_processed_position
-                    .with_label_values(&[self.layout.kind.name()])
-                    .set(position.as_u64() as i64);
-            }
+            self.publish();
         }
+    }
+
+    /// Recomputes the externally observed `last_processed` and updates the
+    /// atomic and gauges.
+    ///
+    /// The external value is `min(internal, min position of any active latch)`.
+    /// Latch positions are captured from the monotonic internal value, so they
+    /// are always `<= internal`; the external value is therefore monotonically
+    /// non-decreasing.
+    fn publish(&self) {
+        let internal = self.state.last_processed;
+        let external = self
+            .latches
+            .first()
+            .map_or(internal, |(min_position, _)| internal.min(*min_position));
+        self.last_processed
+            .store(external.as_u64(), Ordering::SeqCst);
+        let kind = self.layout.kind.name();
+        self.metrics
+            .wal_last_processed_position
+            .with_label_values(&[kind])
+            .set(external.as_u64() as i64);
+        self.metrics
+            .wal_internal_last_processed_position
+            .with_label_values(&[kind])
+            .set(internal.as_u64() as i64);
+        self.metrics
+            .wal_active_latches
+            .with_label_values(&[kind])
+            .set(self.latches.len() as i64);
     }
 }
 
@@ -391,6 +502,114 @@ mod tests {
         drop(guard2);
         tracker.barrier();
         // When all guards blocked the state is correct
+        assert_eq!(tracker.last_processed().as_u64(), c.next_position());
+    }
+
+    #[test]
+    fn test_no_latch_external_tracks_internal() {
+        let layout = WalLayout::new_simple(32);
+        let allocator = WalAllocator::new(layout.clone(), 0);
+        let a = allocator.allocate(8);
+        let b = allocator.allocate(9);
+
+        let tracker = WalTracker::start(
+            layout.clone(),
+            WalMapper::new_unstarted().0,
+            LastProcessed::new(0),
+            Metrics::new(),
+        );
+        assert_eq!(tracker.last_processed().as_u64(), 0);
+
+        drop(tracker.allocated(a.clone()));
+        tracker.barrier();
+        assert_eq!(tracker.last_processed().as_u64(), a.next_position());
+
+        drop(tracker.allocated(b.clone()));
+        tracker.barrier();
+        assert_eq!(tracker.last_processed().as_u64(), b.next_position());
+    }
+
+    #[test]
+    fn test_latch_pins_external_last_processed() {
+        let layout = WalLayout::new_simple(32);
+        let allocator = WalAllocator::new(layout.clone(), 0);
+        let a = allocator.allocate(8);
+        let b = allocator.allocate(9);
+        let c = allocator.allocate(10);
+
+        let tracker = WalTracker::start(
+            layout.clone(),
+            WalMapper::new_unstarted().0,
+            LastProcessed::new(0),
+            Metrics::new(),
+        );
+
+        // Process `a`: internal and external advance to a.next_position().
+        drop(tracker.allocated(a.clone()));
+        tracker.barrier();
+        assert_eq!(tracker.last_processed().as_u64(), a.next_position());
+
+        // Take a latch: it captures the current internal last_processed.
+        let latch = tracker.latch();
+        assert_eq!(latch.position().as_u64(), a.next_position());
+        assert_eq!(tracker.last_processed().as_u64(), a.next_position());
+
+        // Process `b` and `c`: internal advances, but external is pinned by the latch.
+        drop(tracker.allocated(b.clone()));
+        drop(tracker.allocated(c.clone()));
+        tracker.barrier();
+        assert_eq!(tracker.last_processed().as_u64(), a.next_position());
+
+        // Drop the latch: external catches up to the internal value.
+        drop(latch);
+        tracker.barrier();
+        assert_eq!(tracker.last_processed().as_u64(), c.next_position());
+    }
+
+    #[test]
+    fn test_multiple_latches() {
+        let layout = WalLayout::new_simple(32);
+        let allocator = WalAllocator::new(layout.clone(), 0);
+        let a = allocator.allocate(8);
+        let b = allocator.allocate(9);
+        let c = allocator.allocate(10);
+
+        let tracker = WalTracker::start(
+            layout.clone(),
+            WalMapper::new_unstarted().0,
+            LastProcessed::new(0),
+            Metrics::new(),
+        );
+
+        // internal -> a.next_position(); take the older latch l0 here.
+        drop(tracker.allocated(a.clone()));
+        tracker.barrier();
+        let l0 = tracker.latch();
+        assert_eq!(l0.position().as_u64(), a.next_position());
+
+        // internal -> b.next_position(); external pinned at l0's position.
+        drop(tracker.allocated(b.clone()));
+        tracker.barrier();
+        assert_eq!(tracker.last_processed().as_u64(), a.next_position());
+
+        // Take the newer latch l1 at b.next_position(); external still pinned at l0.
+        let l1 = tracker.latch();
+        assert_eq!(l1.position().as_u64(), b.next_position());
+        assert_eq!(tracker.last_processed().as_u64(), a.next_position());
+
+        // internal -> c.next_position(); external still pinned at l0.
+        drop(tracker.allocated(c.clone()));
+        tracker.barrier();
+        assert_eq!(tracker.last_processed().as_u64(), a.next_position());
+
+        // Drop the older latch: external moves to min(internal, l1.position).
+        drop(l0);
+        tracker.barrier();
+        assert_eq!(tracker.last_processed().as_u64(), b.next_position());
+
+        // Drop the last latch: external catches up to internal.
+        drop(l1);
+        tracker.barrier();
         assert_eq!(tracker.last_processed().as_u64(), c.next_position());
     }
 }
