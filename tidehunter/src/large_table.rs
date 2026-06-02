@@ -629,16 +629,22 @@ impl LargeTable {
     /// `last_processed`, captured by a
     /// [`crate::wal::tracker::WalTrackerLatch`].
     ///
-    /// Differs from [`Self::get`] in two ways:
-    ///   - The value LRU and bloom filter are skipped. The LRU holds the latest
-    ///     value, which may postdate the checkpoint, and the bloom filter is a
-    ///     latest-state structure too — neither is safe for a historical read.
-    ///   - The in-memory overlay is probed with [`LargeTableEntry::get_at`],
-    ///     which ignores index positions at or above `last_processed` (writes
-    ///     that landed after the checkpoint frontier). On-disk levels are
-    ///     walked identically to `get`: every on-disk entry is below the
-    ///     latched frontier by the `promote_to_flat` invariant (see
-    ///     [`IndexTable::get_at`]), so no extra filtering is required there.
+    /// Differs from [`Self::get`] in how the in-memory overlay is read: it is
+    /// probed with [`LargeTableEntry::get_at`], which ignores index positions
+    /// at or above `last_processed` (writes that landed after the checkpoint
+    /// frontier). On-disk levels are walked identically to `get` — every
+    /// on-disk entry is below the latched frontier by the `promote_to_flat`
+    /// invariant (see [`IndexTable::get_at`]), so no extra filtering is needed.
+    ///
+    /// The bloom filter and value LRU are both reused, soundly:
+    ///   - The bloom only ever yields true negatives ("key not in this cell").
+    ///     Its key set is a superset of every key with any index entry, so a
+    ///     negative means the key is absent from the index entirely — and the
+    ///     checkpoint reads that same index, so it would also miss.
+    ///   - The LRU holds the *latest* value, which may postdate the frontier,
+    ///     so it is consulted only when the key has not been written since the
+    ///     checkpoint — i.e. its as-of-frontier position equals its latest
+    ///     position (`entry.get(k) == as_of`). Then the cached value matches.
     pub fn get_checkpoint<L: Loader>(
         &self,
         context: &KsContext,
@@ -657,13 +663,34 @@ impl LargeTable {
         // the ordering in `get`.
         entry.promote_pending();
 
+        if entry.bloom_filter_not_found(k) {
+            return Ok(context.report_lookup_result(None, LookupSource::Bloom));
+        }
         if entry.state == LargeTableEntryState::Empty {
             return Ok(context.report_lookup_result(None, LookupSource::Cache));
         }
         if entry.state != LargeTableEntryState::Unloaded
             && let Some(found) = entry.get_at(k, last_processed)
         {
-            return Ok(context.report_lookup_result(found.valid(), LookupSource::Cache));
+            let Some(as_of) = found.valid() else {
+                // Deleted as of the frontier — shadows deeper levels.
+                return Ok(context.report_lookup_result(None, LookupSource::Cache));
+            };
+            // Serve from the value LRU only when the key is unchanged since the
+            // checkpoint (its as-of-frontier position is also its latest one);
+            // otherwise the cache holds a newer value. The `is_some` gate comes
+            // first so keyspaces without a value cache skip the extra
+            // `entry.get(k)` index lookup entirely (a leading `let Some(..) =
+            // &mut entry.value_lru` would instead hold a borrow across it).
+            if entry.value_lru.is_some()
+                && entry.get(k) == Some(as_of)
+                && let Some(value_lru) = &mut entry.value_lru
+                && let Some((full_key, value)) = value_lru.get(k)
+            {
+                context.inc_lookup_result(LookupResult::Found, LookupSource::Lru);
+                return Ok(GetResult::Value(full_key.clone(), value.clone()));
+            }
+            return Ok(context.report_lookup_result(Some(as_of), LookupSource::Cache));
         }
         let level_positions = entry.disk_levels_to_walk_for_key(k);
         if level_positions.is_empty() {

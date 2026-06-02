@@ -29,9 +29,11 @@ impl DbCheckpoint {
 
     /// Reads `k` from `ks` as of the checkpoint frontier.
     ///
-    /// Unlike [`Db::get`], this bypasses the value LRU and bloom filter (both
-    /// reflect the latest database state, not the checkpoint) and only
-    /// considers index positions at or below the latched frontier.
+    /// Only index positions at or below the latched frontier are considered
+    /// (see [`crate::large_table::LargeTable::get_checkpoint`]). The bloom
+    /// filter and value LRU are reused soundly: the bloom only short-circuits
+    /// keys absent from the index, and the LRU is consulted only for keys not
+    /// written since the checkpoint.
     pub fn get(&self, ks: KeySpace, k: &[u8]) -> DbResult<Option<Bytes>> {
         let db = self.db.as_ref();
         let context = db.ks_context(ks);
@@ -42,8 +44,8 @@ impl DbCheckpoint {
             .large_table
             .get_checkpoint(context, reduced_key.as_ref(), last_processed, db)?
         {
-            // No LRU is consulted on this path, so `Value` is never produced;
-            // handle it for completeness with the same key check as `Db::get`.
+            // An LRU hit returns the value directly; apply the same index-key
+            // check as `Db::get` for keyspaces that reduce keys.
             GetResult::Value(full_key, value) => {
                 if context.ks_config.need_check_index_key() && full_key.as_ref() != k {
                     return Ok(None);
@@ -130,7 +132,7 @@ impl DbCheckpoint {
 mod tests {
     use crate::config::Config;
     use crate::db::{Db, DbResult};
-    use crate::key_shape::{KeyShape, KeyType};
+    use crate::key_shape::{KeyShape, KeyShapeBuilder, KeySpaceConfig, KeyType};
     use crate::metrics::Metrics;
     use minibytes::Bytes;
     use std::sync::Arc;
@@ -272,6 +274,55 @@ mod tests {
             snapshot,
             collect(checkpoint.iterator(ks)),
             "checkpoint iterator must stay stable after waiting"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_reuses_bloom_and_lru() {
+        let dir = tempdir::TempDir::new("test-checkpoint-bloom-lru").unwrap();
+        let config = Arc::new(Config::small());
+        let mut ksb = KeyShapeBuilder::new();
+        let ksc = KeySpaceConfig::new()
+            .with_value_cache_size(512)
+            .with_bloom_filter(0.01, 2000);
+        let ks = ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ksc);
+        let key_shape = ksb.build();
+        let metrics = Metrics::new();
+        let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+
+        let k = |n: u64| n.to_be_bytes().to_vec();
+        let v = |b: u8| -> Bytes { vec![b].into() };
+
+        db.insert(ks, k(1), v(10)).unwrap(); // unchanged after the checkpoint
+        db.insert(ks, k(2), v(20)).unwrap(); // overwritten after the checkpoint
+        let checkpoint = db.checkpoint();
+        db.insert(ks, k(2), v(21)).unwrap();
+
+        // k1 is unchanged since the checkpoint, so its value is served from the
+        // value LRU without a WAL read — and it is the snapshot value.
+        assert_eq!(Some(v(10)), checkpoint.get(ks, &k(1)).unwrap());
+        // k2 was overwritten after the checkpoint: the LRU holds the new value
+        // (v21) but the freshness guard rejects it, so the checkpoint returns
+        // the as-of-frontier value v(20).
+        assert_eq!(Some(v(20)), checkpoint.get(ks, &k(2)).unwrap());
+        // An absent key is short-circuited by the bloom filter.
+        assert_eq!(None, checkpoint.get(ks, &k(999)).unwrap());
+
+        let lru_hits = metrics
+            .lookup_result
+            .with_label_values(&["k", "found", "lru"])
+            .get();
+        assert!(
+            lru_hits >= 1,
+            "checkpoint read of an unchanged key should hit the value LRU"
+        );
+        let bloom_misses = metrics
+            .lookup_result
+            .with_label_values(&["k", "not_found", "bloom"])
+            .get();
+        assert!(
+            bloom_misses >= 1,
+            "checkpoint read of an absent key should be filtered by the bloom"
         );
     }
 }
