@@ -606,84 +606,66 @@ impl IndexTable {
         self.iter_inner(true)
     }
 
+    /// Merge `flat` and `data` into the table's logical view: one entry per
+    /// unique key, with the `data` overlay shadowing `flat` on ties (matching
+    /// [`Self::get`] priority). Keys are yielded in ascending order. Tombstones
+    /// are included as-is — callers apply their own kind filter.
+    ///
+    /// Both inputs are strictly ascending and individually unique (`flat` by
+    /// construction, `data` via latest-per-key), so this is an O(N+M) merge.
+    /// Flat keys are zero-copy subslices of `self.flat` (`slice_to_bytes`); data
+    /// keys are `Bytes` clones (owner refcount bump). No per-entry heap copy of
+    /// the key bytes is made, and the equal-key case folds the shadowing in
+    /// directly rather than via a separate `data_contains_key` membership probe.
+    fn iter_combined(&self) -> impl Iterator<Item = (Bytes, IndexWalPosition)> + '_ {
+        let flat = &self.flat;
+        let mut flat_it = FlatIter::new(flat, self.key_size).peekable();
+        let mut data_it = self.data_iter_latest().peekable();
+        std::iter::from_fn(move || {
+            // Resolve to an owned `Ordering` first so the peek borrows end
+            // before we advance either iterator below.
+            let cmp = match (flat_it.peek(), data_it.peek()) {
+                (None, None) => return None,
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (Some((fk, _)), Some((bk, _))) => {
+                    let bk_slice: &[u8] = bk.as_ref();
+                    fk.cmp(&bk_slice)
+                }
+            };
+            match cmp {
+                Ordering::Less => {
+                    let (k, iwp) = flat_it.next().unwrap();
+                    Some((flat.slice_to_bytes(k), iwp))
+                }
+                Ordering::Greater => {
+                    let (k, v) = data_it.next().unwrap();
+                    Some((k.clone(), *v))
+                }
+                // Same key: data overlay wins; drop the shadowed flat entry.
+                Ordering::Equal => {
+                    flat_it.next();
+                    let (k, v) = data_it.next().unwrap();
+                    Some((k.clone(), *v))
+                }
+            }
+        })
+    }
+
     fn iter_inner(
         &self,
         include_tombstones: bool,
     ) -> impl Iterator<Item = (Bytes, WalPosition)> + '_ {
-        // Both sources are sorted and disjoint (flat excludes keys present in data).
-        // Merge in O(N+M) rather than collecting and sorting.
-        let mut flat_it = FlatIter::new(&self.flat, self.key_size)
-            .filter(|(k, _)| !self.data_contains_key(k))
-            .filter_map(move |(k, iwp)| {
-                let pos = iwp.into_wal_position();
-                if include_tombstones || pos.is_valid() {
-                    Some((Bytes::from(k.to_vec()), pos))
-                } else {
-                    None
-                }
-            })
-            .peekable();
-        let mut data_it = self
-            .data_iter_latest()
-            .filter_map(move |(k, v)| {
-                let pos = v.into_wal_position();
-                if include_tombstones || pos.is_valid() {
-                    Some((k.clone(), pos))
-                } else {
-                    None
-                }
-            })
-            .peekable();
-
-        let mut result = Vec::with_capacity(self.flat_len() + self.data_unique_key_count());
-        loop {
-            let cmp = match (flat_it.peek(), data_it.peek()) {
-                (None, None) => break,
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (Some((fk, _)), Some((bk, _))) => fk.cmp(bk),
-            };
-            if cmp != Ordering::Greater {
-                result.push(flat_it.next().unwrap());
-            } else {
-                result.push(data_it.next().unwrap());
-            }
-        }
-        result.extend(flat_it);
-        result.extend(data_it);
-        result.into_iter()
+        self.iter_combined().filter_map(move |(k, iwp)| {
+            let pos = iwp.into_wal_position();
+            (include_tombstones || pos.is_valid()).then_some((k, pos))
+        })
     }
 
     pub fn keys(&self) -> impl Iterator<Item = Bytes> + '_ {
-        // Both sources are sorted and disjoint (flat excludes keys present in data).
-        // Merge in O(N+M) rather than collecting and sorting.
-        let mut flat_it = FlatIter::new(&self.flat, self.key_size)
-            .filter(|(k, iwp)| !self.data_contains_key(k) && !iwp.is_removed())
-            .map(|(k, _)| Bytes::from(k.to_vec()))
-            .peekable();
-        let mut data_it = self
-            .data_iter_latest()
-            .filter(|(_, v)| !v.is_removed())
-            .map(|(k, _)| k.clone())
-            .peekable();
-
-        let mut result = Vec::with_capacity(self.flat_len() + self.data_unique_key_count());
-        loop {
-            let cmp = match (flat_it.peek(), data_it.peek()) {
-                (None, None) => break,
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (Some(fk), Some(bk)) => fk.cmp(bk),
-            };
-            if cmp != Ordering::Greater {
-                result.push(flat_it.next().unwrap());
-            } else {
-                result.push(data_it.next().unwrap());
-            }
-        }
-        result.extend(flat_it);
-        result.extend(data_it);
-        result.into_iter()
+        self.iter_combined()
+            .filter(|(_, iwp)| !iwp.is_removed())
+            .map(|(k, _)| k)
     }
 
     /// Writes key-value pairs from IndexTable to a BytesMut buffer.
@@ -1131,37 +1113,11 @@ impl IndexTable {
         F: FnOnce(&mut dyn DoubleEndedIterator<Item = &Bytes>) -> HashSet<Bytes>,
     {
         // Collect all valid unique keys from both flat and data in sorted order.
-        // Both sources are sorted and disjoint (latest-per-key over data) — merge in O(N+M).
-        let all_keys: Vec<Bytes> = {
-            let mut flat_it = FlatIter::new(&self.flat, self.key_size)
-                .filter(|(k, _)| !self.data_contains_key(k))
-                .filter(|(_, iwp)| !iwp.is_removed())
-                .map(|(k, _)| Bytes::from(k.to_vec()))
-                .peekable();
-            let mut data_it = self
-                .data_iter_latest()
-                .filter(|(_, v)| !v.is_removed())
-                .map(|(k, _)| k.clone())
-                .peekable();
-            let mut v: Vec<Bytes> =
-                Vec::with_capacity(self.flat_len() + self.data_unique_key_count());
-            loop {
-                let cmp = match (flat_it.peek(), data_it.peek()) {
-                    (None, None) => break,
-                    (Some(_), None) => Ordering::Less,
-                    (None, Some(_)) => Ordering::Greater,
-                    (Some(fk), Some(bk)) => fk.cmp(bk),
-                };
-                if cmp != Ordering::Greater {
-                    v.push(flat_it.next().unwrap());
-                } else {
-                    v.push(data_it.next().unwrap());
-                }
-            }
-            v.extend(flat_it);
-            v.extend(data_it);
-            v
-        };
+        let all_keys: Vec<Bytes> = self
+            .iter_combined()
+            .filter(|(_, iwp)| !iwp.is_removed())
+            .map(|(k, _)| k)
+            .collect();
 
         let mut iter = all_keys.iter();
         let to_retain = compactor(&mut iter);
