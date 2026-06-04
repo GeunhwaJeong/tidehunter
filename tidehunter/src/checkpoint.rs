@@ -54,6 +54,14 @@ pub struct DbCheckpoint {
     latch: WalTrackerLatch,
 }
 
+impl Drop for DbCheckpoint {
+    fn drop(&mut self) {
+        // The latch is a cheap value token; clone it to hand an owned copy back
+        // to the tracker (the field is behind `&mut self` and cannot be moved).
+        self.db.wal_writer.release_latch(self.latch.clone());
+    }
+}
+
 impl DbCheckpoint {
     pub(crate) fn new(db: Arc<Db>, latch: WalTrackerLatch) -> Self {
         Self { db, latch }

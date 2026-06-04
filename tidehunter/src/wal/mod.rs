@@ -184,6 +184,12 @@ impl WalWriter {
         self.wal_tracker.latch()
     }
 
+    /// Releases a latch acquired via [`Self::latch`] (see
+    /// [`WalTracker::release_latch`]).
+    pub fn release_latch(&self, latch: WalTrackerLatch) {
+        self.wal_tracker.release_latch(latch)
+    }
+
     /// Requests deletion of WAL files that have been fully processed by the relocation process up to the watermark position.
     ///
     /// Given watermark positions will be preserved.

@@ -51,18 +51,19 @@ pub struct WalGuardMaker {
 /// captured by any active latch, even though the tracker keeps processing
 /// allocations internally. This keeps in-memory index updates above that
 /// position considered unprocessed (they stay in the BTreeMap and are not
-/// promoted into flat). When all latches are dropped, the external value
+/// promoted into flat). When all latches are released, the external value
 /// catches up to the internal one.
 ///
-/// Dropping the latch releases it asynchronously by sending a message to the
-/// tracker thread.
+/// The latch is a plain token owned by the tracker: it is constructed by the
+/// tracker thread, returned from [`WalTracker::latch`], and released by handing
+/// it back to [`WalTracker::release_latch`].
 ///
 /// This is a position-pinning latch and is unrelated to the synchronization
 /// primitive [`crate::latch::Latch`].
+#[derive(Clone)]
 pub struct WalTrackerLatch {
     id: u64,
     position: LastProcessed,
-    sender: mpsc::Sender<WalTrackerMessage>,
 }
 
 struct WalTrackerThread {
@@ -93,7 +94,7 @@ struct PendingLatchRequest {
     /// The captured frontier; the reply fires once `last_processed >= target`.
     target: u64,
     id: u64,
-    response: mpsc::Sender<(u64, LastProcessed)>,
+    response: mpsc::Sender<WalTrackerLatch>,
 }
 
 struct WalTrackerState {
@@ -116,12 +117,12 @@ enum WalTrackerMessage {
         result: AllocationResult,
     },
     /// Request a new latch. The tracker assigns an id, captures the current
-    /// received frontier as the latch position, and stores the latch. The reply
-    /// `(id, position)` is deferred until every position below the frontier has
-    /// been processed (`last_processed >= position`).
-    LatchRequest(mpsc::Sender<(u64, LastProcessed)>),
-    /// Release a previously acquired latch. Sent when [`WalTrackerLatch`] is dropped.
-    LatchRelease { id: u64, position: LastProcessed },
+    /// received frontier as the latch position, stores the latch, and replies
+    /// with the [`WalTrackerLatch`]. The reply is deferred until every position
+    /// below the frontier has been processed (`last_processed >= position`).
+    LatchRequest(mpsc::Sender<WalTrackerLatch>),
+    /// Release a previously acquired latch, handing it back to the tracker.
+    LatchRelease(WalTrackerLatch),
     #[cfg(test)]
     Barrier(#[allow(dead_code)] LatchGuard),
 }
@@ -200,7 +201,7 @@ impl WalTracker {
     /// frontier), so on return every position below
     /// [`WalTrackerLatch::position`] is in the in-memory index. While the
     /// returned [`WalTrackerLatch`] is held, [`Self::last_processed`] will not
-    /// advance past that position. Dropping the latch releases it.
+    /// advance past that position. Release it with [`Self::release_latch`].
     ///
     /// The caller must not hold a `WalGuard` for a position below the frontier,
     /// or the awaited position can never be processed and the call deadlocks.
@@ -209,13 +210,18 @@ impl WalTracker {
         let message = WalTrackerMessage::LatchRequest(response);
         let sender = self.sender.as_ref().expect("WalTracker already dropped");
         sender.send(message).ok();
-        let (id, position) = response_rx
+        response_rx
             .recv()
-            .expect("WalTracker thread terminated before replying to latch request");
-        WalTrackerLatch {
-            id,
-            position,
-            sender: sender.clone(),
+            .expect("WalTracker thread terminated before replying to latch request")
+    }
+
+    /// Releases a latch acquired via [`Self::latch`], handing it back to the
+    /// tracker so the externally observed `last_processed` can advance past the
+    /// latch's position once no other latch pins it. Best-effort: if the tracker
+    /// thread is already gone there is nothing to release.
+    pub fn release_latch(&self, latch: WalTrackerLatch) {
+        if let Some(sender) = self.sender.as_ref() {
+            sender.send(WalTrackerMessage::LatchRelease(latch)).ok();
         }
     }
 
@@ -302,17 +308,6 @@ impl WalTrackerLatch {
     }
 }
 
-impl Drop for WalTrackerLatch {
-    fn drop(&mut self) {
-        let message = WalTrackerMessage::LatchRelease {
-            id: self.id,
-            position: self.position,
-        };
-        // Best-effort: if the tracker is already gone, there is nothing to release.
-        self.sender.send(message).ok();
-    }
-}
-
 impl WalTrackerThread {
     pub fn run(mut self) {
         // `recv()` borrows only `self.receiver` for the duration of the call,
@@ -358,7 +353,7 @@ impl WalTrackerThread {
                     let position = LastProcessed::new(target);
                     self.latches.insert((position, id));
                     if self.state.last_processed.as_u64() >= target {
-                        response.send((id, position)).ok();
+                        response.send(WalTrackerLatch { id, position }).ok();
                     } else {
                         self.pending_requests.push(PendingLatchRequest {
                             target,
@@ -368,8 +363,8 @@ impl WalTrackerThread {
                     }
                     self.publish();
                 }
-                WalTrackerMessage::LatchRelease { id, position } => {
-                    self.latches.remove(&(position, id));
+                WalTrackerMessage::LatchRelease(latch) => {
+                    self.latches.remove(&(latch.position, latch.id));
                     self.publish();
                 }
                 #[cfg(test)]
@@ -410,7 +405,10 @@ impl WalTrackerThread {
             if request.target <= last_processed {
                 request
                     .response
-                    .send((request.id, LastProcessed::new(request.target)))
+                    .send(WalTrackerLatch {
+                        id: request.id,
+                        position: LastProcessed::new(request.target),
+                    })
                     .ok();
                 false
             } else {
@@ -636,8 +634,8 @@ mod tests {
         tracker.barrier();
         assert_eq!(tracker.last_processed().as_u64(), a.next_position());
 
-        // Drop the latch: external catches up to the internal value.
-        drop(latch);
+        // Release the latch: external catches up to the internal value.
+        tracker.release_latch(latch);
         tracker.barrier();
         assert_eq!(tracker.last_processed().as_u64(), c.next_position());
     }
@@ -678,13 +676,13 @@ mod tests {
         tracker.barrier();
         assert_eq!(tracker.last_processed().as_u64(), a.next_position());
 
-        // Drop the older latch: external moves to min(internal, l1.position).
-        drop(l0);
+        // Release the older latch: external moves to min(internal, l1.position).
+        tracker.release_latch(l0);
         tracker.barrier();
         assert_eq!(tracker.last_processed().as_u64(), b.next_position());
 
-        // Drop the last latch: external catches up to internal.
-        drop(l1);
+        // Release the last latch: external catches up to internal.
+        tracker.release_latch(l1);
         tracker.barrier();
         assert_eq!(tracker.last_processed().as_u64(), c.next_position());
     }
@@ -724,7 +722,9 @@ mod tests {
                 // reaches the captured frontier (c.next_position()).
                 let latch = tracker.latch();
                 thread_done.store(true, Ordering::SeqCst);
-                latch.position().as_u64()
+                let position = latch.position().as_u64();
+                tracker.release_latch(latch);
+                position
             });
 
             // The latch request is now deferred: the hole at `b` is not filled,
