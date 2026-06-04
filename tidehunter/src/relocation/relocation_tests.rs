@@ -59,6 +59,64 @@ fn list_wal_files(path: &Path) -> Vec<String> {
 }
 
 #[test]
+fn test_checkpoint_survives_relocation_with_unload() {
+    // End-to-end reproduction of the flush/unload-during-checkpoint bug: a busy
+    // cell (so the pre-checkpoint value gets promoted to flat) with an
+    // overwritten key, forced to unload during a held checkpoint by relocation
+    // (snapshot_unload_threshold = 0). Before the fix the checkpoint read the
+    // post-checkpoint value; now it must read the as-of value.
+    let dir = tempdir::TempDir::new("test_ckpt_reloc_unload").unwrap();
+    let mut config = Config::small();
+    config.wal_file_size = 2 * config.frag_size;
+    let config = force_unload_config(&config); // snapshot_unload_threshold = 0
+    let mut ksb = KeyShapeBuilder::new();
+    let ks = ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    let key_shape = ksb.build();
+    let metrics = Metrics::new();
+    let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+
+    let big = |b: u8| -> Vec<u8> { vec![b; 12 * 1000] };
+    let overwritten = 3u64;
+    let untouched = 7u64;
+
+    db.insert(ks, overwritten.to_be_bytes().to_vec(), big(1))
+        .unwrap();
+    db.insert(ks, untouched.to_be_bytes().to_vec(), big(5))
+        .unwrap();
+    for i in 1000..3000u64 {
+        db.insert(ks, i.to_be_bytes().to_vec(), big(7)).unwrap();
+    }
+
+    let checkpoint = db.checkpoint();
+
+    db.insert(ks, overwritten.to_be_bytes().to_vec(), big(2))
+        .unwrap();
+    for i in 3000..3100u64 {
+        db.insert(ks, i.to_be_bytes().to_vec(), big(7)).unwrap();
+    }
+
+    db.start_blocking_relocation();
+
+    let kept = metrics.relocation_kept.with_label_values(&["k"]).get();
+    assert!(kept > 0, "relocation must have relocated entries");
+
+    assert_eq!(
+        checkpoint.get(ks, &overwritten.to_be_bytes()).unwrap(),
+        Some(big(1).into()),
+        "overwritten key: checkpoint must read the as-of-checkpoint value after unload"
+    );
+    assert_eq!(
+        checkpoint.get(ks, &untouched.to_be_bytes()).unwrap(),
+        Some(big(5).into()),
+        "untouched key: checkpoint must read it after unload"
+    );
+    assert_eq!(
+        db.get(ks, &overwritten.to_be_bytes()).unwrap(),
+        Some(big(2).into())
+    );
+}
+
+#[test]
 fn test_wal_relocation_basic_flow() {
     let dir = tempdir::TempDir::new("test_relocation_filter").unwrap();
     let mut config = Config::small();

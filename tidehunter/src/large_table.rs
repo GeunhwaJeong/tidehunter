@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use std::{cmp, mem, thread};
+use std::{cmp, thread};
 
 pub struct LargeTable {
     table: Vec<KsTable>,
@@ -2432,23 +2432,6 @@ impl LargeTableEntry {
                 .with_label_values(&["unmerge"])
                 .inc();
         }
-    }
-
-    #[allow(dead_code)]
-    fn unload_dirty_loaded<L: Loader>(&mut self, loader: &L) -> Result<(), L::Error> {
-        let mut data = Default::default();
-        mem::swap(&mut data, &mut self.data);
-        let mut data = data.into_owned();
-        data.clean_self();
-        // `clean_self` above strips tombstones — this path rewrites a single
-        // blob, so there is nothing below to shadow.
-        // todo - if this line returns error, self.data will be in the inconsistent state
-        let position = loader.flush(self.context.id(), &data)?;
-        self.levels = IndexLevels::single(position);
-        self.state = LargeTableEntryState::Unloaded;
-        self.data = Default::default();
-        self.report_loaded_keys_count();
-        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {

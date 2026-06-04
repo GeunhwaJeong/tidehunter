@@ -1,3 +1,35 @@
+//! Point-in-time read views over a [`Db`] — see [`DbCheckpoint`].
+//!
+//! # The unprocessed-write retention invariant
+//!
+//! A checkpoint captures a WAL frontier `L` (the latched `last_processed`) and
+//! reads as of it: in-memory overlay (BTree) positions are filtered to
+//! `offset < L`, but on-disk index levels (and the in-memory `flat` buffer) are
+//! read **unfiltered** — a checkpoint point read / iterator walks a blob as-is.
+//! For that to be correct the on-disk image must never hold a *user* value newer
+//! than the frontier. That is guaranteed by this invariant:
+//!
+//! > Every user-initiated write (anything except a relocation copy) stays in the
+//! > BTree overlay until `last_processed` advances past its WAL position. A user
+//! > write at position `P` is never promoted to flat nor flushed to disk while it
+//! > is unprocessed (`last_processed <= P`); only once `last_processed > P` may it
+//! > leave the overlay.
+//!
+//! `last_processed` is monotonic, and a live checkpoint *pins* it at `L` through
+//! the WAL-tracker latch, so while the checkpoint is held nothing it considers
+//! post-frontier (`offset >= L`) can reach flat or disk. Reading on-disk levels
+//! unfiltered therefore yields the as-of-`L` value.
+//!
+//! Enforcement points, both keyed on `last_processed`:
+//!   - overlay -> flat: `IndexTable::promote_to_flat` (via `merge_into_flat`,
+//!     which folds only processed positions);
+//!   - overlay -> disk: the flusher calls `IndexTable::retain_processed` on the
+//!     blob before writing it.
+//!
+//! Relocation is the deliberate exception: a relocated copy sits at a WAL-tail
+//! offset (`>= L`) yet holds the as-of-frontier *value*, so an unfiltered read
+//! still returns the correct value (see [`crate::relocation`]).
+
 use crate::cell::CellId;
 use crate::context::DbOpKind;
 use crate::db::{Db, DbResult};

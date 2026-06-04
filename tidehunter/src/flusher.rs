@@ -327,6 +327,10 @@ impl IndexFlusherThread {
         };
         let existing_l1 = current_levels.l1();
 
+        // Unprocessed entries may still be read by an in-flight checkpoint, so
+        // don't merge them to disk; keep them in the in-memory overlay.
+        merged_l0.retain_processed(loader.last_processed_wal_position());
+
         // `RelocationUpdates::apply` uses compare-and-set semantics — it can
         // only rewrite positions for keys already in `merged_l0`. Keys that
         // live only in L1 (the common case for post-promote `[INVALID, L1]`
@@ -906,7 +910,13 @@ mod tests {
         }
 
         fn last_processed_wal_position(&self) -> LastProcessed {
-            LastProcessed::none()
+            // The seeded/flushed entries represent already-processed data being
+            // flushed, so report a frontier above every seeded offset (it is
+            // strictly less than `current_wal_position`). This keeps the
+            // flusher's `retain_processed` filter a no-op for these tests; with
+            // `none()` (= 0) every entry would count as unprocessed and the
+            // whole blob would be dropped.
+            LastProcessed::new(u64::MAX / 2)
         }
 
         fn current_wal_position(&self) -> u64 {

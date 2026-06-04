@@ -411,10 +411,11 @@ impl IndexTable {
     /// `promote_to_flat` only ever moves lower offsets down). So a processed
     /// data entry, when present, is the freshest as-of-frontier value and wins.
     ///
-    /// `flat` is always safe to consult in full: `promote_to_flat` only moves
-    /// entries below the externally observed `last_processed`, and a checkpoint
-    /// latch caps that value at its frontier, so every flat entry has offset
-    /// below the latch frontier and is processed relative to it.
+    /// `flat` is always safe to consult in full: by the unprocessed-write
+    /// retention invariant (see the `crate::checkpoint` module docs) no user
+    /// value newer than the frontier ever reaches flat. (Relocated copies in
+    /// flat can sit at offsets `>= last_processed`, but they hold the
+    /// as-of-frontier value, so reading them unfiltered is still correct.)
     pub fn get_at(&self, k: &[u8], last_processed: LastProcessed) -> Option<WalPosition> {
         if let Some(p) = self.data_get_latest_processed(k, last_processed) {
             return Some(p.into_wal_position());
@@ -1183,6 +1184,25 @@ impl IndexTable {
         self.retain(|k, v| v.is_removed() || to_retain.contains(k));
     }
 
+    /// Drop every post-frontier overlay position (offset `>= last_processed`)
+    /// from the BTree, reducing the table to its as-of-`last_processed` view.
+    /// Used by the flusher so an on-disk blob only holds as-of-frontier data;
+    /// the mirror of [`Self::retain_unprocessed`].
+    ///
+    /// This is the flush-side enforcement of the unprocessed-write retention
+    /// invariant — see the `crate::checkpoint` module docs.
+    ///
+    /// The cutoff is the overlay's alone — flat is left untouched: a relocation
+    /// merge parks an as-of value at a WAL-tail offset (`>= last_processed`) in
+    /// flat that re-filtering would wrongly drop. It is per position, not per
+    /// key — a key may carry both a below- and a post-frontier write.
+    pub fn retain_processed(&mut self, last_processed: LastProcessed) {
+        self.data.retain(|(_, v)| last_processed.is_processed(v));
+        let (kb, dc) = self.recount_stats();
+        self.key_bytes = kb;
+        self.dirty_count = dc;
+    }
+
     /// Apply given update function to a value with a given key.
     /// If the key does not exist, this function completes without calling the update function.
     /// Operates on the latest position for the key.
@@ -1242,6 +1262,11 @@ impl IndexTable {
     const PROMOTE_THRESHOLD: usize = 0;
 
     /// Returns `true` if the flat buffer was updated, `false` if nothing changed.
+    ///
+    /// Folds only processed overlay positions (offset `< last_processed`) into
+    /// flat; unprocessed ones stay in the BTree. This is the promote-side
+    /// enforcement of the unprocessed-write retention invariant — see the
+    /// `crate::checkpoint` module docs.
     pub fn promote_to_flat(&mut self, last_processed: LastProcessed) -> bool {
         self.promote_to_flat_inner(Self::PROMOTE_THRESHOLD, last_processed)
     }

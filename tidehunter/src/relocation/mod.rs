@@ -7,6 +7,7 @@ use crate::large_table::Loader;
 use crate::metrics::Metrics;
 use crate::relocation::watermark::RelocationWatermarks;
 use crate::wal::WalError;
+use crate::wal::position::LastProcessed;
 pub use cell_reference::CellReference;
 use minibytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -389,6 +390,11 @@ impl RelocationDriver {
                 .large_table
                 .get_index_for_cell(db.ks_context(cell.keyspace), &cell.cell_id, db.as_ref())?
                 .unwrap_or(IndexTable::default().into());
+            // Relocate the value as of the checkpoint frontier, not the live
+            // latest: a post-frontier overwrite would otherwise strand the
+            // as-of value (which GC reclaims) that a held checkpoint reads.
+            let mut index = IndexTable::clone(&index);
+            index.retain_processed(LastProcessed::new(upper_limit));
             let context = db.ks_context(cell.keyspace);
             for (reduced_key, position) in index.iter() {
                 if position.offset() < target_position
@@ -483,6 +489,10 @@ impl RelocationDriver {
         // - Fall back to current value-based approach when needed
         let ks_context = db.ks_context(cell_ref.keyspace);
         let keyspace_desc = &ks_context.ks_config;
+        // Relocate the value as of the checkpoint frontier, not the live latest
+        // (see the WAL-based path for why).
+        let mut index = IndexTable::clone(&index);
+        index.retain_processed(LastProcessed::new(effective_limit));
         for (key, position) in index.iter() {
             if position.offset() >= effective_limit {
                 continue;
