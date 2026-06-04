@@ -58,19 +58,17 @@ fn list_wal_files(path: &Path) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-#[test]
-fn test_checkpoint_survives_relocation_with_unload() {
-    // End-to-end reproduction of the flush/unload-during-checkpoint bug: a busy
-    // cell (so the pre-checkpoint value gets promoted to flat) with an
-    // overwritten key, forced to unload during a held checkpoint by relocation
-    // (snapshot_unload_threshold = 0). Before the fix the checkpoint read the
-    // post-checkpoint value; now it must read the as-of value.
-    let dir = tempdir::TempDir::new("test_ckpt_reloc_unload").unwrap();
-    let mut config = Config::small();
-    config.wal_file_size = 2 * config.frag_size;
-    let config = force_unload_config(&config); // snapshot_unload_threshold = 0
+// A checkpoint must keep reading the as-of-frontier values across a relocation
+// that runs while it is held: a pre-checkpoint key is overwritten after the
+// checkpoint and then relocation rewrites positions / reclaims WAL files. Run
+// against two configs (see the two tests below): forced unload, where the cell
+// unloads and the as-of value is read from the relocated on-disk blob; and
+// unloading disabled, where the cell stays loaded and the as-of value must
+// survive in the in-memory overlay.
+fn checkpoint_survives_relocation(config: Arc<Config>, ksc: KeySpaceConfig) {
+    let dir = tempdir::TempDir::new("test_ckpt_reloc").unwrap();
     let mut ksb = KeyShapeBuilder::new();
-    let ks = ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    let ks = ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ksc);
     let key_shape = ksb.build();
     let metrics = Metrics::new();
     let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
@@ -83,6 +81,8 @@ fn test_checkpoint_survives_relocation_with_unload() {
         .unwrap();
     db.insert(ks, untouched.to_be_bytes().to_vec(), big(5))
         .unwrap();
+    // Enough padding to push the relocation target past several WAL files so it
+    // actually relocates (rewrites positions), not a no-op.
     for i in 1000..3000u64 {
         db.insert(ks, i.to_be_bytes().to_vec(), big(7)).unwrap();
     }
@@ -97,23 +97,54 @@ fn test_checkpoint_survives_relocation_with_unload() {
 
     db.start_blocking_relocation();
 
+    // Sanity: relocation actually relocated entries (otherwise this test is
+    // vacuous — it must exercise the position-rewrite path).
     let kept = metrics.relocation_kept.with_label_values(&["k"]).get();
-    assert!(kept > 0, "relocation must have relocated entries");
+    assert!(
+        kept > 0,
+        "relocation must have relocated entries for this test to be meaningful"
+    );
 
+    // Checkpoint reads the as-of-frontier values.
     assert_eq!(
         checkpoint.get(ks, &overwritten.to_be_bytes()).unwrap(),
         Some(big(1).into()),
-        "overwritten key: checkpoint must read the as-of-checkpoint value after unload"
+        "overwritten key as of checkpoint"
     );
     assert_eq!(
         checkpoint.get(ks, &untouched.to_be_bytes()).unwrap(),
         Some(big(5).into()),
-        "untouched key: checkpoint must read it after unload"
+        "untouched key as of checkpoint (relocation rewrite hazard)"
+    );
+    // Live reads reflect the latest values after relocation.
+    assert_eq!(
+        db.get(ks, &untouched.to_be_bytes()).unwrap(),
+        Some(big(5).into())
     );
     assert_eq!(
         db.get(ks, &overwritten.to_be_bytes()).unwrap(),
         Some(big(2).into())
     );
+}
+
+#[test]
+fn test_checkpoint_survives_relocation_with_unload() {
+    // Forced unload during the held checkpoint (snapshot_unload_threshold = 0):
+    // the cell unloads, so the checkpoint reads the as-of value from the
+    // relocated on-disk blob rather than the post-checkpoint value.
+    let mut config = Config::small();
+    config.wal_file_size = 2 * config.frag_size;
+    checkpoint_survives_relocation(force_unload_config(&config), KeySpaceConfig::new());
+}
+
+#[test]
+fn test_checkpoint_survives_relocation_without_unload() {
+    // Unloading disabled: the cell stays loaded, so the as-of value must survive
+    // relocation in the in-memory overlay (relocation rewrites its position to
+    // >= L and reclaims the original frame).
+    let mut config = Config::small();
+    config.wal_file_size = 2 * config.frag_size;
+    checkpoint_survives_relocation(Arc::new(config), KeySpaceConfig::new().disable_unload());
 }
 
 #[test]

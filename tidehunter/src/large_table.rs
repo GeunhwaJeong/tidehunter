@@ -2296,6 +2296,22 @@ impl LargeTableEntry {
             return Ok(());
         };
         self.last_processed = last_processed;
+        if self.context.ks_config.unloading_disabled() && self.state.is_loaded() {
+            // An unloading-disabled cell is never evicted, so its reads stay on
+            // the in-memory overlay and never fall through to the freshly
+            // written blob. Relocation just moved this cell's as-of values to
+            // new WAL positions and reclaimed the old frames, so re-point the
+            // overlay: adopt the blob's flat (the as-of view, incl. relocated
+            // copies) and keep only post-frontier writes in the BTree. Without
+            // this the overlay would keep below-frontier positions whose frames
+            // are now gone. `clear_after_flush` below then just fixes up state
+            // (its loaded branch keeps `self.data` as-is).
+            let blob = match new_levels.l0() {
+                Some(pos) => loader.load(&self.context.ks_config, pos)?,
+                None => IndexTable::default(),
+            };
+            self.data.make_mut().rebase_on_as_of(blob, last_processed);
+        }
         self.clear_after_flush(new_levels, last_processed, true);
         Ok(())
     }

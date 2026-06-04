@@ -1203,6 +1203,36 @@ impl IndexTable {
         self.dirty_count = dc;
     }
 
+    /// Rebase a still-loaded overlay onto a freshly flushed as-of-`last_processed`
+    /// blob: adopt `as_of`'s flat as the base, keep only the post-frontier overlay
+    /// writes (offset `>= last_processed`) on top.
+    ///
+    /// Used **only** by the relocation flush of an unloading-disabled cell
+    /// (`LargeTableEntry::sync_flush`) — the single path where a cell stays loaded
+    /// while relocation moves its as-of values to new WAL positions and reclaims
+    /// the old frames, so the loaded overlay must be re-pointed at the surviving
+    /// copies. Every other flush either unloads the cell (reads then fall through
+    /// to the relocated on-disk blob) or does no WAL GC, so none of them need this.
+    ///
+    /// `as_of` is disk-loaded (flat-only). Post-frontier tuples are re-inserted
+    /// raw, bypassing `checked_insert`'s increasing-offset assertion — a relocated
+    /// flat copy can transiently sit above a post-frontier write for the same key.
+    pub fn rebase_on_as_of(&mut self, as_of: IndexTable, last_processed: LastProcessed) {
+        let post_frontier: Vec<(Bytes, IndexWalPosition)> = self
+            .data
+            .iter()
+            .filter(|(_, v)| !last_processed.is_processed(v))
+            .cloned()
+            .collect();
+        *self = as_of;
+        for entry in post_frontier {
+            self.data.insert(entry);
+        }
+        let (kb, dc) = self.recount_stats();
+        self.key_bytes = kb;
+        self.dirty_count = dc;
+    }
+
     /// Apply given update function to a value with a given key.
     /// If the key does not exist, this function completes without calling the update function.
     /// Operates on the latest position for the key.
