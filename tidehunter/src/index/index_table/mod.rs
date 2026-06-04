@@ -1398,37 +1398,78 @@ impl IndexTable {
     /// strictly greater than `prev` that has at least one processed position,
     /// paired with that key's latest processed `IndexWalPosition`. Keys whose
     /// positions all postdate the frontier are skipped over.
+    ///
+    /// Single ascending range scan grouped by key: one bound allocation, no
+    /// per-candidate re-bisect. Within a same-key group entries ascend by
+    /// `(offset, ..)`, so the latest processed position is the last tuple below
+    /// the frontier.
     fn data_next_forward_at(
         &self,
         prev: Option<&[u8]>,
         last_processed: LastProcessed,
     ) -> Option<(Bytes, IndexWalPosition)> {
-        let mut cursor: Option<Vec<u8>> = prev.map(|p| p.to_vec());
-        loop {
-            // Clone the key first so the borrow from `data_next_forward` ends
-            // before we re-borrow `self.data` in `data_get_latest_processed`.
-            let key = self.data_next_forward(cursor.as_deref())?.0.clone();
-            if let Some(iwp) = self.data_get_latest_processed(&key, last_processed) {
-                return Some((key, iwp));
+        let start: Bound<(Bytes, IndexWalPosition)> = match prev {
+            Some(p) => Bound::Excluded((Bytes::from(p.to_vec()), IndexWalPosition::MAX)),
+            None => Bound::Unbounded,
+        };
+        let mut iter = self.data.range((start, Bound::Unbounded));
+        let mut cur = iter.next();
+        while let Some((key, iwp)) = cur {
+            let mut latest_processed = last_processed.is_processed(iwp).then_some(*iwp);
+            loop {
+                cur = iter.next();
+                match cur {
+                    Some((k, v)) if k == key => {
+                        if last_processed.is_processed(v) {
+                            latest_processed = Some(*v);
+                        }
+                    }
+                    // Group ended; `cur` now holds the next group's first tuple
+                    // (or None) for the outer loop to pick up.
+                    _ => break,
+                }
             }
-            cursor = Some(key.to_vec());
+            if let Some(found) = latest_processed {
+                return Some((key.clone(), found));
+            }
         }
+        None
     }
 
     /// As-of-`last_processed` backward counterpart of [`Self::data_next_forward_at`].
+    ///
+    /// Single descending range scan grouped by key. Within a group descending
+    /// by `(offset, ..)` the first processed tuple encountered has the largest
+    /// offset, i.e. is the latest processed position.
     fn data_next_reverse_at(
         &self,
         prev: Option<&[u8]>,
         last_processed: LastProcessed,
     ) -> Option<(Bytes, IndexWalPosition)> {
-        let mut cursor: Option<Vec<u8>> = prev.map(|p| p.to_vec());
-        loop {
-            let key = self.data_next_reverse(cursor.as_deref())?.0.clone();
-            if let Some(iwp) = self.data_get_latest_processed(&key, last_processed) {
-                return Some((key, iwp));
+        let end: Bound<(Bytes, IndexWalPosition)> = match prev {
+            Some(p) => Bound::Excluded((Bytes::from(p.to_vec()), IndexWalPosition::MIN)),
+            None => Bound::Unbounded,
+        };
+        let mut iter = self.data.range((Bound::Unbounded, end)).rev();
+        let mut cur = iter.next();
+        while let Some((key, iwp)) = cur {
+            let mut latest_processed = last_processed.is_processed(iwp).then_some(*iwp);
+            loop {
+                cur = iter.next();
+                match cur {
+                    Some((k, v)) if k == key => {
+                        if latest_processed.is_none() && last_processed.is_processed(v) {
+                            latest_processed = Some(*v);
+                        }
+                    }
+                    _ => break,
+                }
             }
-            cursor = Some(key.to_vec());
+            if let Some(found) = latest_processed {
+                return Some((key.clone(), found));
+            }
         }
+        None
     }
 
     /// Single-pass recount of `(data_key_bytes, dirty_count)`. Both counters
@@ -3021,6 +3062,79 @@ mod tests {
         assert_eq!(n, (Bytes::from(vec![2]), WalPosition::test_value(30)));
         let n = table.next_entry(Some(vec![2].into()), true).unwrap();
         assert_eq!(n, (Bytes::from(vec![1]), WalPosition::test_value(10)));
+    }
+
+    #[test]
+    fn test_next_entry_at_returns_latest_processed_position() {
+        // Key [2] carries a processed (@10) and a post-frontier (@100) position.
+        // As-of frontier=50, both directions must surface the latest *processed*
+        // position (@10), never the post-frontier one.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(5));
+        table.insert(vec![2].into(), WalPosition::test_value(10));
+        table.insert(vec![2].into(), WalPosition::test_value(100));
+        table.insert(vec![3].into(), WalPosition::test_value(40));
+        let lp = LastProcessed::new_test(50);
+
+        let fwd = table
+            .next_entry_at(Some(vec![1].into()), false, lp)
+            .unwrap();
+        assert_eq!(fwd, (Bytes::from(vec![2]), WalPosition::test_value(10)));
+        let rev = table.next_entry_at(Some(vec![3].into()), true, lp).unwrap();
+        assert_eq!(rev, (Bytes::from(vec![2]), WalPosition::test_value(10)));
+        assert_eq!(table.get_at(&[2], lp), Some(WalPosition::test_value(10)));
+    }
+
+    #[test]
+    fn test_next_entry_at_skips_key_with_only_post_frontier_positions() {
+        // Key [2]'s positions are all post-frontier (@100, @200). As-of
+        // frontier=50 it must be skipped entirely; iteration lands on the next
+        // processed key in each direction.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(5));
+        table.insert(vec![2].into(), WalPosition::test_value(100));
+        table.insert(vec![2].into(), WalPosition::test_value(200));
+        table.insert(vec![3].into(), WalPosition::test_value(40));
+        let lp = LastProcessed::new_test(50);
+
+        let fwd = table
+            .next_entry_at(Some(vec![1].into()), false, lp)
+            .unwrap();
+        assert_eq!(fwd, (Bytes::from(vec![3]), WalPosition::test_value(40)));
+        let rev = table.next_entry_at(Some(vec![3].into()), true, lp).unwrap();
+        assert_eq!(rev, (Bytes::from(vec![1]), WalPosition::test_value(5)));
+        assert_eq!(table.get_at(&[2], lp), None);
+    }
+
+    #[test]
+    fn test_next_entry_at_forward_reverse_agree_on_within_group_selection() {
+        // Key [2] has three positions @10/@20/@30. Forward selects the last
+        // tuple below the frontier; reverse selects the first one descending.
+        // Both must resolve to the same latest-processed position.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(5));
+        table.insert(vec![2].into(), WalPosition::test_value(10));
+        table.insert(vec![2].into(), WalPosition::test_value(20));
+        table.insert(vec![2].into(), WalPosition::test_value(30));
+        table.insert(vec![3].into(), WalPosition::test_value(40));
+
+        // frontier=25: @10,@20 processed, @30 post-frontier → latest processed @20.
+        let lp = LastProcessed::new_test(25);
+        let fwd = table
+            .next_entry_at(Some(vec![1].into()), false, lp)
+            .unwrap();
+        let rev = table.next_entry_at(Some(vec![3].into()), true, lp).unwrap();
+        assert_eq!(fwd, (Bytes::from(vec![2]), WalPosition::test_value(20)));
+        assert_eq!(rev, (Bytes::from(vec![2]), WalPosition::test_value(20)));
+
+        // frontier=1000: all processed → latest processed @30.
+        let lp = LastProcessed::new_test(1000);
+        let fwd = table
+            .next_entry_at(Some(vec![1].into()), false, lp)
+            .unwrap();
+        let rev = table.next_entry_at(Some(vec![3].into()), true, lp).unwrap();
+        assert_eq!(fwd, (Bytes::from(vec![2]), WalPosition::test_value(30)));
+        assert_eq!(rev, (Bytes::from(vec![2]), WalPosition::test_value(30)));
     }
 
     #[test]
