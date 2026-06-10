@@ -58,20 +58,29 @@ pub struct IndexTable {
     /// Stores Clean, Modified, and Removed entries. Entries in `data` (the write
     /// buffer) take priority over entries in `flat` for the same key.
     ///
-    /// **Invariant (set by `promote_to_flat`):** every entry written here has WAL
-    /// `offset` strictly below the `last_processed` threshold passed to the
-    /// promote that introduced it. Because `last_processed` is monotonically
-    /// non-decreasing, this is the property `has_unprocessed` and
-    /// `retain_unprocessed` rely on to treat flat as fully processed against any
-    /// later caller-supplied `last_processed`.
+    /// **Invariant: flat never holds an in-flight entry**, which is what
+    /// `has_unprocessed` and `retain_unprocessed` rely on to treat it as fully
+    /// processed against any caller-supplied `last_processed`. Each of its
+    /// writers maintains this independently:
+    /// - `promote_to_flat` admits only entries with WAL `offset` strictly
+    ///   below the promote's `last_processed` threshold (monotonically
+    ///   non-decreasing across promotes).
+    /// - `merge_dirty` → `fold_dirty_flat` folds a disk-loaded blob's flat
+    ///   into this buffer — never into `data`. A blob carries no in-flight
+    ///   entries: the flusher filters the merged table with `retain_processed`
+    ///   before serializing, and the blob entries that can still sit at or
+    ///   above a caller's frontier — relocated copies re-pointed to WAL-tail
+    ///   offsets and `INVALID`-sentinel tombstones — are durable in the blob
+    ///   itself, so treating them as processed is sound.
+    /// - WAL replay (`from_sorted_entries`) builds flat from replayed
+    ///   entries, all below the post-replay frontier any later caller can
+    ///   observe.
     ///
-    /// Disk-loaded flat is the one exception: a flushed-to-disk blob can carry
-    /// in-flight (unprocessed) entries from its snapshot. `maybe_load` →
-    /// `merge_dirty_no_clean` (see `mod.rs:165`) compensates by re-inserting
-    /// every prior in-memory entry — including the contents of the old
-    /// `flat` — into the *new* `data` BTreeMap, so any unprocessed entry from
-    /// disk-loaded flat is also reachable via `data` and the
-    /// `has_unprocessed`/`retain_unprocessed` contract still holds.
+    /// The complementary invariant — disk-derived entries (relocated copies,
+    /// `INVALID`-sentinel tombstones) live only here, never in `data`, which
+    /// holds only genuine in-memory WAL writes — is what makes
+    /// `retain_processed`'s frontier predicate on `data` sound; see the
+    /// `debug_assert` there.
     flat: Bytes,
     /// Fixed key size for this key space, or `None` for variable-length keys.
     /// Determines which flat format is used.
@@ -279,7 +288,9 @@ impl IndexTable {
     /// dropped so the flat value is the one observed. In every production
     /// caller `self` is a freshly-loaded merge base with empty `data`, so that
     /// cleanup is a no-op there; it only matters for synthetic callers that
-    /// pre-seed `self.data` with values older than `dirty`.
+    /// pre-seed `self.data` with values older than `dirty` (debug asserts
+    /// enforce the "older" contract on both the dropped tuples and equal-key
+    /// flat entries).
     ///
     /// Returns the number of dirty (non-clean) entries in the rebuilt `flat`,
     /// so the caller can finish its stats without re-decoding the blob.
@@ -308,7 +319,7 @@ impl IndexTable {
         // up front avoids the reallocation growth of an unbounded push loop.
         let cap = flat_count(&self_flat, self.key_size) + flat_count(&dirty.flat, dirty.key_size);
         let mut merged: Vec<(Bytes, IndexWalPosition)> = Vec::with_capacity(cap);
-        let mut keys_from_dirty: Vec<Bytes> = Vec::new();
+        let mut keys_from_dirty: Vec<(Bytes, IndexWalPosition)> = Vec::new();
 
         loop {
             let ord = match (self_it.peek(), dirty_it.peek()) {
@@ -328,7 +339,7 @@ impl IndexTable {
                         continue; // overlay carries the fresher value
                     }
                     let key = dirty.flat.slice_to_bytes(k);
-                    keys_from_dirty.push(key.clone());
+                    keys_from_dirty.push((key.clone(), v));
                     merged.push((key, demote(v)));
                 }
                 Ordering::Equal => {
@@ -338,8 +349,20 @@ impl IndexTable {
                         // Overlay is freshest; keep self.flat's entry beneath it.
                         merged.push((self_flat.slice_to_bytes(sk), sv));
                     } else {
+                        // Caller contract: `dirty` is the fresher side. Offsets
+                        // are comparable unless either side is a disk tombstone
+                        // (`INVALID` sentinel offset, meaningless for ordering).
+                        debug_assert!(
+                            sv.offset == WalPosition::INVALID.offset()
+                                || dv.offset == WalPosition::INVALID.offset()
+                                || dv.offset >= sv.offset,
+                            "fold_dirty_flat: dirty.flat entry at offset {} is older than \
+                             self.flat entry at offset {} for the same key",
+                            dv.offset,
+                            sv.offset
+                        );
                         let key = dirty.flat.slice_to_bytes(dk);
-                        keys_from_dirty.push(key.clone());
+                        keys_from_dirty.push((key.clone(), dv));
                         merged.push((key, demote(dv)));
                     }
                 }
@@ -347,11 +370,22 @@ impl IndexTable {
         }
 
         // Drop overlay tuples shadowed by a value just taken from dirty.flat.
-        for key in keys_from_dirty {
+        for (key, winner) in keys_from_dirty {
             let lower = (key.clone(), IndexWalPosition::MIN);
             let upper = (key, IndexWalPosition::MAX);
             let stale: Vec<_> = self.data.range(lower..=upper).cloned().collect();
             for e in stale {
+                // Caller contract: any same-key `self.data` tuple is older than
+                // the dirty.flat value shadowing it — dropping a newer tuple
+                // here would lose a write. (A tombstone winner sits at the
+                // INVALID sentinel offset u64::MAX, trivially satisfying this.)
+                debug_assert!(
+                    e.1.offset <= winner.offset,
+                    "fold_dirty_flat: dropping self.data tuple at offset {} newer than \
+                     the dirty.flat value at offset {} that shadows it",
+                    e.1.offset,
+                    winner.offset
+                );
                 self.data.remove(&e);
             }
         }
@@ -1163,11 +1197,9 @@ impl IndexTable {
 
     /// Retain only unprocessed entries (those with WAL offset >= last_processed).
     ///
-    /// Callers (`clear_after_flush`) pass a `last_processed` value at or above
-    /// every threshold ever used by `promote_to_flat` on this entry, so by
-    /// invariant every flat entry is processed and `flat` is cleared
-    /// unconditionally. The BTreeMap still holds entries on both sides of the
-    /// boundary and is filtered.
+    /// By the `flat` field invariant (no in-flight entries, see its doc),
+    /// `flat` is cleared unconditionally. The BTreeMap still holds entries on
+    /// both sides of the boundary and is filtered.
     pub fn retain_unprocessed(&mut self, last_processed: LastProcessed) {
         self.flat = Bytes::default();
         self.retain(|_, v| !last_processed.is_processed(v));
@@ -1175,13 +1207,9 @@ impl IndexTable {
 
     /// Returns true if this index table has any unprocessed entries.
     ///
-    /// Only the data set (write buffer) needs to be checked. By the
-    /// `promote_to_flat` invariant every flat entry has WAL offset below the
-    /// threshold observed at its most recent promote, and the caller always
-    /// passes a `last_processed` at or above that threshold (it is either the
-    /// `pending_last_processed` that bounded the promote, or the current
-    /// loader position which is monotonically larger). So flat is guaranteed
-    /// fully processed and contributes no unprocessed entries.
+    /// Only the data set (write buffer) needs to be checked: by the `flat`
+    /// field invariant (no in-flight entries, see its doc), flat contributes
+    /// no unprocessed entries against any caller-supplied `last_processed`.
     pub fn has_unprocessed(&self, last_processed: LastProcessed) -> bool {
         self.data
             .iter()
@@ -1260,6 +1288,12 @@ impl IndexTable {
         // are never lifted here — see `merge_dirty`. Were such an entry present
         // its sentinel offset would read as "post-frontier" and be dropped,
         // resurrecting the value it shadows.
+        //
+        // The assert below cannot catch every violation: `apply_update` lifts
+        // re-pointed relocated copies into `data` at genuine WAL-tail offsets
+        // (>= the frontier), which this filter would also wrongly drop. That is
+        // an ordering requirement on the flush path — this filter must run
+        // before `RelocationUpdates::apply`, never after (see `flusher.rs`).
         debug_assert!(
             self.data
                 .iter()

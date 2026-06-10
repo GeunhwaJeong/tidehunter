@@ -329,6 +329,12 @@ impl IndexFlusherThread {
 
         // Unprocessed entries may still be read by an in-flight checkpoint, so
         // don't merge them to disk; keep them in the in-memory overlay.
+        //
+        // Ordering: this frontier filter must run before
+        // `RelocationUpdates::apply` below. `apply` lifts re-pointed
+        // disk-derived entries (relocated copies at WAL-tail offsets, i.e.
+        // >= the frontier) into `data`, where this offset predicate would
+        // misread them as unprocessed in-flight writes and drop them.
         merged_l0.retain_processed(loader.last_processed_wal_position());
 
         // `RelocationUpdates::apply` uses compare-and-set semantics — it can
