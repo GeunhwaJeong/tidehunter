@@ -914,13 +914,30 @@ impl LargeTable {
         }
     }
 
-    /// Get a shared reference to the index for a specific cell.
-    /// Returns None if the cell doesn't exist.
+    /// Returns the **as-of-`last_processed`** index view for a cell: the on-disk
+    /// levels merged under the in-memory overlay, with the overlay reduced to its
+    /// below-`last_processed` positions. Returns `None` if the cell doesn't exist.
+    ///
+    /// Used by relocation, which must relocate the as-of-frontier value of every
+    /// key (not the live latest) so a held checkpoint can still read it after GC
+    /// reclaims the original WAL file.
+    ///
+    /// Correctness hinge: the overlay is filtered (`retain_processed`) on its
+    /// *uncollapsed* positions, BEFORE the latest-per-key collapse that
+    /// `maybe_load`/`merge_dirty` perform. A key with a below-frontier write
+    /// shadowed by a post-frontier overwrite holds both positions in the overlay;
+    /// collapsing first keeps only the latest (post-frontier) one, which the
+    /// filter then drops — losing the as-of value entirely and stranding its WAL
+    /// file for GC. We therefore build the view here without `maybe_load` (which
+    /// would also destructively collapse the live cell's overlay). `retain_processed`
+    /// touches only `data`; disk-derived levels are merged unfiltered (they are
+    /// as-of-safe by the unprocessed-write retention invariant — see `crate::checkpoint`).
     pub fn get_index_for_cell<L: Loader>(
         &self,
         context: &KsContext,
         cell_id: &CellId,
         loader: &L,
+        last_processed: LastProcessed,
     ) -> Result<Option<Arc<IndexTable>>, L::Error> {
         let mutex_index = context.ks_config.mutex_for_cell(cell_id);
         let mut row = self.row_by_mutex(context, mutex_index);
@@ -932,24 +949,25 @@ impl LargeTable {
 
         entry.promote_pending();
 
-        // Load the entry if it's unloaded
-        // TODO: doing this will mean all entries will be loaded in memory during relocation
-        // and at some point we might want to find a way to avoid it
-        entry.maybe_load(loader)?;
+        // As-of overlay: clone the (uncollapsed) in-memory overlay and drop its
+        // post-frontier positions before any merge collapses to latest-per-key.
+        let mut overlay = IndexTable::clone(&entry.data);
+        overlay.retain_processed(last_processed);
 
-        // Fast path: single-level cell — entry.data is the complete view.
-        if entry.levels().l1().is_none() {
-            return Ok(Some(entry.data.clone_shared()));
+        // Base = the on-disk levels the overlay sits on. Load L1; for an unloaded
+        // cell L0 is still on disk (not folded into `entry.data`), so merge it over
+        // L1. For a loaded cell L0 already lives in `entry.data` (and thus `overlay`).
+        let mut merged = match entry.levels().l1() {
+            Some(l1_pos) => loader.load(&entry.context.ks_config, l1_pos)?,
+            None => IndexTable::default(),
+        };
+        if entry.as_unloaded_state().is_some()
+            && let Some(l0_pos) = entry.levels().l0()
+        {
+            let l0 = loader.load(&entry.context.ks_config, l0_pos)?;
+            merged.merge_dirty_and_clean(&l0);
         }
-
-        // Multi-level cell (e.g., post-promote [INVALID, L1] or two-level [L0, L1]):
-        // maybe_load only populates entry.data from L0 (see its doc comment for why
-        // L1 cannot be folded into entry.data). For relocation and other consumers
-        // that need a full per-cell key view, merge L1 under entry.data here without
-        // mutating entry state.
-        let l1_pos = entry.levels().l1().expect("checked above that l1 is Some");
-        let mut merged = loader.load(&entry.context.ks_config, l1_pos)?;
-        merged.merge_dirty_and_clean(&entry.data);
+        merged.merge_dirty_and_clean(&overlay);
         Ok(Some(Arc::new(merged)))
     }
 

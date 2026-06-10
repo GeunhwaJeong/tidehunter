@@ -316,7 +316,8 @@ impl RelocationDriver {
             db.config.batch_codec.is_none(),
             "wal-based relocation does not support Config::batch_codec yet"
         );
-        let upper_limit = db.wal_writer.last_processed().as_u64();
+        let last_processed = db.wal_writer.last_processed();
+        let upper_limit = last_processed.as_u64();
         let min_wal_position = db.wal.min_wal_position();
         let mut wal_iterator = db.wal.wal_iterator_for_scan(min_wal_position)?;
 
@@ -386,15 +387,21 @@ impl RelocationDriver {
             let batch_limit = db.config.relocation_batch_max_bytes();
             let mut batch =
                 RelocatedWriteBatch::new(cell.keyspace, cell.cell_id.clone(), target_position);
-            let index = db
-                .large_table
-                .get_index_for_cell(db.ks_context(cell.keyspace), &cell.cell_id, db.as_ref())?
-                .unwrap_or(IndexTable::default().into());
             // Relocate the value as of the checkpoint frontier, not the live
             // latest: a post-frontier overwrite would otherwise strand the
             // as-of value (which GC reclaims) that a held checkpoint reads.
-            let mut index = IndexTable::clone(&index);
-            index.retain_processed(LastProcessed::new(upper_limit));
+            // `get_index_for_cell` returns that as-of view directly — the overlay
+            // is filtered to < `last_processed` before any latest-per-key collapse,
+            // and the on-disk levels it merges under are already as-of-safe.
+            let index = db
+                .large_table
+                .get_index_for_cell(
+                    db.ks_context(cell.keyspace),
+                    &cell.cell_id,
+                    db.as_ref(),
+                    last_processed,
+                )?
+                .unwrap_or(IndexTable::default().into());
             let context = db.ks_context(cell.keyspace);
             for (reduced_key, position) in index.iter() {
                 if position.offset() < target_position
@@ -460,11 +467,13 @@ impl RelocationDriver {
         let mut context = CellProcessingContext::new(batch);
         let mut removed_count = 0;
 
-        // Phase A: Get shared reference to cell index
+        // Phase A: Get shared reference to cell index, as of the relocation
+        // frontier (filters the overlay before any latest-per-key collapse).
         let index = match db.large_table.get_index_for_cell(
             db.ks_context(cell_ref.keyspace),
             &cell_ref.cell_id,
             db.as_ref(),
+            LastProcessed::new(effective_limit),
         )? {
             Some(index) => index,
             None => {
@@ -490,9 +499,9 @@ impl RelocationDriver {
         let ks_context = db.ks_context(cell_ref.keyspace);
         let keyspace_desc = &ks_context.ks_config;
         // Relocate the value as of the checkpoint frontier, not the live latest
-        // (see the WAL-based path for why).
-        let mut index = IndexTable::clone(&index);
-        index.retain_processed(LastProcessed::new(effective_limit));
+        // (see the WAL-based path for why). `get_index_for_cell` already returns
+        // the as-of view; the loop below skips any on-disk entry still at >= the
+        // cutoff.
         for (key, position) in index.iter() {
             if position.offset() >= effective_limit {
                 continue;

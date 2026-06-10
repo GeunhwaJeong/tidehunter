@@ -147,6 +147,85 @@ fn test_checkpoint_survives_relocation_without_unload() {
     checkpoint_survives_relocation(Arc::new(config), KeySpaceConfig::new().disable_unload());
 }
 
+// Regression: a key overwritten after a checkpoint, whose as-of value lives as a
+// distinct *overlay* position (not promoted to flat/L1) in a multi-level/unloaded
+// cell, must survive relocation. Before the fix, `get_index_for_cell` collapsed
+// the overlay to latest-per-key before `retain_processed`, discarding the
+// below-frontier value; it was never relocated, and GC reclaimed its WAL file, so
+// the held checkpoint read `None`.
+#[test]
+fn test_checkpoint_survives_relocation_overlay_asof_value() {
+    let dir = tempdir::TempDir::new("ckpt_reloc_overlay_asof").unwrap();
+    let mut config = Config::small();
+    config.wal_file_size = 2 * config.frag_size;
+    let config = force_unload_config(&config); // snapshot_unload_threshold = 0
+    let mut ksb = KeyShapeBuilder::new();
+    let ks = ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    let ks2 = ksb.add_key_space_config("k2", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    let key_shape = ksb.build();
+    let metrics = Metrics::new();
+    let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+
+    let big = |b: u8| -> Vec<u8> { vec![b; 12 * 1000] };
+    let target = 3u64;
+
+    // 1. Build a cell from OTHER keys (not `target`); flush it to disk
+    //    synchronously so the bulk lives on-disk and the overlay is clean.
+    //    Two force-rebuilds encourage an L0->L1 compaction (multi-level cell).
+    for i in 1000..3000u64 {
+        db.insert(ks, i.to_be_bytes().to_vec(), big(7)).unwrap();
+    }
+    db.force_rebuild_control_region().unwrap();
+    db.force_rebuild_control_region().unwrap();
+
+    // 2. Insert the target's as-of value into a fresh overlay over the on-disk
+    //    cell. One dirty key (< max_dirty_keys=32) => stays in `data`.
+    db.insert(ks, target.to_be_bytes().to_vec(), big(1))
+        .unwrap();
+
+    // 3. Pin a checkpoint at this frontier (target == big(1) as of here).
+    let checkpoint = db.checkpoint();
+    assert_eq!(
+        checkpoint.get(ks, &target.to_be_bytes()).unwrap(),
+        Some(big(1).into()),
+        "SANITY: as-of read works right after checkpoint"
+    );
+
+    // 4. Overwrite target after the frontier => overlay holds BOTH positions.
+    db.insert(ks, target.to_be_bytes().to_vec(), big(2))
+        .unwrap();
+    assert_eq!(
+        checkpoint.get(ks, &target.to_be_bytes()).unwrap(),
+        Some(big(1).into()),
+        "SANITY: as-of read still works after the post-frontier overwrite (pre-relocation)"
+    );
+
+    // 5. Advance the global WAL position via a different keyspace/cell so
+    //    relocation's target_position passes the as-of value's offset.
+    for i in 0..4000u64 {
+        db.insert(ks2, i.to_be_bytes().to_vec(), big(9)).unwrap();
+    }
+
+    // 6. Relocate (default WAL-based) => GC reclaims files below target_position.
+    db.start_blocking_relocation();
+    assert!(
+        metrics.relocation_kept.with_label_values(&["k"]).get() > 0,
+        "relocation must have relocated entries"
+    );
+
+    assert_eq!(
+        db.get(ks, &target.to_be_bytes()).unwrap(),
+        Some(big(2).into()),
+        "live get must be the overwrite"
+    );
+    assert_eq!(
+        checkpoint.get(ks, &target.to_be_bytes()).unwrap(),
+        Some(big(1).into()),
+        "checkpoint must read the as-of value big(1) after relocation; \
+         None => the below-frontier overlay value was lost"
+    );
+}
+
 #[test]
 fn test_wal_relocation_basic_flow() {
     let dir = tempdir::TempDir::new("test_relocation_filter").unwrap();
