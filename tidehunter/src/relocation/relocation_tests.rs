@@ -1032,6 +1032,57 @@ fn test_index_based_relocation_with_target_position() {
     assert_eq!(watermark.target_position, Some(mid_position));
 }
 
+// Regression: the index-based CAS threshold must be the relocation frontier
+// (`effective_limit`), not the live frontier. For a key overwritten after the
+// frontier, the as-of view still relocates the older value; a live-frontier
+// threshold lets `RelocationUpdates::apply` re-point the newer write to the
+// relocated copy of that older value, losing the overwrite. The same state
+// arises with a write that lands concurrently with a relocation run, so this
+// also pins the concurrent-overwrite case deterministically.
+#[test]
+fn test_index_based_relocation_preserves_overwrite_above_target() {
+    let dir = tempdir::TempDir::new("test_index_cas_overwrite").unwrap();
+    let mut ksb = KeyShapeBuilder::new();
+    let ks = ksb.add_key_space("k", 8, 1, KeyType::uniform(1));
+    let key_shape = ksb.build();
+    let metrics = Metrics::new();
+    // No forced unload: the cell must stay loaded so the as-of value is still
+    // a distinct overlay position when relocation runs (a flush would collapse
+    // the key to latest-per-key and nothing would be relocated).
+    let db = Db::open(
+        dir.path(),
+        key_shape,
+        Arc::new(Config::small()),
+        metrics.clone(),
+    )
+    .unwrap();
+
+    let key = 3u64.to_be_bytes().to_vec();
+    db.insert(ks, key.clone(), vec![1; 64]).unwrap();
+    db.wal_writer.wal_tracker_barrier();
+    let frontier = db.wal_writer.last_processed().as_u64();
+
+    // Overwrite after the frontier; the barrier ensures the live frontier at
+    // relocation time is past the overwrite.
+    db.insert(ks, key.clone(), vec![2; 64]).unwrap();
+    db.wal_writer.wal_tracker_barrier();
+
+    db.start_blocking_relocation_with_strategy(RelocationStrategy::IndexBased(Some(frontier)));
+
+    // The as-of value must actually have been relocated, otherwise the CAS
+    // never runs and this test is vacuous.
+    assert!(
+        metrics.relocation_kept.with_label_values(&["k"]).get() > 0,
+        "relocation must have relocated the as-of value"
+    );
+    assert_eq!(
+        db.get(ks, &key).unwrap(),
+        Some(vec![2; 64].into()),
+        "the overwrite must survive relocation; the relocated copy of the \
+         as-of value must not be CAS'd over it"
+    );
+}
+
 #[test]
 fn test_compute_target_position_from_ratio() {
     use crate::relocation::compute_target_position_from_ratio;

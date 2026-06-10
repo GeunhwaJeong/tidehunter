@@ -3,7 +3,6 @@ use crate::batch::RelocatedWriteBatch;
 use crate::db::{Db, DbResult, WalEntry};
 use crate::index::index_table::IndexTable;
 use crate::key_shape::KeySpace;
-use crate::large_table::Loader;
 use crate::metrics::Metrics;
 use crate::relocation::watermark::RelocationWatermarks;
 use crate::wal::WalError;
@@ -459,11 +458,14 @@ impl RelocationDriver {
         db: &Arc<Db>,
         effective_limit: u64,
     ) -> DbResult<CellProcessingContext> {
-        let batch = RelocatedWriteBatch::new(
-            cell_ref.keyspace,
-            cell_ref.cell_id.clone(),
-            db.last_processed_wal_position().as_u64(),
-        );
+        // The CAS threshold must be the same frontier the as-of index view
+        // below is built with. Any write newer than that view sits at an
+        // offset >= `effective_limit`; a higher threshold (e.g. the live
+        // frontier) would let the CAS re-point such a write to the relocated
+        // copy of the older as-of value, losing the overwrite. (The WAL-based
+        // path passes its `target_position` for the same reason.)
+        let batch =
+            RelocatedWriteBatch::new(cell_ref.keyspace, cell_ref.cell_id.clone(), effective_limit);
         let mut context = CellProcessingContext::new(batch);
         let mut removed_count = 0;
 
