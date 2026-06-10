@@ -212,13 +212,15 @@ impl IndexTable {
     /// as-is in both modes — callers producing the deepest level still need to
     /// call `clean_self()` afterwards to strip them.
     fn merge_dirty(&mut self, dirty: &Self, promote_to_clean: bool) {
-        // todo implement this efficiently taking into account both self and dirty are sorted
-        // Iterate dirty's logical view (latest entry per key) and apply each
-        // to self as if it were a regular insert at that key.
-        let insert_one = |this: &mut Self, key: &Bytes, v: IndexWalPosition| {
+        // ---- data side: dirty's in-flight overlay folds into self.data ----
+        // These are genuine WAL-offset writes — the only entries the
+        // offset-based filters (`retain_processed`, `retain_unprocessed`,
+        // `promote_to_flat`) ever act on. `_and_clean` demotes Modified→Clean
+        // because they are about to become clean on disk.
+        for (k, v) in dirty.data_iter_latest() {
             #[cfg(any(debug_assertions, feature = "test_methods"))]
             if promote_to_clean
-                && let Some(found) = this.data_get_latest(key)
+                && let Some(found) = self.data_get_latest(k)
                 && found.offset > v.offset
             {
                 panic!("found.offset {} > v.offset {}", found.offset, v.offset);
@@ -226,40 +228,139 @@ impl IndexTable {
             let incoming = if promote_to_clean && !v.is_removed() {
                 v.as_clean_modified()
             } else {
-                v
+                *v
             };
-            let incoming_dirty = !incoming.is_clean();
-            match this.data_get_latest(key) {
-                Some(prev) => {
-                    if !prev.is_clean() && !incoming_dirty {
-                        this.dirty_count -= 1;
-                    } else if prev.is_clean() && incoming_dirty {
-                        this.dirty_count += 1;
-                    }
-                }
-                None => {
-                    this.key_bytes += key.len();
-                    if incoming_dirty {
-                        this.dirty_count += 1;
-                    }
-                }
-            }
-            this.data.insert((key.clone(), incoming));
+            self.data.insert((k.clone(), incoming));
+        }
+
+        // ---- flat side: dirty's disk-derived `flat` folds into self.flat ----
+        // Invariant: entries that originated on disk live only in `flat`, never
+        // in the `data` overlay. The old code lifted them into `data`, where
+        // the offset-based filters then misread them — most damagingly,
+        // `retain_processed` saw a disk tombstone's INVALID sentinel offset
+        // (u64::MAX) as an unprocessed post-frontier write and dropped it,
+        // resurrecting the value the tombstone shadowed in a deeper level.
+        // `flat`'s dirty-entry count: `fold_dirty_flat` tallies it while building
+        // the new buffer, so the merged blob is not re-decoded here. When there
+        // is no `dirty.flat` to fold, `self.flat` is unchanged and counted once.
+        let flat_dirty = if !dirty.flat.is_empty() {
+            self.fold_dirty_flat(dirty, promote_to_clean)
+        } else {
+            FlatIter::new(&self.flat, self.key_size)
+                .filter(|(_, v)| !v.is_clean())
+                .count()
         };
 
-        for (k, v) in dirty.data_iter_latest() {
-            insert_one(self, k, *v);
-        }
-        // Also merge flat entries (present when promote_to_flat has been called on dirty).
-        // Entries already covered by dirty.data (latest-per-key) take priority; skip those keys.
-        for (k, v) in FlatIter::new(&dirty.flat, dirty.key_size) {
-            if dirty.data_contains_key(k) {
-                continue;
+        // Data-side stats are a cheap scan: `data` holds only the in-flight
+        // overlay (small; empty in the common freshly-loaded-base merge).
+        let mut key_bytes = 0usize;
+        let mut data_dirty = 0usize;
+        for (k, v) in self.data_iter_latest() {
+            key_bytes += k.len();
+            if !v.is_clean() {
+                data_dirty += 1;
             }
-            // Zero-copy: k is a subslice of dirty.flat, so slice_ref avoids a heap allocation.
-            let key = dirty.flat.slice_to_bytes(k);
-            insert_one(self, &key, v);
         }
+        self.key_bytes = key_bytes;
+        self.dirty_count = flat_dirty + data_dirty;
+    }
+
+    /// Merge `dirty.flat` (disk-derived, already-processed entries) into
+    /// `self.flat`, upholding the invariant that disk entries never enter the
+    /// `data` overlay.
+    ///
+    /// `dirty` is the fresher side, so on equal keys its flat entry wins over
+    /// `self.flat` — except where `dirty.data` already carries the key, in
+    /// which case the overlay (just merged into `self.data`) is freshest and
+    /// `self.flat`'s entry is kept untouched as the below-overlay value
+    /// (matching the prior behavior of skipping `dirty.flat` for overlay keys).
+    ///
+    /// For a key taken from `dirty.flat`, any now-stale `self.data` tuple is
+    /// dropped so the flat value is the one observed. In every production
+    /// caller `self` is a freshly-loaded merge base with empty `data`, so that
+    /// cleanup is a no-op there; it only matters for synthetic callers that
+    /// pre-seed `self.data` with values older than `dirty`.
+    ///
+    /// Returns the number of dirty (non-clean) entries in the rebuilt `flat`,
+    /// so the caller can finish its stats without re-decoding the blob.
+    fn fold_dirty_flat(&mut self, dirty: &Self, promote_to_clean: bool) -> usize {
+        if self.flat.is_empty() {
+            // `self` may be a default table that has not adopted a key layout.
+            self.key_size = dirty.key_size;
+        }
+        // Each side is decoded with its own `key_size` and re-encoded with the
+        // output (`self`) layout. The two need not match: an in-memory overlay
+        // promotes to a var-len `flat` (`key_size = None`) even in a fixed-size
+        // keyspace, while a disk-loaded base is fixed. Keys are length-consistent
+        // for a keyspace, so `build_flat_bytes` re-encodes them either way.
+        let demote = |iwp: IndexWalPosition| {
+            if promote_to_clean && !iwp.is_removed() {
+                iwp.as_clean_modified()
+            } else {
+                iwp
+            }
+        };
+
+        let self_flat = std::mem::take(&mut self.flat);
+        let mut self_it = FlatIter::new(&self_flat, self.key_size).peekable();
+        let mut dirty_it = FlatIter::new(&dirty.flat, dirty.key_size).peekable();
+        // Upper bound on the merged entry count (O(1) flat_count each); sizing
+        // up front avoids the reallocation growth of an unbounded push loop.
+        let cap = flat_count(&self_flat, self.key_size) + flat_count(&dirty.flat, dirty.key_size);
+        let mut merged: Vec<(Bytes, IndexWalPosition)> = Vec::with_capacity(cap);
+        let mut keys_from_dirty: Vec<Bytes> = Vec::new();
+
+        loop {
+            let ord = match (self_it.peek(), dirty_it.peek()) {
+                (None, None) => break,
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (Some((sk, _)), Some((dk, _))) => sk.cmp(dk),
+            };
+            match ord {
+                Ordering::Less => {
+                    let (k, v) = self_it.next().unwrap();
+                    merged.push((self_flat.slice_to_bytes(k), v));
+                }
+                Ordering::Greater => {
+                    let (k, v) = dirty_it.next().unwrap();
+                    if dirty.data_contains_key(k) {
+                        continue; // overlay carries the fresher value
+                    }
+                    let key = dirty.flat.slice_to_bytes(k);
+                    keys_from_dirty.push(key.clone());
+                    merged.push((key, demote(v)));
+                }
+                Ordering::Equal => {
+                    let (sk, sv) = self_it.next().unwrap();
+                    let (dk, dv) = dirty_it.next().unwrap();
+                    if dirty.data_contains_key(dk) {
+                        // Overlay is freshest; keep self.flat's entry beneath it.
+                        merged.push((self_flat.slice_to_bytes(sk), sv));
+                    } else {
+                        let key = dirty.flat.slice_to_bytes(dk);
+                        keys_from_dirty.push(key.clone());
+                        merged.push((key, demote(dv)));
+                    }
+                }
+            }
+        }
+
+        // Drop overlay tuples shadowed by a value just taken from dirty.flat.
+        for key in keys_from_dirty {
+            let lower = (key.clone(), IndexWalPosition::MIN);
+            let upper = (key, IndexWalPosition::MAX);
+            let stale: Vec<_> = self.data.range(lower..=upper).cloned().collect();
+            for e in stale {
+                self.data.remove(&e);
+            }
+        }
+
+        // Tally the rebuilt flat's dirty entries here (cheap — over the decoded
+        // tuples) so the caller need not re-decode `self.flat`.
+        let flat_dirty = merged.iter().filter(|(_, v)| !v.is_clean()).count();
+        self.flat = build_flat_bytes(merged, self.key_size);
+        flat_dirty
     }
 
     /// Remove flushed index entries that have offset <= last_processed
@@ -1153,6 +1254,19 @@ impl IndexTable {
     /// flat that re-filtering would wrongly drop. It is per position, not per
     /// key — a key may carry both a below- and a post-frontier write.
     pub fn retain_processed(&mut self, last_processed: LastProcessed) {
+        // The offset filter is only sound because `data` holds exclusively
+        // genuine WAL-offset writes. Disk-derived entries (notably tombstones,
+        // stored with the INVALID sentinel offset u64::MAX) live in `flat` and
+        // are never lifted here — see `merge_dirty`. Were such an entry present
+        // its sentinel offset would read as "post-frontier" and be dropped,
+        // resurrecting the value it shadows.
+        debug_assert!(
+            self.data
+                .iter()
+                .all(|(_, v)| v.offset() != WalPosition::INVALID.offset()),
+            "disk-origin (INVALID-offset) entry found in data overlay — \
+             violates the invariant that disk entries live only in flat"
+        );
         self.data.retain(|(_, v)| last_processed.is_processed(v));
         let (kb, dc) = self.recount_stats();
         self.key_bytes = kb;
@@ -1206,13 +1320,24 @@ impl IndexTable {
             return;
         }
         // Also check the flat buffer (present when promote_to_flat has been called).
-        // Insert the updated entry into the data set so it shadows the stale flat entry.
-        if let Some(mut iwp) = self.flat_binary_search(key) {
-            let was_dirty = !iwp.is_clean();
+        if let Some(original) = self.flat_binary_search(key) {
+            let mut iwp = original;
             update(&mut iwp);
+            // Only lift the entry into the data overlay when the update actually
+            // re-pointed it. A no-op update must leave the entry in flat: lifting
+            // it would copy a disk-derived position into `data` (e.g. a
+            // tombstone's INVALID sentinel offset, which relocation's closure
+            // never rewrites), violating the invariant that disk entries live
+            // only in flat. Lifting an unchanged entry is a no-op for reads
+            // anyway — the data copy would just duplicate the flat value.
+            if iwp == original {
+                return;
+            }
+            let was_dirty = !original.is_clean();
             adjust_dirty_count(&mut self.dirty_count, was_dirty, !iwp.is_clean());
             let key_bytes = Bytes::from(key.to_vec());
             self.key_bytes += key_bytes.len();
+            // The updated position shadows the stale flat entry on reads.
             self.data.insert((key_bytes, iwp));
         }
     }
@@ -2426,6 +2551,61 @@ mod tests {
             deserialized.get(&[2]),
             Some(WalPosition::INVALID),
             "tombstone failed to round-trip through serialize/deserialize"
+        );
+    }
+
+    #[test]
+    fn test_merge_dirty_keeps_disk_entries_in_flat() {
+        // Regression: a tombstone read back from disk carries the INVALID
+        // sentinel offset (u64::MAX). `merge_dirty_and_clean` must fold such
+        // disk-derived `flat` entries into the merged `flat`, never into the
+        // `data` overlay — the offset-based filters only reason about genuine
+        // WAL offsets, so a sentinel-offset entry in `data` is misread as an
+        // unprocessed post-frontier write and dropped by retain_processed,
+        // resurrecting the value the tombstone shadows in a deeper level.
+        let (shape, ks) = KeyShape::new_single_config_indexing(
+            KeyIndexing::variable_length(),
+            1,
+            KeyType::uniform(1),
+            Default::default(),
+        );
+        let ks = shape.ks(ks);
+
+        // Build an on-disk blob holding a tombstone for [2], then round-trip it
+        // so the tombstone decodes back as INVALID (offset u64::MAX) in `flat`.
+        let mut on_disk = IndexTable::default();
+        on_disk.insert(vec![1].into(), WalPosition::test_value(10));
+        on_disk.remove(vec![2].into(), WalPosition::test_value(25));
+        let mut buf = BytesMut::new();
+        on_disk.serialize_index_entries(ks, &mut buf);
+        let dirty = IndexTable::deserialize_index_entries(ks, Bytes::from(buf.freeze()));
+        assert_eq!(dirty.get(&[2]), Some(WalPosition::INVALID));
+
+        // Mirror the flusher's merge-flush path.
+        let mut merged = IndexTable::default();
+        merged.merge_dirty_and_clean(&dirty);
+
+        // Invariant: no disk-derived (INVALID-offset) entry leaked into `data`.
+        assert!(
+            merged
+                .data
+                .iter()
+                .all(|(_, v)| v.offset() != WalPosition::INVALID.offset()),
+            "disk tombstone leaked into the data overlay"
+        );
+        assert!(
+            !merged.data_contains_key(&[2]),
+            "tombstone should live in flat"
+        );
+
+        // The offset filter must leave the disk tombstone untouched (it is in
+        // flat), so the shadowed value stays deleted.
+        merged.retain_processed(LastProcessed::new(1_000_000));
+        assert_eq!(merged.get(&[1]), Some(WalPosition::test_value(10)));
+        assert_eq!(
+            merged.get(&[2]),
+            Some(WalPosition::INVALID),
+            "disk-origin tombstone was dropped (resurrection bug)"
         );
     }
 
