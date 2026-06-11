@@ -2838,7 +2838,7 @@ impl LargeTableFailPoints {
     }
 
     pub fn fp_remove_before_lock(&self) {
-        self.0.read().fp_insert_before_lock.fp();
+        self.0.read().fp_remove_before_lock.fp();
     }
     pub fn fp_lookup_after_lock_drop(&self) {
         self.0.read().fp_lookup_after_lock_drop.fp();
