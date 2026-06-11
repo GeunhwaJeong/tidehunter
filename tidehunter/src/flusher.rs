@@ -212,6 +212,10 @@ impl IndexFlusherThread {
                     if let Some((original_index, new_levels)) =
                         Self::handle_command(&*db, &command, ks_context, None, None)
                     {
+                        // Failpoint between the flush work and its visible
+                        // completion: lets tests pause here to interleave
+                        // writes with an in-flight flush deterministically.
+                        db.large_table.fp.fp_flush_before_completion();
                         if is_relocation {
                             db.update_relocated_index(command.ks, command.cell, new_levels);
                         } else {

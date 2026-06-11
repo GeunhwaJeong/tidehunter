@@ -1484,6 +1484,25 @@ impl LargeTable {
         });
     }
 
+    /// Test-only view of an entry's state name (the state enum is private).
+    #[cfg(test)]
+    pub(crate) fn entry_state_for_test(&self, context: &KsContext, cell: &CellId) -> String {
+        self.with_entry_for_test(context, cell, |entry| format!("{:?}", entry.state))
+    }
+
+    /// Test-only access to a cell's entry under its row lock, mirroring the
+    /// flusher-completion callbacks: like them it runs `promote_pending`
+    /// before handing the entry to `f`.
+    #[cfg(test)]
+    pub(crate) fn with_entry_for_test<R>(
+        &self,
+        context: &KsContext,
+        cell: &CellId,
+        f: impl FnOnce(&mut LargeTableEntry) -> R,
+    ) -> R {
+        self.with_promoted_entry(context, cell, f)
+    }
+
     /// Locks the row containing `cell`, calls `promote_pending` on the entry,
     /// then hands it to `f`. Shared by flusher-completion callbacks.
     fn with_promoted_entry<R>(
@@ -2227,11 +2246,7 @@ impl LargeTableEntry {
     /// Unlike `update_flushed_index`, this handles clean entries (Unloaded/Loaded)
     /// since forced relocation re-flushes an already-clean entry to a new position.
     pub fn update_relocated_position(&mut self, new_levels: IndexLevels) {
-        self.commit_pending_last_processed();
-        // Update levels. New writes may have arrived making the entry dirty —
-        // in that case, just update the on-disk levels. The dirty overlay
-        // remains valid.
-        //
+        let last_processed = self.commit_pending_last_processed();
         // Force-relocate on an unsharded cell collapses all populated levels
         // into a single new blob, so `new_levels` is single-level. On a
         // sharded cell it rewrites a subset of shards in place, preserving
@@ -2255,11 +2270,49 @@ impl LargeTableEntry {
                 self.report_loaded_keys_count();
             }
             LargeTableEntryState::DirtyUnloaded => {
-                // New write arrived while relocation was in flight — update base position
+                // A write arrived while the relocation was in flight. The
+                // overlay holds only those writes — none are covered by the
+                // relocated blob — so it stays intact over the new levels.
                 self.levels = new_levels;
             }
             LargeTableEntryState::DirtyLoaded => {
+                // A write arrived while the relocation was in flight, on a
+                // cell whose overlay covers the *old* L0 blob.
+                //
+                // Sharded relocation rewrites blobs in place with identical
+                // content, and an unsharded cell with nothing below L0
+                // collapses into a blob whose content the overlay already
+                // covers — in both cases the loaded overlay remains a
+                // superset of the L0 slot and the cell can stay loaded.
+                let overlay_still_covers_l0 =
+                    new_levels.is_sharded() || self.levels.iter_below_l0().next().is_none();
                 self.levels = new_levels;
+                if overlay_still_covers_l0 {
+                    return;
+                }
+                // The relocated blob folded the levels below L0 into the L0
+                // slot, so the overlay no longer covers it. Keeping the cell
+                // loaded would hide the folded-in keys from reads (loaded
+                // cells skip the L0 slot in `disk_levels_to_walk`) and drop
+                // them at the next flush (which clones the overlay as the
+                // cell's entire L0 content). Retain the racing writes and
+                // demote, so reads and flushes consult the new blob again.
+                //
+                // The request frontier is the exact cutoff: the cell was
+                // clean at request time and in-flight writes hold their WAL
+                // guards until applied, so every overlay entry sits at or
+                // above it (no key straddles the frontier, making the
+                // per-key-latest `retain` equivalent to per-position here);
+                // everything below it is covered by the new blob, and the
+                // promote job never moves entries at or above a pending
+                // frontier into flat.
+                self.data.make_mut().retain_unprocessed(last_processed);
+                self.report_loaded_keys_count();
+                if self.data.is_empty() {
+                    self.state = LargeTableEntryState::Unloaded;
+                } else {
+                    self.state = LargeTableEntryState::DirtyUnloaded;
+                }
             }
             LargeTableEntryState::Empty => {
                 panic!("update_relocated_position called in Empty state")
@@ -2763,6 +2816,9 @@ pub(crate) struct LargeTableFailPointsInner {
     pub fp_insert_before_lock: crate::failpoints::FailPoint,
     pub fp_remove_before_lock: crate::failpoints::FailPoint,
     pub fp_lookup_after_lock_drop: crate::failpoints::FailPoint,
+    /// Hit by the flusher thread between the flush work and the visible
+    /// completion (`update_flushed_index` / `update_relocated_index`).
+    pub fp_flush_before_completion: crate::failpoints::FailPoint,
 }
 
 #[cfg(not(test))]
@@ -2771,6 +2827,8 @@ impl LargeTableFailPoints {
     pub fn fp_remove_before_lock(&self) {}
 
     pub fn fp_lookup_after_lock_drop(&self) {}
+
+    pub fn fp_flush_before_completion(&self) {}
 }
 
 #[cfg(test)]
@@ -2784,6 +2842,10 @@ impl LargeTableFailPoints {
     }
     pub fn fp_lookup_after_lock_drop(&self) {
         self.0.read().fp_lookup_after_lock_drop.fp();
+    }
+
+    pub fn fp_flush_before_completion(&self) {
+        self.0.read().fp_flush_before_completion.fp();
     }
 }
 

@@ -1,7 +1,14 @@
+use std::collections::HashSet;
 use std::{path::Path, sync::Arc, thread, time::Duration};
 
-use crate::key_shape::KeySpaceConfig;
+use crate::control::RelocateFiles;
+use crate::failpoints::FailPoint;
+use crate::key_shape::{KeySpace, KeySpaceConfig};
+use crate::large_table::Loader;
+use crate::latch::Latch;
+use crate::relocation::CellReference;
 use crate::relocation::watermark::WatermarkData;
+use crate::wal::layout::WalKind;
 use crate::{
     RelocationStrategy,
     config::Config,
@@ -10,6 +17,7 @@ use crate::{
     relocation::RelocationWatermarks,
 };
 use crate::{metrics::Metrics, relocation::Decision};
+use minibytes::Bytes;
 
 fn force_unload_config(config: &Config) -> Arc<Config> {
     let mut config2 = Config::clone(config);
@@ -1080,6 +1088,186 @@ fn test_index_based_relocation_preserves_overwrite_above_target() {
         Some(vec![2; 64].into()),
         "the overwrite must survive relocation; the relocated copy of the \
          as-of value must not be CAS'd over it"
+    );
+}
+
+// Regression: a write racing a clean `ForceRelocate` on a Loaded `[L0, L1]`
+// cell must not lose the keys below L0.
+//
+// A loaded cell's overlay covers L0 only; reads reach L1-resident keys by
+// walking `disk_levels_to_walk` -> `iter_below_l0`. A clean ForceRelocate
+// collapses L0+L1 into a single blob in the L0 slot. When a write lands while
+// that flush is in flight, the completion (`update_relocated_position`)
+// reaches the DirtyLoaded arm with an overlay that no longer covers the new
+// L0 blob (it lacks the former-L1-only keys). Before the fix that arm kept
+// the cell loaded, violating the "Loaded => data covers L0" invariant:
+// - reads: `iter_below_l0` on the single-level cell walks nothing, so
+//   former-L1-only keys returned None immediately;
+// - the next normal flush cloned the overlay as the cell's only level,
+//   dropping those keys from the index permanently.
+// The fix retains only the racing writes and demotes the cell to
+// DirtyUnloaded, so reads and flushes consult the relocated blob again.
+//
+// The relocation runs on the production flusher; the
+// `fp_flush_before_completion` failpoint pauses it between the flush work and
+// the completion, so the racing write deterministically lands inside the
+// in-flight window.
+#[test]
+fn test_force_relocate_concurrent_write_keeps_below_l0_keys() {
+    let dir = tempdir::TempDir::new("force_relocate_dirty_loaded").unwrap();
+    // Forced unload (threshold 0) so the flushed cell unloads; the later read
+    // reloads it folding only L0 into the overlay, leaving L1 on disk.
+    let config = force_unload_config(&Config::small());
+    let mut ksb = KeyShapeBuilder::new();
+    // Unloaded iteration off so that stepping an iterator loads the cell
+    // (point reads never load; this is the only read-path load trigger).
+    let ks = ksb.add_key_space_config(
+        "k",
+        8,
+        1,
+        KeyType::uniform(1),
+        KeySpaceConfig::new().with_unloaded_iterator(false),
+    );
+    let key_shape = ksb.build();
+    let metrics = Metrics::new();
+    let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+
+    let value = |b: u8| -> Vec<u8> { vec![b; 100] };
+    let key = |i: u64| -> Vec<u8> { i.to_be_bytes().to_vec() };
+
+    // Build an L1: enough keys for an L0->L1 promote (l0_max_entries =
+    // 8 * max_dirty_keys = 256 for Config::small), then a small fresh L0.
+    for i in 0..300u64 {
+        db.insert(ks, key(i), value(1)).unwrap();
+    }
+    // Advance the tracker frontier past the inserts before each rebuild, so
+    // the flush retains nothing in the overlay and the cell ends up clean.
+    db.wal_writer.wal_tracker_barrier();
+    db.force_rebuild_control_region().unwrap();
+    for i in 1000..1010u64 {
+        db.insert(ks, key(i), value(2)).unwrap();
+    }
+    db.wal_writer.wal_tracker_barrier();
+    db.force_rebuild_control_region().unwrap();
+    db.large_table.flusher.barrier();
+    // Flushes dispatched while the inserts ran sampled an older frontier and
+    // can leave a retained overlay tail (DirtyUnloaded). With nothing in
+    // flight any more, one more rebuild flushes at the current frontier and
+    // leaves the cell clean.
+    db.wal_writer.wal_tracker_barrier();
+    db.force_rebuild_control_region().unwrap();
+    db.large_table.flusher.barrier();
+
+    let cell = CellReference::first(&db, KeySpace::first()).expect("cell must exist");
+    let context = db.ks_context(cell.keyspace);
+    assert_eq!(
+        db.large_table.entry_state_for_test(context, &cell.cell_id),
+        "Unloaded",
+        "PRECONDITION: the flushed cell must be clean and unloaded"
+    );
+
+    // Load the (clean) cell: iterators load cells (point reads read through
+    // without loading); this folds only L0 into the in-memory overlay,
+    // leaving L1 reachable solely through the on-disk levels walk.
+    assert!(db.iterator(ks).next().is_some());
+    assert_eq!(
+        db.large_table.entry_state_for_test(context, &cell.cell_id),
+        "Loaded",
+        "PRECONDITION: cell must be clean and loaded"
+    );
+
+    // Pick a probe key that lives only below L0: absent from the loaded
+    // overlay but readable through the on-disk levels walk.
+    let below_l0_key = (0..300u64)
+        .find(|i| {
+            let reduced = context.ks_config.reduced_key_bytes(Bytes::from(key(*i)));
+            db.large_table
+                .with_entry_for_test(context, &cell.cell_id, |entry| {
+                    entry.get(&reduced).is_none()
+                })
+        })
+        .expect("setup must leave at least one key only reachable below L0");
+    assert_eq!(
+        db.get(ks, &key(below_l0_key)).unwrap(),
+        Some(value(1).into()),
+        "SANITY: probe key readable via the levels walk before relocation"
+    );
+
+    // Dispatch a force-relocate of the cell's blobs into a flusher whose
+    // receiver the test owns, capturing the command instead of racing a
+    // Pause the flusher between the flush work and its completion, so the
+    // racing write below deterministically lands while the force-relocate is
+    // in flight. The latch releases when its guard drops — including on a
+    // panicking assertion, so a failure cannot wedge the flusher thread.
+    let (completion_latch, completion_latch_guard) = Latch::new();
+    db.large_table.fp.0.write().fp_flush_before_completion = FailPoint::latch(completion_latch);
+
+    // Dispatch the force-relocate through the production flusher, exactly as
+    // the snapshot pass does for a clean cell in low-occupancy files.
+    let last_processed = db.last_processed_wal_position();
+    db.large_table
+        .with_entry_for_test(context, &cell.cell_id, |entry| {
+            let layout = db.config.wal_layout(WalKind::Index);
+            let files: HashSet<_> = entry
+                .levels()
+                .iter()
+                .filter_map(|p| p.valid())
+                .map(|p| layout.locate_file(p.offset()))
+                .collect();
+            let relocate_files = RelocateFiles::new(files, db.config.wal_layout(WalKind::Index));
+            entry.request_force_relocate(&db.large_table.flusher, last_processed, &relocate_files);
+        });
+
+    // The racing write: lands while the paused flusher holds the completion.
+    // The cell goes Loaded -> DirtyLoaded, routing the completion through the
+    // arm whose overlay no longer covers the relocated blob.
+    db.insert(ks, key(7777), value(3)).unwrap();
+    assert_eq!(
+        db.large_table.entry_state_for_test(context, &cell.cell_id),
+        "DirtyLoaded",
+        "PRECONDITION: the racing write must land before the completion"
+    );
+
+    // Unblock the flusher and wait for the completion to apply.
+    drop(completion_latch_guard);
+    db.large_table.flusher.barrier();
+
+    // The clean-cell branch must have dispatched a ForceRelocate — a dirty
+    // cell would dispatch a normal Flush, exercising a different completion
+    // path and leaving this test vacuous.
+    assert!(
+        metrics.unload.with_label_values(&["force_relocate"]).get() > 0,
+        "the ForceRelocate flusher path must have run"
+    );
+
+    // The completion demotes the cell so reads consult the relocated blob;
+    // the overlay keeps only the racing write.
+    assert_eq!(
+        db.large_table.entry_state_for_test(context, &cell.cell_id),
+        "DirtyUnloaded",
+        "completion on a dirtied loaded cell must demote it"
+    );
+
+    // The racing write and the L0-resident keys survive...
+    assert_eq!(db.get(ks, &key(7777)).unwrap(), Some(value(3).into()));
+    assert_eq!(db.get(ks, &key(1000)).unwrap(), Some(value(2).into()));
+    // ...and so must the key that lived below L0 (lost before the fix: the
+    // single-level cell had nothing below L0 to walk, and the kept overlay
+    // never had the key).
+    assert_eq!(
+        db.get(ks, &key(below_l0_key)).unwrap(),
+        Some(value(1).into()),
+        "key residing below L0 must survive a force-relocate completing on a dirtied cell"
+    );
+
+    // The loss must also not become permanent: the next normal flush writes
+    // the overlay as the cell's only level.
+    db.force_rebuild_control_region().unwrap();
+    db.large_table.flusher.barrier();
+    assert_eq!(
+        db.get(ks, &key(below_l0_key)).unwrap(),
+        Some(value(1).into()),
+        "key below L0 must survive the next normal flush after the relocation"
     );
 }
 
