@@ -132,6 +132,35 @@ fn adjust_dirty_count(dirty_count: &mut usize, was_dirty: bool, is_dirty: bool) 
     }
 }
 
+/// A key for `data` overlay lookups. Building a `(Bytes, IndexWalPosition)`
+/// range bound needs an owned `Bytes`; this bridges the two key forms callers
+/// hold so each pays only what it must: a caller that already owns the key as
+/// `Bytes` (the write path — `checked_insert`, `skip_stale_update`) clones it
+/// (a refcount bump), while a borrowed slice (the read path) copies once. The
+/// `AsRef<[u8]>` supertrait also yields the slice the flat fallback needs.
+trait OverlayKey: AsRef<[u8]> {
+    fn to_bound_key(&self) -> Bytes;
+}
+
+impl OverlayKey for Bytes {
+    fn to_bound_key(&self) -> Bytes {
+        self.clone()
+    }
+}
+
+impl OverlayKey for [u8] {
+    fn to_bound_key(&self) -> Bytes {
+        Bytes::from(self.to_vec())
+    }
+}
+
+// For array-literal call sites such as `data_get_latest(&[1])`.
+impl<const N: usize> OverlayKey for [u8; N] {
+    fn to_bound_key(&self) -> Bytes {
+        Bytes::from(self.to_vec())
+    }
+}
+
 /// Iterate `(Bytes, IndexWalPosition)` tuples yielding one entry per unique
 /// key — the latest (largest IWP) within each same-key group. Since the set
 /// is sorted by `(key, offset, len, kind)` ascending, the latest is the last
@@ -573,7 +602,7 @@ impl IndexTable {
 
     /// Similar to `get`, but returns the WAL position of the update operation for both
     /// inserts and deletes.
-    pub fn get_update_position(&self, k: &[u8]) -> Option<WalPosition> {
+    pub fn get_update_position(&self, k: &Bytes) -> Option<WalPosition> {
         if let Some(p) = self.data_get_latest(k) {
             return Some(p.into_update_position());
         }
@@ -1465,12 +1494,17 @@ impl IndexTable {
     // `(offset, len, kind)` ordering — i.e. the latest position per key.
     // ---------------------------------------------------------------------------
 
-    /// Latest `IndexWalPosition` recorded in `data` for `key`, or `None` if
-    /// no tuple exists for that key.
-    fn data_get_latest(&self, key: &[u8]) -> Option<IndexWalPosition> {
-        let key_bytes = Bytes::from(key.to_vec());
-        let lower = (key_bytes.clone(), IndexWalPosition::MIN);
-        let upper = (key_bytes, IndexWalPosition::MAX);
+    /// Latest `IndexWalPosition` recorded in `data` for `key`, or `None` if no
+    /// tuple exists for that key.
+    ///
+    /// Generic over [`OverlayKey`] so a write-path caller that already owns the
+    /// key as `Bytes` (e.g. `checked_insert`) builds the range bounds with a
+    /// refcount-bump clone, while a borrowed `&[u8]` read-path caller copies the
+    /// key once. The choice is made by the argument type — no extra method.
+    fn data_get_latest<K: OverlayKey + ?Sized>(&self, key: &K) -> Option<IndexWalPosition> {
+        let bound = key.to_bound_key();
+        let lower = (bound.clone(), IndexWalPosition::MIN);
+        let upper = (bound, IndexWalPosition::MAX);
         self.data.range(lower..=upper).next_back().map(|(_, v)| *v)
     }
 
