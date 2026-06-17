@@ -585,9 +585,14 @@ impl IndexTable {
     /// the larger; `data` wins on ties in either direction (freshest data).
     ///
     /// Removed tombstones in `data` are surfaced (as INVALID positions) so
-    /// callers can shadow a matching on-disk entry — but a tombstone that
-    /// shadows a *flat* entry at the same key suppresses that flat candidate
-    /// from this iterator (the tombstone in `data` is the winning view).
+    /// callers can shadow a matching on-disk entry. A flat entry shadowed by a
+    /// same-key `data` tombstone needs no separate pre-filter: at the step
+    /// where that flat key becomes `flat_cand` the key also exists in `data`
+    /// on the correct side of `prev`, so `data_cand` is `<=` it (Forward) /
+    /// `>=` it (Backward) and wins the tie below. `data_next_*` surfaces a
+    /// key's latest position — the very position `data_get_latest` would
+    /// return — so the tie-break alone suppresses the flat entry and surfaces
+    /// the tombstone, one shadowed key per scan step.
     fn next_entry_directional(
         &self,
         prev: Option<&[u8]>,
@@ -598,24 +603,10 @@ impl IndexTable {
             Direction::Backward => self.data_next_reverse(prev),
         };
 
-        let flat_step = |from: Option<&[u8]>| match direction {
-            Direction::Forward => self.flat_next_forward(from),
-            Direction::Backward => self.flat_next_reverse(from),
+        let flat_cand = match direction {
+            Direction::Forward => self.flat_next_forward(prev),
+            Direction::Backward => self.flat_next_reverse(prev),
         };
-
-        let mut flat_cand = flat_step(prev);
-        while let Some((ref fk, _)) = flat_cand {
-            if self
-                .data_get_latest(fk.as_ref())
-                .map(|v| v.is_removed())
-                .unwrap_or(false)
-            {
-                let fk_clone = fk.clone();
-                flat_cand = flat_step(Some(fk_clone.as_ref()));
-            } else {
-                break;
-            }
-        }
 
         match (data_cand, flat_cand) {
             (None, None) => None,
@@ -659,9 +650,15 @@ impl IndexTable {
 
     /// As-of-`last_processed` counterpart of [`Self::next_entry_directional`].
     /// Structurally identical, except the data side uses latest-*processed*
-    /// positions: candidates come from `data_next_{forward,reverse}_at`, and a
-    /// flat entry is shadowed only when the key's latest *processed* data
-    /// position is a tombstone.
+    /// positions: candidates come from `data_next_{forward,reverse}_at`.
+    ///
+    /// A flat entry shadowed by a same-key *processed* tombstone needs no
+    /// pre-filter for the same reason as the non-`at` walk: a key whose latest
+    /// processed position is a tombstone still has a processed position, so
+    /// `data_next_*_at` surfaces it as `data_cand` and the tie-break suppresses
+    /// the flat entry. A key whose positions are *all* post-frontier is skipped
+    /// by `data_next_*_at` and contributes nothing, leaving any flat entry for
+    /// that key visible — which is exactly the desired as-of view.
     fn next_entry_directional_at(
         &self,
         prev: Option<&[u8]>,
@@ -673,24 +670,10 @@ impl IndexTable {
             Direction::Backward => self.data_next_reverse_at(prev, last_processed),
         };
 
-        let flat_step = |from: Option<&[u8]>| match direction {
-            Direction::Forward => self.flat_next_forward(from),
-            Direction::Backward => self.flat_next_reverse(from),
+        let flat_cand = match direction {
+            Direction::Forward => self.flat_next_forward(prev),
+            Direction::Backward => self.flat_next_reverse(prev),
         };
-
-        let mut flat_cand = flat_step(prev);
-        while let Some((ref fk, _)) = flat_cand {
-            if self
-                .data_get_latest_processed(fk.as_ref(), last_processed)
-                .map(|v| v.is_removed())
-                .unwrap_or(false)
-            {
-                let fk_clone = fk.clone();
-                flat_cand = flat_step(Some(fk_clone.as_ref()));
-            } else {
-                break;
-            }
-        }
 
         match (data_cand, flat_cand) {
             (None, None) => None,
@@ -2358,6 +2341,172 @@ mod tests {
         assert_eq!(pos, WalPosition::INVALID);
         // Continuing past the tombstone yields k4(20).
         assert_eq!(table.next_entry(Some(k4(10)), false).unwrap().0, k4(20));
+    }
+
+    #[test]
+    fn test_next_entry_data_tombstone_shadows_live_flat() {
+        // A live flat entry shadowed by a same-key `data` tombstone, before the
+        // remove is re-promoted into flat. next_entry must surface the tombstone
+        // (INVALID) and never the stale live flat position, in both directions.
+        // This is the case the per-flat-candidate `data_get_latest` pre-filter
+        // used to cover; the data-wins-ties merge covers it on its own.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(1));
+        table.insert(vec![2].into(), WalPosition::test_value(2));
+        table.insert(vec![3].into(), WalPosition::test_value(3));
+        table.demote_data_modified_to_clean();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
+        assert!(table.data.is_empty());
+        assert_eq!(table.flat_len(), 3);
+
+        // Tombstone [2] in `data`; flat still holds the live [2]@2 position.
+        table.remove(vec![2].into(), WalPosition::test_value(10));
+        assert_eq!(table.get(&[2]), Some(WalPosition::INVALID));
+
+        // Forward: [1] live, then the [2] tombstone (INVALID, not [2]@2), then [3].
+        let n = table.next_entry(Some(vec![1].into()), false).unwrap();
+        assert_eq!(n, (Bytes::from(vec![2]), WalPosition::INVALID));
+        let n = table.next_entry(Some(vec![2].into()), false).unwrap();
+        assert_eq!(n, (Bytes::from(vec![3]), WalPosition::test_value(3)));
+
+        // Reverse: [3] live, then the [2] tombstone, then [1].
+        let n = table.next_entry(Some(vec![3].into()), true).unwrap();
+        assert_eq!(n, (Bytes::from(vec![2]), WalPosition::INVALID));
+        let n = table.next_entry(Some(vec![2].into()), true).unwrap();
+        assert_eq!(n, (Bytes::from(vec![1]), WalPosition::test_value(1)));
+    }
+
+    #[test]
+    fn test_next_entry_at_remove_processed_vs_post_frontier() {
+        // As-of view of a live flat [2] with a `data` remove layered on top. The
+        // remove only shadows the flat entry once it is processed (offset below
+        // the frontier); a post-frontier remove contributes nothing and the live
+        // flat entry stays visible.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(1));
+        table.insert(vec![2].into(), WalPosition::test_value(2));
+        table.insert(vec![3].into(), WalPosition::test_value(3));
+        table.demote_data_modified_to_clean();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
+        table.remove(vec![2].into(), WalPosition::test_value(100));
+
+        // Frontier above the remove@100: tombstone is processed, shadows flat [2].
+        let lp = LastProcessed::new_test(200);
+        let n = table
+            .next_entry_at(Some(vec![1].into()), false, lp)
+            .unwrap();
+        assert_eq!(n, (Bytes::from(vec![2]), WalPosition::INVALID));
+        let n = table.next_entry_at(Some(vec![3].into()), true, lp).unwrap();
+        assert_eq!(n, (Bytes::from(vec![2]), WalPosition::INVALID));
+
+        // Frontier below the remove@100: tombstone is post-frontier and skipped,
+        // so the live flat [2]@2 is the as-of view.
+        let lp = LastProcessed::new_test(50);
+        let n = table
+            .next_entry_at(Some(vec![1].into()), false, lp)
+            .unwrap();
+        assert_eq!(n, (Bytes::from(vec![2]), WalPosition::test_value(2)));
+        let n = table.next_entry_at(Some(vec![3].into()), true, lp).unwrap();
+        assert_eq!(n, (Bytes::from(vec![2]), WalPosition::test_value(2)));
+    }
+
+    #[test]
+    fn test_next_entry_consecutive_data_tombstones_over_flat() {
+        // Several adjacent flat keys each shadowed by a same-key `data`
+        // tombstone. The removed loop skipped all of them in a single call; the
+        // tie-break merge surfaces exactly one tombstone (INVALID) per scan
+        // step. Both must yield the same sequence: [1] live, [2]/[3]/[4]
+        // INVALID, [5] live.
+        let mut table = IndexTable::default();
+        for k in 1u8..=5 {
+            table.insert(vec![k].into(), WalPosition::test_value(k as u64));
+        }
+        table.demote_data_modified_to_clean();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
+        assert!(table.data.is_empty());
+        table.remove(vec![2].into(), WalPosition::test_value(10));
+        table.remove(vec![3].into(), WalPosition::test_value(11));
+        table.remove(vec![4].into(), WalPosition::test_value(12));
+
+        let mut prev: Option<Bytes> = None;
+        let mut seen = Vec::new();
+        while let Some((k, pos)) = table.next_entry(prev.clone(), false) {
+            seen.push((k.as_ref().to_vec(), pos));
+            prev = Some(k);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (vec![1], WalPosition::test_value(1)),
+                (vec![2], WalPosition::INVALID),
+                (vec![3], WalPosition::INVALID),
+                (vec![4], WalPosition::INVALID),
+                (vec![5], WalPosition::test_value(5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_next_entry_data_tombstone_with_other_live_data_key() {
+        // The shadowing tombstone is NOT the nearest data candidate: a smaller
+        // live data key wins the comparison first (non-tie ordering path), and
+        // only at its own step does the tombstone tie with — and shadow — the
+        // live flat entry. The stale flat [5]@5 must never surface.
+        let mut table = IndexTable::default();
+        table.insert(vec![5].into(), WalPosition::test_value(5));
+        table.demote_data_modified_to_clean();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
+        assert_eq!(table.flat_len(), 1);
+        // Live data key [3] (< 5) and a tombstone shadowing flat [5].
+        table.insert(vec![3].into(), WalPosition::test_value(20));
+        table.remove(vec![5].into(), WalPosition::test_value(21));
+
+        // Forward: live [3]@20 wins by ordering, then [5] tombstone (INVALID).
+        let n = table.next_entry(None, false).unwrap();
+        assert_eq!(n, (Bytes::from(vec![3]), WalPosition::test_value(20)));
+        let n = table.next_entry(Some(vec![3].into()), false).unwrap();
+        assert_eq!(n, (Bytes::from(vec![5]), WalPosition::INVALID));
+        assert!(table.next_entry(Some(vec![5].into()), false).is_none());
+
+        // Reverse: [5] tombstone first, then live [3]@20.
+        let n = table.next_entry(None, true).unwrap();
+        assert_eq!(n, (Bytes::from(vec![5]), WalPosition::INVALID));
+        let n = table.next_entry(Some(vec![5].into()), true).unwrap();
+        assert_eq!(n, (Bytes::from(vec![3]), WalPosition::test_value(20)));
+    }
+
+    #[test]
+    fn test_next_entry_at_processed_live_over_flat_ignores_post_frontier_tombstone() {
+        // Key [2] in `data` carries a processed live position (@10) and a later
+        // post-frontier tombstone (@100), layered over a live flat [2]@2.
+        // As-of the frontier between them, the latest *processed* position is
+        // the live @10 — it shadows flat [2]@2 and the tombstone does not count.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(1));
+        table.insert(vec![2].into(), WalPosition::test_value(2));
+        table.insert(vec![3].into(), WalPosition::test_value(3));
+        table.demote_data_modified_to_clean();
+        table.promote_to_flat(LastProcessed::new(u64::MAX));
+        table.insert(vec![2].into(), WalPosition::test_value(10));
+        table.remove(vec![2].into(), WalPosition::test_value(100));
+
+        // Frontier=50: latest processed at [2] is the live @10 (not flat @2,
+        // not the post-frontier tombstone @100).
+        let lp = LastProcessed::new_test(50);
+        let n = table
+            .next_entry_at(Some(vec![1].into()), false, lp)
+            .unwrap();
+        assert_eq!(n, (Bytes::from(vec![2]), WalPosition::test_value(10)));
+        let n = table.next_entry_at(Some(vec![3].into()), true, lp).unwrap();
+        assert_eq!(n, (Bytes::from(vec![2]), WalPosition::test_value(10)));
+
+        // Frontier=200: now the tombstone @100 is processed and is latest →
+        // [2] is shadowed (INVALID).
+        let lp = LastProcessed::new_test(200);
+        let n = table
+            .next_entry_at(Some(vec![1].into()), false, lp)
+            .unwrap();
+        assert_eq!(n, (Bytes::from(vec![2]), WalPosition::INVALID));
     }
 
     #[test]
