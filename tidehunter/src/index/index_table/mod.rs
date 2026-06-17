@@ -483,7 +483,22 @@ impl IndexTable {
     /// shadow the now-removed latest. This matches the BTreeMap-era contract
     /// where each key had a single entry. `key_bytes` and `dirty_count` are
     /// recomputed after.
-    fn retain<F>(&mut self, mut f: F)
+    fn retain<F>(&mut self, f: F)
+    where
+        F: FnMut(&Bytes, &IndexWalPosition) -> bool,
+    {
+        self.drop_data_keys(f);
+        let (kb, dc) = self.recount_stats();
+        self.key_bytes = kb;
+        self.dirty_count = dc;
+    }
+
+    /// Drop from `data` every tuple of any key whose *latest* IWP fails `f`.
+    /// The decision is per-unique-key, matching [`Self::retain`], but this
+    /// helper does **not** refresh `key_bytes`/`dirty_count` — callers that
+    /// already know the resulting flat dirty count can recount just the data
+    /// side (see `promote_to_flat_inner`).
+    fn drop_data_keys<F>(&mut self, mut f: F)
     where
         F: FnMut(&Bytes, &IndexWalPosition) -> bool,
     {
@@ -492,9 +507,6 @@ impl IndexTable {
             .map(|(k, _)| k.clone())
             .collect();
         self.data.retain(|(k, _)| !to_drop.contains(k));
-        let (kb, dc) = self.recount_stats();
-        self.key_bytes = kb;
-        self.dirty_count = dc;
     }
 
     /// Rebuild the flat buffer by walking existing entries through `keep`. The
@@ -1427,14 +1439,20 @@ impl IndexTable {
             return false;
         }
 
-        let (new_flat, _flat_dirty) =
+        let (new_flat, flat_dirty) =
             merge_into_flat(&self.flat, self.key_size, &self.data, last_processed);
         self.flat = new_flat;
         // Per-key: if the latest entry was promoted (its offset < last_processed),
         // discard ALL positions for that key from data. Otherwise (latest is
-        // unprocessed), keep every position for that key untouched. Per-key
-        // `retain` already does this and recomputes the stat counters.
-        self.retain(|_, v| !last_processed.is_processed(v));
+        // unprocessed), keep every position for that key untouched.
+        //
+        // `merge_into_flat` already returned `flat_dirty` for the new flat, so
+        // recount only the data side rather than re-scanning the (now larger)
+        // flat via the full `retain`/`recount_stats` path.
+        self.drop_data_keys(|_, v| !last_processed.is_processed(v));
+        let (data_key_bytes, data_dirty) = self.recount_data_stats();
+        self.key_bytes = data_key_bytes;
+        self.dirty_count = flat_dirty + data_dirty;
         true
     }
 
@@ -1622,6 +1640,16 @@ impl IndexTable {
         let flat_dirty = FlatIter::new(&self.flat, self.key_size)
             .filter(|(_, iwp)| !iwp.is_clean())
             .count();
+        let (key_bytes, data_dirty) = self.recount_data_stats();
+        (key_bytes, flat_dirty + data_dirty)
+    }
+
+    /// Single-pass recount of the data side only: `(data_key_bytes,
+    /// data_dirty)`. The flat-side dirty count is excluded, so callers that
+    /// already hold an accurate flat dirty count (e.g. the value
+    /// `merge_into_flat` returns) can avoid a redundant full flat re-scan and
+    /// combine it themselves: `dirty_count = flat_dirty + data_dirty`.
+    fn recount_data_stats(&self) -> (usize, usize) {
         let mut key_bytes = 0usize;
         let mut data_dirty = 0usize;
         for (k, v) in self.data_iter_latest() {
@@ -1630,7 +1658,7 @@ impl IndexTable {
                 data_dirty += 1;
             }
         }
-        (key_bytes, flat_dirty + data_dirty)
+        (key_bytes, data_dirty)
     }
 
     // ---------------------------------------------------------------------------
