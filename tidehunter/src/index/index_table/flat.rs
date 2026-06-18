@@ -19,12 +19,11 @@
 // The flat buffer is purely in-memory and never persisted.
 // ---------------------------------------------------------------------------
 
-use super::{IndexEntryKind, IndexWalPosition, data_latest_per_key};
+use super::{DataOverlay, IndexEntryKind, IndexWalPosition, data_latest_per_key};
 use crate::wal::position::{LastProcessed, WalPosition};
 use bytes::BytesMut;
 use minibytes::Bytes;
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
 
 // ---- Variable-length helpers (operate on the flat buffer directly) --------
 
@@ -397,7 +396,7 @@ impl<'a> Iterator for FlatIter<'a> {
 fn merge_walk(
     flat: &[u8],
     key_size: Option<usize>,
-    data: &BTreeSet<(Bytes, IndexWalPosition)>,
+    data: &DataOverlay,
     last_processed: LastProcessed,
     mut f: impl FnMut(&[u8], IndexWalPosition),
 ) {
@@ -452,7 +451,7 @@ fn merge_walk(
 pub(super) fn merge_into_flat(
     flat: &[u8],
     key_size: Option<usize>,
-    data: &BTreeSet<(Bytes, IndexWalPosition)>,
+    data: &DataOverlay,
     last_processed: LastProcessed,
 ) -> (Bytes, usize) {
     let mut entry_count: usize = 0;

@@ -13,13 +13,26 @@ use crate::primitives::var_int::{MAX_U16_VARINT, deserialize_u16_varint, seriali
 use crate::wal::position::{HasOffset, LastProcessed, WalPosition};
 use bytes::{Buf, BufMut, BytesMut};
 use minibytes::Bytes;
+use smallvec::{SmallVec, smallvec};
 use std::cmp::Ordering;
-#[cfg(test)]
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::btree_map::Entry;
 use std::ops::Bound;
+
+/// Positions recorded in the `data` overlay for a single key, kept ascending by
+/// `IndexWalPosition` (so the last element is the latest). Inline capacity 1
+/// keeps the common single-write-per-key case allocation-free; the rare key
+/// rewritten again before promotion spills its extra positions to the heap.
+pub(super) type DataPositions = SmallVec<[IndexWalPosition; 1]>;
+
+/// The `data` write buffer: one entry per key, mapping the key to its ordered
+/// positions. A `BTreeMap` (vs. a flat `BTreeSet<(key, position)>`) lets the
+/// hot insert path reach a key with a single tree descent via `entry`, stores
+/// each key once, and makes `data.len()` the unique-key count the rest of the
+/// impl assumes.
+pub(super) type DataOverlay = BTreeMap<Bytes, DataPositions>;
 
 #[derive(Default, Clone, Debug)]
 #[doc(hidden)]
@@ -29,15 +42,15 @@ pub struct IndexTable {
     /// supplied `last_processed`; unprocessed (in-flight) entries remain here
     /// until a later promote observes a high enough `last_processed`.
     ///
-    /// Stored as a `BTreeSet<(key, position)>` so multiple positions for the
-    /// same key may coexist. Observable semantics treat the entry with the
-    /// largest `IndexWalPosition` as the live value for that key — set
-    /// ordering is `(key, offset, len, kind)`, so the latest entry for a key
-    /// is the last one in its same-key group.
-    data: BTreeSet<(Bytes, IndexWalPosition)>,
+    /// Stored as a `BTreeMap<key, positions>` so multiple positions for the
+    /// same key may coexist (the `positions` vec, ascending by
+    /// `IndexWalPosition`). Observable semantics treat the entry with the
+    /// largest `IndexWalPosition` — the last vec element — as the live value
+    /// for that key.
+    data: DataOverlay,
     /// Sum of unique key lengths currently in `data` (each key counted once,
     /// regardless of how many positions exist for it). Maintained
-    /// incrementally where cheap, recomputed via `recount_data_key_bytes`
+    /// incrementally where cheap, recomputed via `recount_data_stats`
     /// after bulk operations.
     key_bytes: usize,
     /// Count of dirty (Modified or Removed) entries across both `data` and
@@ -132,53 +145,14 @@ fn adjust_dirty_count(dirty_count: &mut usize, was_dirty: bool, is_dirty: bool) 
     }
 }
 
-/// A key for `data` overlay lookups. Building a `(Bytes, IndexWalPosition)`
-/// range bound needs an owned `Bytes`; this bridges the two key forms callers
-/// hold so each pays only what it must: a caller that already owns the key as
-/// `Bytes` (the write path — `checked_insert`, `skip_stale_update`) clones it
-/// (a refcount bump), while a borrowed slice (the read path) copies once. The
-/// `AsRef<[u8]>` supertrait also yields the slice the flat fallback needs.
-trait OverlayKey: AsRef<[u8]> {
-    fn to_bound_key(&self) -> Bytes;
-}
-
-impl OverlayKey for Bytes {
-    fn to_bound_key(&self) -> Bytes {
-        self.clone()
-    }
-}
-
-impl OverlayKey for [u8] {
-    fn to_bound_key(&self) -> Bytes {
-        Bytes::from(self.to_vec())
-    }
-}
-
-// For array-literal call sites such as `data_get_latest(&[1])`.
-impl<const N: usize> OverlayKey for [u8; N] {
-    fn to_bound_key(&self) -> Bytes {
-        Bytes::from(self.to_vec())
-    }
-}
-
-/// Iterate `(Bytes, IndexWalPosition)` tuples yielding one entry per unique
-/// key — the latest (largest IWP) within each same-key group. Since the set
-/// is sorted by `(key, offset, len, kind)` ascending, the latest is the last
-/// entry in each group, identifiable by the next tuple's key differing.
-pub(super) fn data_latest_per_key<'a>(
-    data: &'a BTreeSet<(Bytes, IndexWalPosition)>,
-) -> impl Iterator<Item = (&'a Bytes, &'a IndexWalPosition)> + 'a {
-    let mut iter = data.iter().peekable();
-    std::iter::from_fn(move || {
-        let mut cur = iter.next()?;
-        while let Some(next) = iter.peek() {
-            if next.0 != cur.0 {
-                break;
-            }
-            cur = iter.next().unwrap();
-        }
-        Some((&cur.0, &cur.1))
-    })
+/// Iterate one entry per key — the key and its latest (largest IWP) position.
+/// Each key's `positions` vec is kept ascending, so the latest is its last
+/// element. Keys are yielded in ascending order (`BTreeMap` iteration).
+pub(super) fn data_latest_per_key(
+    data: &DataOverlay,
+) -> impl Iterator<Item = (&Bytes, &IndexWalPosition)> + '_ {
+    data.iter()
+        .map(|(k, positions)| (k, positions.last().expect("data positions are never empty")))
 }
 
 // ---------------------------------------------------------------------------
@@ -201,30 +175,41 @@ impl IndexTable {
         // todo handle this comparison correctly when we have data relocation
         // todo might want a separate test with snapshot enabled
 
-        let previous = self.data_get_latest(&k);
-        if previous.is_none() {
-            // Enforce the ordering assertion for keys that were promoted to flat.
-            #[cfg(any(debug_assertions, feature = "test_methods"))]
-            if let Some(existing) = self.flat_binary_search(&k) {
-                assert!(
-                    existing.offset < v.offset,
-                    "Index WAL position must be increasing (flat)"
-                );
-            }
+        // Enforce the ordering assertion for keys promoted to flat but not yet
+        // in `data`. Done before `entry` so the immutable flat read doesn't
+        // overlap the mutable `data` borrow the entry holds (the `contains_key`
+        // probe is debug/test-only — release does a single `data` descent).
+        #[cfg(any(debug_assertions, feature = "test_methods"))]
+        if !self.data.contains_key(&k)
+            && let Some(existing) = self.flat_binary_search(&k)
+        {
+            assert!(
+                existing.offset < v.offset,
+                "Index WAL position must be increasing (flat)"
+            );
         }
 
-        if let Some(prev) = previous {
-            assert!(
-                prev.offset < v.offset,
-                "Index WAL position must be increasing"
-            );
-            adjust_dirty_count(&mut self.dirty_count, !prev.is_clean(), !v.is_clean());
-        } else {
-            self.key_bytes += k.len();
-            adjust_dirty_count(&mut self.dirty_count, false, !v.is_clean());
+        match self.data.entry(k) {
+            Entry::Occupied(mut oc) => {
+                // `positions` is non-empty and ascending by IWP, so the latest
+                // is its last element and the new (strictly greater) position
+                // appends in order.
+                let prev = *oc.get().last().unwrap();
+                assert!(
+                    prev.offset < v.offset,
+                    "Index WAL position must be increasing"
+                );
+                adjust_dirty_count(&mut self.dirty_count, !prev.is_clean(), !v.is_clean());
+                oc.get_mut().push(v);
+                Some(prev.into_wal_position())
+            }
+            Entry::Vacant(va) => {
+                self.key_bytes += va.key().len();
+                adjust_dirty_count(&mut self.dirty_count, false, !v.is_clean());
+                va.insert(smallvec![v]);
+                None
+            }
         }
-        self.data.insert((k, v));
-        previous.map(|p| p.into_wal_position())
     }
 
     /// Merges dirty IndexTable into a loaded IndexTable, producing **clean** index table
@@ -268,7 +253,7 @@ impl IndexTable {
             } else {
                 *v
             };
-            self.data.insert((k.clone(), incoming));
+            self.data_insert_sorted(k.clone(), incoming);
         }
 
         // ---- flat side: dirty's disk-derived `flat` folds into self.flat ----
@@ -398,24 +383,23 @@ impl IndexTable {
             }
         }
 
-        // Drop overlay tuples shadowed by a value just taken from dirty.flat.
+        // Drop overlay positions shadowed by a value just taken from dirty.flat:
+        // every position for that key is below the winner, so the whole key goes.
         for (key, winner) in keys_from_dirty {
-            let lower = (key.clone(), IndexWalPosition::MIN);
-            let upper = (key, IndexWalPosition::MAX);
-            let stale: Vec<_> = self.data.range(lower..=upper).cloned().collect();
-            for e in stale {
-                // Caller contract: any same-key `self.data` tuple is older than
-                // the dirty.flat value shadowing it — dropping a newer tuple
-                // here would lose a write. (A tombstone winner sits at the
-                // INVALID sentinel offset u64::MAX, trivially satisfying this.)
-                debug_assert!(
-                    e.1.offset <= winner.offset,
-                    "fold_dirty_flat: dropping self.data tuple at offset {} newer than \
-                     the dirty.flat value at offset {} that shadows it",
-                    e.1.offset,
-                    winner.offset
-                );
-                self.data.remove(&e);
+            if let Some(stale) = self.data.remove(&key) {
+                for e in &stale {
+                    // Caller contract: any same-key `self.data` position is older
+                    // than the dirty.flat value shadowing it — dropping a newer
+                    // one here would lose a write. (A tombstone winner sits at the
+                    // INVALID sentinel offset u64::MAX, trivially satisfying this.)
+                    debug_assert!(
+                        e.offset <= winner.offset,
+                        "fold_dirty_flat: dropping self.data position at offset {} newer than \
+                         the dirty.flat value at offset {} that shadows it",
+                        e.offset,
+                        winner.offset
+                    );
+                }
             }
         }
 
@@ -435,32 +419,25 @@ impl IndexTable {
         // ran between snapshot capture and now, an entry present in original.data may now
         // live in self.flat — record those for the flat-rebuild pass below.
         let mut pending_flat: HashMap<Bytes, IndexWalPosition> = HashMap::new();
-        for (k, v) in original.data.iter() {
-            if !last_processed.is_processed(v) {
-                // Do not unmerge entries that might have in-flight operations
-                continue;
-            }
-            // Find the tuple in self.data with matching key + update_position
-            // (kind may differ, but offset+len must match). Use into_update_position:
-            // into_wal_position collapses all Removed entries to INVALID, which would
-            // incorrectly match two different Removed tombstones at distinct WAL offsets.
-            let v_update_position = v.into_update_position();
-            let to_remove: Option<(Bytes, IndexWalPosition)> = self
-                .data
-                .range((k.clone(), IndexWalPosition::MIN)..=(k.clone(), IndexWalPosition::MAX))
-                .find(|(_, sv)| sv.into_update_position() == v_update_position)
-                .cloned();
-            let removed_from_data = if let Some(entry) = to_remove {
-                self.data.remove(&entry);
-                true
-            } else {
-                false
-            };
-            if !removed_from_data {
-                // Either no matching tuple in self.data (likely promoted into
-                // self.flat) or only newer positions exist for the key. Let the
-                // flat rebuild below drop it by key+position match.
-                pending_flat.insert(k.clone(), *v);
+        for (k, positions) in original.data.iter() {
+            for v in positions {
+                if !last_processed.is_processed(v) {
+                    // Do not unmerge entries that might have in-flight operations
+                    continue;
+                }
+                // Remove the position in self.data with matching key + update_position
+                // (kind may differ, but offset+len must match). Use into_update_position:
+                // into_wal_position collapses all Removed entries to INVALID, which would
+                // incorrectly match two different Removed tombstones at distinct WAL offsets.
+                let v_update_position = v.into_update_position();
+                let removed_from_data = self
+                    .data_remove_matching(k, |sv| sv.into_update_position() == v_update_position);
+                if !removed_from_data {
+                    // Either no matching position in self.data (likely promoted
+                    // into self.flat) or only newer positions exist for the key.
+                    // Let the flat rebuild below drop it by key+position match.
+                    pending_flat.insert(k.clone(), *v);
+                }
             }
         }
         // Rebuild self.flat, dropping entries matched by either:
@@ -535,11 +512,9 @@ impl IndexTable {
     where
         F: FnMut(&Bytes, &IndexWalPosition) -> bool,
     {
-        let to_drop: HashSet<Bytes> = data_latest_per_key(&self.data)
-            .filter(|(k, v)| !f(k, v))
-            .map(|(k, _)| k.clone())
-            .collect();
-        self.data.retain(|(k, _)| !to_drop.contains(k));
+        // Keep a key (and thus all its positions) iff its latest IWP passes `f`.
+        self.data
+            .retain(|k, positions| f(k, positions.last().expect("data positions are never empty")));
     }
 
     /// Rebuild the flat buffer by walking existing entries through `keep`. The
@@ -547,7 +522,7 @@ impl IndexTable {
     /// (optionally with a rewritten position — e.g. Modified→Clean).
     ///
     /// `dirty_count` is **not** adjusted here — callers are expected to either
-    /// set it (`clean_self`: goes to 0) or recompute via `count_dirty_slow`
+    /// set it (`clean_self`: goes to 0) or recompute via `recount_stats`
     /// (`retain_above_position`, `compact_with`) since the accurate delta
     /// depends on caller context.
     fn retain_flat<F>(&mut self, mut keep: F)
@@ -1006,7 +981,7 @@ impl IndexTable {
     #[doc(hidden)] // Used by lookup_header.rs for varlen index deserialization
     pub(crate) fn from_varlen_flat_bytes(flat: Bytes) -> Self {
         IndexTable {
-            data: BTreeSet::new(),
+            data: BTreeMap::new(),
             key_bytes: 0,
             flat,
             key_size: None,
@@ -1024,7 +999,7 @@ impl IndexTable {
         let dirty_count = entries.iter().filter(|(_, iwp)| !iwp.is_clean()).count();
         let flat = build_flat_bytes(entries, None);
         IndexTable {
-            data: BTreeSet::new(),
+            data: BTreeMap::new(),
             key_bytes: 0,
             flat,
             key_size: None,
@@ -1092,7 +1067,7 @@ impl IndexTable {
 
         if !has_tombstone {
             return IndexTable {
-                data: BTreeSet::new(),
+                data: BTreeMap::new(),
                 key_bytes: 0,
                 flat: bytes,
                 key_size: Some(key_size),
@@ -1113,7 +1088,7 @@ impl IndexTable {
         }
         let flat = build_flat_bytes(entries, Some(key_size));
         IndexTable {
-            data: BTreeSet::new(),
+            data: BTreeMap::new(),
             key_bytes: 0,
             flat,
             key_size: Some(key_size),
@@ -1142,7 +1117,7 @@ impl IndexTable {
         }
         let flat = build_flat_bytes(entries, None);
         IndexTable {
-            data: BTreeSet::new(),
+            data: BTreeMap::new(),
             key_bytes: 0,
             flat,
             key_size: None,
@@ -1190,14 +1165,14 @@ impl IndexTable {
         // logical "view" only ever exposed the latest, and clean_self is the
         // resting point where we settle to one entry per key.
         let mut tombstoned: HashSet<Bytes> = HashSet::new();
-        let mut new_data: BTreeSet<(Bytes, IndexWalPosition)> = BTreeSet::new();
+        let mut new_data: DataOverlay = BTreeMap::new();
         for (k, v) in data_latest_per_key(&self.data) {
             match v.kind {
                 IndexEntryKind::Clean => {
-                    new_data.insert((k.clone(), *v));
+                    new_data.insert(k.clone(), smallvec![*v]);
                 }
                 IndexEntryKind::Modified => {
-                    new_data.insert((k.clone(), v.as_clean_modified()));
+                    new_data.insert(k.clone(), smallvec![v.as_clean_modified()]);
                 }
                 IndexEntryKind::Removed => {
                     tombstoned.insert(k.clone());
@@ -1240,8 +1215,9 @@ impl IndexTable {
     /// no unprocessed entries against any caller-supplied `last_processed`.
     pub fn has_unprocessed(&self, last_processed: LastProcessed) -> bool {
         self.data
-            .iter()
-            .any(|(_k, v)| !last_processed.is_processed(v))
+            .values()
+            .flatten()
+            .any(|v| !last_processed.is_processed(v))
     }
 
     /// Retain only entries with offset >= last_processed. Applied to both flat and data.
@@ -1324,12 +1300,19 @@ impl IndexTable {
         // before `RelocationUpdates::apply`, never after (see `flusher.rs`).
         debug_assert!(
             self.data
-                .iter()
-                .all(|(_, v)| v.offset() != WalPosition::INVALID.offset()),
+                .values()
+                .flatten()
+                .all(|v| v.offset() != WalPosition::INVALID.offset()),
             "disk-origin (INVALID-offset) entry found in data overlay — \
              violates the invariant that disk entries live only in flat"
         );
-        self.data.retain(|(_, v)| last_processed.is_processed(v));
+        // Per position, not per key — a key may carry both a below- and a
+        // post-frontier write; drop only the post-frontier ones, then drop any
+        // key left with no positions.
+        self.data.retain(|_, positions| {
+            positions.retain(|v| last_processed.is_processed(v));
+            !positions.is_empty()
+        });
         let (kb, dc) = self.recount_stats();
         self.key_bytes = kb;
         self.dirty_count = dc;
@@ -1353,12 +1336,18 @@ impl IndexTable {
         let post_frontier: Vec<(Bytes, IndexWalPosition)> = self
             .data
             .iter()
-            .filter(|(_, v)| !last_processed.is_processed(v))
-            .cloned()
+            .flat_map(|(k, positions)| {
+                positions
+                    .iter()
+                    .filter(|v| !last_processed.is_processed(*v))
+                    .map(move |v| (k.clone(), *v))
+            })
             .collect();
         *self = as_of;
-        for entry in post_frontier {
-            self.data.insert(entry);
+        for (k, iwp) in post_frontier {
+            // Raw sorted insert: a relocated flat copy can transiently sit above
+            // a post-frontier write for the same key, so order is not guaranteed.
+            self.data_insert_sorted(k, iwp);
         }
         let (kb, dc) = self.recount_stats();
         self.key_bytes = kb;
@@ -1370,15 +1359,29 @@ impl IndexTable {
     /// Operates on the latest position for the key.
     pub fn apply_update(&mut self, key: &[u8], update: impl FnOnce(&mut IndexWalPosition)) {
         if let Some(latest) = self.data_get_latest(key) {
-            // Remove the old latest tuple, apply update, re-insert.
-            let key_bytes = Bytes::from(key.to_vec());
-            let removed = self.data.remove(&(key_bytes.clone(), latest));
-            debug_assert!(removed);
             let was_dirty = !latest.is_clean();
             let mut new_iwp = latest;
             update(&mut new_iwp);
             adjust_dirty_count(&mut self.dirty_count, was_dirty, !new_iwp.is_clean());
-            self.data.insert((key_bytes, new_iwp));
+            // Replace the latest position (the vec's last element) with the
+            // updated one, keeping the vec ordered. The update re-points to a
+            // fresh, strictly-greater WAL offset, so `new_iwp` always inserts as
+            // a new element rather than colliding with a surviving older
+            // position — assert that, since a silent collision would drop the
+            // element while `dirty_count` was already adjusted for it.
+            let positions = self
+                .data
+                .get_mut(key)
+                .expect("data_get_latest found the key");
+            positions.pop();
+            match positions.binary_search(&new_iwp) {
+                Err(pos) => positions.insert(pos, new_iwp),
+                Ok(_) => debug_assert!(
+                    false,
+                    "apply_update: updated position collided with an existing position for the key"
+                ),
+            }
+            debug_assert!(!positions.is_empty());
             return;
         }
         // Also check the flat buffer (present when promote_to_flat has been called).
@@ -1399,8 +1402,10 @@ impl IndexTable {
             adjust_dirty_count(&mut self.dirty_count, was_dirty, !iwp.is_clean());
             let key_bytes = Bytes::from(key.to_vec());
             self.key_bytes += key_bytes.len();
-            // The updated position shadows the stale flat entry on reads.
-            self.data.insert((key_bytes, iwp));
+            // The key is absent from `data` (we reached the flat branch), so the
+            // updated position shadows the stale flat entry on reads as a fresh
+            // single-position entry.
+            self.data.insert(key_bytes, smallvec![iwp]);
         }
     }
 
@@ -1462,12 +1467,9 @@ impl IndexTable {
         // entry happens to be unprocessed, the merge below is a no-op (rare;
         // not worth a separate scan to detect).
         //
-        // todo: `self.data.len()` is the total tuple count, not the unique-key
-        // count. With the BTreeSet layout, re-inserting the same key (e.g. a
-        // hot counter) accumulates tuples and trips the threshold sooner than
-        // the old BTreeMap layout did. Promote fires more often than before
-        // for write-heavy hot-key workloads. Switch to `data_unique_key_count`
-        // to restore the pre-refactor trigger cadence.
+        // `self.data.len()` is the unique-key count (one map entry per key), so
+        // re-inserting the same key does not inflate the trigger — a hot counter
+        // trips the threshold on distinct keys, matching the intended cadence.
         if self.data.len() <= threshold {
             return false;
         }
@@ -1490,60 +1492,79 @@ impl IndexTable {
     }
 
     // ---------------------------------------------------------------------------
-    // Private data-set helpers
+    // Private data-overlay helpers
     //
-    // Bridge the BTreeSet-of-tuples layout to the BTreeMap-style "one logical
-    // entry per key" view the rest of the impl assumes. Each helper dedupes
-    // duplicate-key tuples by picking the largest IWP under the derived
-    // `(offset, len, kind)` ordering — i.e. the latest position per key.
+    // The `data` map keys each entry once and keeps its positions ascending by
+    // IWP, so the latest position is the vec's last element and a key lookup is a
+    // single `get`. Helpers that expose the "one logical entry per key" view the
+    // rest of the impl assumes read that last element.
     // ---------------------------------------------------------------------------
 
     /// Latest `IndexWalPosition` recorded in `data` for `key`, or `None` if no
-    /// tuple exists for that key.
-    ///
-    /// Generic over [`OverlayKey`] so a write-path caller that already owns the
-    /// key as `Bytes` (e.g. `checked_insert`) builds the range bounds with a
-    /// refcount-bump clone, while a borrowed `&[u8]` read-path caller copies the
-    /// key once. The choice is made by the argument type — no extra method.
-    fn data_get_latest<K: OverlayKey + ?Sized>(&self, key: &K) -> Option<IndexWalPosition> {
-        let bound = key.to_bound_key();
-        let lower = (bound.clone(), IndexWalPosition::MIN);
-        let upper = (bound, IndexWalPosition::MAX);
-        self.data.range(lower..=upper).next_back().map(|(_, v)| *v)
+    /// position exists for that key. Single map descent; `Bytes: Borrow<[u8]>`
+    /// means the borrowed-slice lookup needs no key allocation.
+    fn data_get_latest(&self, key: &[u8]) -> Option<IndexWalPosition> {
+        self.data
+            .get(key)
+            .map(|positions| *positions.last().expect("data positions are never empty"))
+    }
+
+    /// Insert `iwp` into `key`'s position list, preserving ascending IWP order
+    /// and set semantics (an identical position is not duplicated). Creates the
+    /// key's entry if absent. Used by merge/rebase paths where the incoming
+    /// position is not guaranteed to be the largest for the key (the hot insert
+    /// path appends directly in `checked_insert`).
+    fn data_insert_sorted(&mut self, key: Bytes, iwp: IndexWalPosition) {
+        let positions = self.data.entry(key).or_default();
+        if let Err(pos) = positions.binary_search(&iwp) {
+            positions.insert(pos, iwp);
+        }
+    }
+
+    /// Remove the first position for `key` (lowest IWP) matching `pred`, dropping
+    /// the key entirely if that empties its list. Returns whether a position was
+    /// removed.
+    fn data_remove_matching(
+        &mut self,
+        key: &[u8],
+        pred: impl Fn(&IndexWalPosition) -> bool,
+    ) -> bool {
+        let Some(positions) = self.data.get_mut(key) else {
+            return false;
+        };
+        let Some(idx) = positions.iter().position(pred) else {
+            return false;
+        };
+        positions.remove(idx);
+        if positions.is_empty() {
+            self.data.remove(key);
+        }
+        true
     }
 
     /// Latest `IndexWalPosition` recorded in `data` for `key` that is processed
     /// relative to `last_processed` (offset < `last_processed`), or `None` if
     /// the key has no processed position there.
     ///
-    /// Within a same-key group the set is ordered by `(offset, len, kind)`, and
-    /// `LastProcessed::is_processed` depends only on `offset`, so the latest
-    /// processed entry is the last tuple strictly below the
-    /// `(offset = last_processed)` boundary.
+    /// Positions ascend by `(offset, ..)` and `LastProcessed::is_processed`
+    /// depends only on `offset`, so scanning from the back yields the latest
+    /// processed position first.
     fn data_get_latest_processed(
         &self,
         key: &[u8],
         last_processed: LastProcessed,
     ) -> Option<IndexWalPosition> {
-        let key_bytes = Bytes::from(key.to_vec());
-        let lower = (key_bytes.clone(), IndexWalPosition::MIN);
-        // Exclusive upper bound: the smallest IWP that is NOT processed. Any
-        // entry with `offset < last_processed` sorts strictly below it; any
-        // entry with `offset >= last_processed` sorts at or above it. This
-        // mirrors the strict `<` in `LastProcessed::is_processed`.
-        let upper = (
-            key_bytes,
-            IndexWalPosition {
-                offset: last_processed.as_u64(),
-                len: 0,
-                kind: IndexEntryKind::Clean,
-            },
-        );
-        self.data.range(lower..upper).next_back().map(|(_, v)| *v)
+        self.data.get(key).and_then(|positions| {
+            positions
+                .iter()
+                .rev()
+                .find(|v| last_processed.is_processed(*v))
+                .copied()
+        })
     }
 
     fn data_contains_key(&self, key: &[u8]) -> bool {
-        self.data_get_latest(key).is_some()
+        self.data.contains_key(key)
     }
 
     /// Iterator over `data` yielding one entry per unique key (the latest).
@@ -1551,45 +1572,37 @@ impl IndexTable {
         data_latest_per_key(&self.data)
     }
 
-    /// Count of unique keys present in `data` (multiple positions for the
-    /// same key collapse to one).
+    /// Count of unique keys present in `data` (one map entry per key).
     fn data_unique_key_count(&self) -> usize {
-        self.data_iter_latest().count()
+        self.data.len()
     }
 
     /// Forward iteration on `data`: smallest key strictly greater than
     /// `prev` (or smallest key if `prev` is `None`), with that key's
-    /// *latest* `IndexWalPosition`.
+    /// *latest* `IndexWalPosition` (its last, largest position).
     fn data_next_forward(&self, prev: Option<&[u8]>) -> Option<(&Bytes, &IndexWalPosition)> {
-        let start: Bound<(Bytes, IndexWalPosition)> = match prev {
-            Some(p) => Bound::Excluded((Bytes::from(p.to_vec()), IndexWalPosition::MAX)),
+        let start = match prev {
+            Some(p) => Bound::Excluded(p),
             None => Bound::Unbounded,
         };
-        let mut iter = self.data.range((start, Bound::Unbounded));
-        let first = iter.next()?;
-        let target_key = &first.0;
-        let mut latest = first;
-        for entry in iter {
-            if entry.0 != *target_key {
-                break;
-            }
-            latest = entry;
-        }
-        Some((&latest.0, &latest.1))
+        self.data
+            .range::<[u8], _>((start, Bound::Unbounded))
+            .next()
+            .map(|(k, positions)| (k, positions.last().expect("data positions are never empty")))
     }
 
     /// Backward iteration on `data`: largest key strictly less than `prev`
     /// (or largest key if `prev` is `None`), with that key's *latest*
-    /// `IndexWalPosition`. The largest tuple in `(-inf, (prev, MIN))` is
-    /// the latest IWP of the largest key < prev because set ordering puts
-    /// the latest entry last in each same-key group.
+    /// `IndexWalPosition`.
     fn data_next_reverse(&self, prev: Option<&[u8]>) -> Option<(&Bytes, &IndexWalPosition)> {
-        let end: Bound<(Bytes, IndexWalPosition)> = match prev {
-            Some(p) => Bound::Excluded((Bytes::from(p.to_vec()), IndexWalPosition::MIN)),
+        let end = match prev {
+            Some(p) => Bound::Excluded(p),
             None => Bound::Unbounded,
         };
-        let last = self.data.range((Bound::Unbounded, end)).next_back()?;
-        Some((&last.0, &last.1))
+        self.data
+            .range::<[u8], _>((Bound::Unbounded, end))
+            .next_back()
+            .map(|(k, positions)| (k, positions.last().expect("data positions are never empty")))
     }
 
     /// As-of-`last_processed` forward step over `data`: the smallest key
@@ -1597,77 +1610,48 @@ impl IndexTable {
     /// paired with that key's latest processed `IndexWalPosition`. Keys whose
     /// positions all postdate the frontier are skipped over.
     ///
-    /// Single ascending range scan grouped by key: one bound allocation, no
-    /// per-candidate re-bisect. Within a same-key group entries ascend by
-    /// `(offset, ..)`, so the latest processed position is the last tuple below
-    /// the frontier.
+    /// Positions ascend by `(offset, ..)`, so scanning a key's list from the
+    /// back yields the latest processed position first.
     fn data_next_forward_at(
         &self,
         prev: Option<&[u8]>,
         last_processed: LastProcessed,
     ) -> Option<(Bytes, IndexWalPosition)> {
-        let start: Bound<(Bytes, IndexWalPosition)> = match prev {
-            Some(p) => Bound::Excluded((Bytes::from(p.to_vec()), IndexWalPosition::MAX)),
+        let start = match prev {
+            Some(p) => Bound::Excluded(p),
             None => Bound::Unbounded,
         };
-        let mut iter = self.data.range((start, Bound::Unbounded));
-        let mut cur = iter.next();
-        while let Some((key, iwp)) = cur {
-            let mut latest_processed = last_processed.is_processed(iwp).then_some(*iwp);
-            loop {
-                cur = iter.next();
-                match cur {
-                    Some((k, v)) if k == key => {
-                        if last_processed.is_processed(v) {
-                            latest_processed = Some(*v);
-                        }
-                    }
-                    // Group ended; `cur` now holds the next group's first tuple
-                    // (or None) for the outer loop to pick up.
-                    _ => break,
-                }
-            }
-            if let Some(found) = latest_processed {
-                return Some((key.clone(), found));
-            }
-        }
-        None
+        self.data
+            .range::<[u8], _>((start, Bound::Unbounded))
+            .find_map(|(key, positions)| {
+                positions
+                    .iter()
+                    .rev()
+                    .find(|v| last_processed.is_processed(*v))
+                    .map(|v| (key.clone(), *v))
+            })
     }
 
     /// As-of-`last_processed` backward counterpart of [`Self::data_next_forward_at`].
-    ///
-    /// Single descending range scan grouped by key. Within a group descending
-    /// by `(offset, ..)` the first processed tuple encountered has the largest
-    /// offset, i.e. is the latest processed position.
     fn data_next_reverse_at(
         &self,
         prev: Option<&[u8]>,
         last_processed: LastProcessed,
     ) -> Option<(Bytes, IndexWalPosition)> {
-        let end: Bound<(Bytes, IndexWalPosition)> = match prev {
-            Some(p) => Bound::Excluded((Bytes::from(p.to_vec()), IndexWalPosition::MIN)),
+        let end = match prev {
+            Some(p) => Bound::Excluded(p),
             None => Bound::Unbounded,
         };
-        let mut iter = self.data.range((Bound::Unbounded, end)).rev();
-        let mut cur = iter.next();
-        while let Some((key, iwp)) = cur {
-            let mut latest_processed = last_processed.is_processed(iwp).then_some(*iwp);
-            loop {
-                cur = iter.next();
-                match cur {
-                    Some((k, v)) if k == key => {
-                        if latest_processed.is_none() && last_processed.is_processed(v) {
-                            latest_processed = Some(*v);
-                        }
-                    }
-                    _ => break,
-                }
-            }
-            if let Some(found) = latest_processed {
-                return Some((key.clone(), found));
-            }
-        }
-        None
+        self.data
+            .range::<[u8], _>((Bound::Unbounded, end))
+            .rev()
+            .find_map(|(key, positions)| {
+                positions
+                    .iter()
+                    .rev()
+                    .find(|v| last_processed.is_processed(*v))
+                    .map(|v| (key.clone(), *v))
+            })
     }
 
     /// Single-pass recount of `(data_key_bytes, dirty_count)`. Both counters
@@ -1772,23 +1756,16 @@ impl IndexTable {
         Some((key_bytes, iwp.into_wal_position()))
     }
 
-    /// Test helper: rewrite every `Modified` entry in `data` to `Clean`.
-    /// Mirrors the common test pattern `data.values_mut().for_each(...)`
-    /// the BTreeMap layout supported in place.
+    /// Test helper: rewrite every `Modified` position in `data` to `Clean`.
     #[cfg(test)]
     fn demote_data_modified_to_clean(&mut self) {
-        self.data = self
-            .data
-            .iter()
-            .map(|(k, v)| {
-                let new_v = if v.kind == IndexEntryKind::Modified {
-                    v.as_clean_modified()
-                } else {
-                    *v
-                };
-                (k.clone(), new_v)
-            })
-            .collect();
+        for positions in self.data.values_mut() {
+            for v in positions.iter_mut() {
+                if v.kind == IndexEntryKind::Modified {
+                    *v = v.as_clean_modified();
+                }
+            }
+        }
         let (kb, dc) = self.recount_stats();
         self.key_bytes = kb;
         self.dirty_count = dc;
@@ -1796,38 +1773,20 @@ impl IndexTable {
 
     #[cfg(test)]
     pub fn into_data(self) -> BTreeMap<Bytes, WalPosition> {
-        // Flat entries have lower priority; data entries override them.
-        // Set iteration is (key, offset) ascending — overwriting earlier entries
-        // for the same key with later ones in the BTreeMap leaves the latest.
+        // Flat entries have lower priority; data entries override them. Each
+        // data key's latest position (its last) is the live value.
         let mut result: BTreeMap<Bytes, WalPosition> = FlatIter::new(&self.flat, self.key_size)
             .map(|(k, iwp)| (Bytes::from(k.to_vec()), iwp.into_wal_position()))
             .collect();
-        for (k, v) in self.data {
-            result.insert(k, v.into_wal_position());
+        for (k, positions) in self.data {
+            let latest = positions.last().expect("data positions are never empty");
+            result.insert(k, latest.into_wal_position());
         }
         result
     }
 }
 
 impl IndexWalPosition {
-    /// Lowest possible IWP value under the derived `(offset, len, kind)`
-    /// lexicographic ordering — used as a range lower bound when querying
-    /// the `(Bytes, IndexWalPosition)` set for "all tuples with key K".
-    pub(super) const MIN: Self = Self {
-        offset: 0,
-        len: 0,
-        kind: IndexEntryKind::Clean,
-    };
-
-    /// Highest possible IWP value — used as a range upper bound to capture
-    /// the latest entry for a key (set ordering puts the largest IWP last
-    /// within a same-key group).
-    pub(super) const MAX: Self = Self {
-        offset: u64::MAX,
-        len: u32::MAX,
-        kind: IndexEntryKind::Removed,
-    };
-
     fn new_clean(w: WalPosition) -> Self {
         debug_assert_ne!(w, WalPosition::INVALID);
         Self {
@@ -1993,12 +1952,12 @@ mod tests {
 
     #[test]
     fn test_var_len_iterator() {
-        let data: BTreeSet<(Bytes, IndexWalPosition)> = BTreeSet::from_iter([
+        let data: DataOverlay = data_overlay([
             (vec![1, 2, 3].into(), iwp(22)),
             (vec![2, 5].into(), iwp(23)),
             (vec![].into(), iwp(25)),
         ]);
-        let key_bytes: usize = data.iter().map(|(k, _)| k.len()).sum();
+        let key_bytes: usize = data.keys().map(|k| k.len()).sum();
         let index = IndexTable {
             data,
             key_bytes,
@@ -2026,6 +1985,20 @@ mod tests {
     }
     fn wp(n: u64) -> WalPosition {
         WalPosition::new(n, 15)
+    }
+
+    /// Build a `data` overlay from `(key, position)` tuples, grouping positions
+    /// by key and keeping each key's list ascending — the in-memory shape the
+    /// production write path maintains.
+    fn data_overlay(entries: impl IntoIterator<Item = (Bytes, IndexWalPosition)>) -> DataOverlay {
+        let mut map: DataOverlay = BTreeMap::new();
+        for (k, v) in entries {
+            map.entry(k).or_default().push(v);
+        }
+        for positions in map.values_mut() {
+            positions.sort();
+        }
+        map
     }
 
     fn u8ref(a: &[u8]) -> &[u8] {
@@ -2616,10 +2589,8 @@ mod tests {
         // Make [1] and [3] clean; leave [2] modified.
         for k in [&[1u8][..], &[3u8][..]] {
             let prev = table.data_get_latest(k).unwrap();
-            table.data.remove(&(Bytes::from(k.to_vec()), prev));
-            table
-                .data
-                .insert((Bytes::from(k.to_vec()), prev.as_clean_modified()));
+            table.data_remove_matching(k, |v| *v == prev);
+            table.data_insert_sorted(Bytes::from(k.to_vec()), prev.as_clean_modified());
         }
 
         table.promote_to_flat(LastProcessed::new(u64::MAX));
@@ -2838,8 +2809,9 @@ mod tests {
         assert!(
             merged
                 .data
-                .iter()
-                .all(|(_, v)| v.offset() != WalPosition::INVALID.offset()),
+                .values()
+                .flatten()
+                .all(|v| v.offset() != WalPosition::INVALID.offset()),
             "disk tombstone leaked into the data overlay"
         );
         assert!(
@@ -3125,7 +3097,7 @@ mod tests {
     #[test]
     fn test_merge_into_flat_var_len_btree_only() {
         let flat = Bytes::default();
-        let btree: BTreeSet<(Bytes, IndexWalPosition)> = BTreeSet::from_iter([
+        let btree: DataOverlay = data_overlay([
             (vec![1].into(), iwp_modified(1)),
             (vec![2, 5].into(), iwp_clean(2)),
             (vec![9].into(), iwp_modified(3)),
@@ -3157,7 +3129,7 @@ mod tests {
         table.insert(vec![3].into(), WalPosition::test_value(3));
         table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
-        let btree: BTreeSet<(Bytes, IndexWalPosition)> = BTreeSet::new();
+        let btree: DataOverlay = DataOverlay::new();
 
         let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
         // All three flat entries are Modified.
@@ -3176,7 +3148,7 @@ mod tests {
         let flat = table.flat.clone();
 
         // btree: [1]=Modified@10 (overrides flat), [2]=Modified@2 (new)
-        let btree: BTreeSet<(Bytes, IndexWalPosition)> = BTreeSet::from_iter([
+        let btree: DataOverlay = data_overlay([
             (vec![1].into(), iwp_modified(10)),
             (vec![2].into(), iwp_modified(2)),
         ]);
@@ -3209,7 +3181,7 @@ mod tests {
         table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
 
-        let btree: BTreeSet<(Bytes, IndexWalPosition)> = BTreeSet::from_iter([
+        let btree: DataOverlay = data_overlay([
             (vec![2].into(), iwp_clean(2)),
             (vec![5].into(), iwp_clean(5)),
             (vec![8].into(), iwp_clean(8)),
@@ -3236,8 +3208,7 @@ mod tests {
         table.insert(vec![2].into(), WalPosition::test_value(2));
         table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
-        let btree: BTreeSet<(Bytes, IndexWalPosition)> =
-            BTreeSet::from_iter([(vec![1].into(), iwp_removed(10))]);
+        let btree: DataOverlay = data_overlay([(vec![1].into(), iwp_removed(10))]);
 
         let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
         // Modified [2] from flat + Removed [1] from btree = 2 dirty.
@@ -3271,8 +3242,12 @@ mod tests {
         assert_eq!(pre[0].1.kind, IndexEntryKind::Removed);
 
         // Merge with empty btree — Removed must round-trip unchanged.
-        let (new_flat, dirty) =
-            merge_into_flat(&flat, None, &BTreeSet::new(), LastProcessed::new(u64::MAX));
+        let (new_flat, dirty) = merge_into_flat(
+            &flat,
+            None,
+            &DataOverlay::new(),
+            LastProcessed::new(u64::MAX),
+        );
         assert_eq!(dirty, 2); // Modified + Removed both dirty.
         let entries = decode_flat(&new_flat, None);
         assert_eq!(entries.len(), 2);
@@ -3295,8 +3270,7 @@ mod tests {
         table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
 
-        let btree: BTreeSet<(Bytes, IndexWalPosition)> =
-            BTreeSet::from_iter([(vec![1].into(), iwp_modified(20))]);
+        let btree: DataOverlay = data_overlay([(vec![1].into(), iwp_modified(20))]);
         let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
         assert_eq!(dirty, 1);
         let entries = decode_flat(&new_flat, None);
@@ -3320,7 +3294,7 @@ mod tests {
         let (new_flat, dirty) = merge_into_flat(
             &flat,
             Some(4),
-            &BTreeSet::new(),
+            &DataOverlay::new(),
             LastProcessed::new(u64::MAX),
         );
         assert_eq!(dirty, 2);
@@ -3337,7 +3311,7 @@ mod tests {
     #[test]
     fn test_merge_into_flat_empty_inputs() {
         let flat = Bytes::default();
-        let btree: BTreeSet<(Bytes, IndexWalPosition)> = BTreeSet::new();
+        let btree: DataOverlay = DataOverlay::new();
         let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
         assert!(new_flat.is_empty());
         assert_eq!(dirty, 0);
@@ -3355,8 +3329,8 @@ mod tests {
         let flat = table.flat.clone();
 
         // btree overrides k4(10), inserts k4(20).
-        let btree: BTreeSet<(Bytes, IndexWalPosition)> =
-            BTreeSet::from_iter([(k4(10), iwp_modified(100)), (k4(20), iwp_modified(20))]);
+        let btree: DataOverlay =
+            data_overlay([(k4(10), iwp_modified(100)), (k4(20), iwp_modified(20))]);
 
         let (new_flat, dirty) =
             merge_into_flat(&flat, Some(4), &btree, LastProcessed::new(u64::MAX));
@@ -3378,7 +3352,7 @@ mod tests {
     #[test]
     fn test_merge_into_flat_fixed_len_btree_only() {
         let flat = Bytes::default();
-        let btree: BTreeSet<(Bytes, IndexWalPosition)> = BTreeSet::from_iter([
+        let btree: DataOverlay = data_overlay([
             (k4(1), iwp_modified(1)),
             (k4(2), iwp_clean(2)),
             (k4(3), iwp_removed(3)),
@@ -3408,7 +3382,7 @@ mod tests {
         let (new_flat, dirty) = merge_into_flat(
             &flat,
             Some(4),
-            &BTreeSet::new(),
+            &DataOverlay::new(),
             LastProcessed::new(u64::MAX),
         );
         // Both flat entries are Modified.
@@ -3424,22 +3398,20 @@ mod tests {
         table.insert(vec![1].into(), WalPosition::test_value(1));
         table.insert(vec![2].into(), WalPosition::test_value(2));
         table.insert(vec![3].into(), WalPosition::test_value(3));
-        // Demote [1] to Clean. Then add a Removed@3 tuple for [3] — with the
-        // BTreeSet layout it coexists with the prior Modified@3 tuple, and
+        // Demote [1] to Clean. Then add a Removed@3 position for [3] — it
+        // coexists with the prior Modified@3 position in the key's list, and
         // since `Removed > Modified` under the derived IWP ordering, the
         // Removed entry wins as the latest for [3].
         let prev_1 = table.data_get_latest(&[1]).unwrap();
-        table.data.remove(&(Bytes::from(vec![1]), prev_1));
-        table
-            .data
-            .insert((Bytes::from(vec![1]), prev_1.as_clean_modified()));
-        table.data.insert((Bytes::from(vec![3]), iwp_removed(3)));
+        table.data_remove_matching(&[1], |v| *v == prev_1);
+        table.data_insert_sorted(Bytes::from(vec![1]), prev_1.as_clean_modified());
+        table.data_insert_sorted(Bytes::from(vec![3]), iwp_removed(3));
         table.promote_to_flat(LastProcessed::new(u64::MAX));
         // flat now: [1]=Clean, [2]=Modified, [3]=Removed.
         let flat = table.flat.clone();
 
         // data set: [4]=Clean (overrides nothing), [2]=Modified@20 (overrides [2])
-        let data: BTreeSet<(Bytes, IndexWalPosition)> = BTreeSet::from_iter([
+        let data: DataOverlay = data_overlay([
             (vec![2].into(), iwp_modified(20)),
             (vec![4].into(), iwp_clean(4)),
         ]);
@@ -3461,7 +3433,7 @@ mod tests {
     fn test_merge_into_flat_var_len_size_with_varying_key_lengths() {
         // Verify exact buffer size for keys of different lengths.
         let flat = Bytes::default();
-        let btree: BTreeSet<(Bytes, IndexWalPosition)> = BTreeSet::from_iter([
+        let btree: DataOverlay = data_overlay([
             (vec![1].into(), iwp_modified(1)),
             (vec![2, 3].into(), iwp_modified(2)),
             (vec![4, 5, 6].into(), iwp_modified(3)),
@@ -3475,15 +3447,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // BTreeSet multi-position-per-key behaviour
+    // Multi-position-per-key behaviour
     //
-    // The set layout allows several `IndexWalPosition` values to coexist for
-    // the same key in `data`. Observers must dedupe to the latest IWP per
-    // key (the largest under derived `(offset, len, kind)` ordering, where
-    // `Removed > Modified > Clean`), preserving the observable behaviour of
-    // the previous BTreeMap layout. The tests below exercise scenarios that
-    // are *only reachable* under the set layout — they did not arise under
-    // BTreeMap because `insert` overwrote.
+    // The `data` map holds several `IndexWalPosition` values per key (the key's
+    // ordered position list). Observers must dedupe to the latest IWP per key
+    // (the list's last element — the largest under derived `(offset, len, kind)`
+    // ordering, where `Removed > Modified > Clean`). The tests below exercise
+    // scenarios reachable when a key is written more than once before a
+    // promote drains it.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3619,7 +3590,8 @@ mod tests {
         table.promote_to_flat(LastProcessed::new(50));
 
         assert_eq!(table.flat_len(), 0);
-        assert_eq!(table.data.len(), 2);
+        // Both positions for [1] are retained (the whole key stays in `data`).
+        assert_eq!(table.data.get([1].as_ref()).map(|p| p.len()), Some(2));
         assert_eq!(table.get(&[1]), Some(WalPosition::test_value(100)));
     }
 
@@ -3635,13 +3607,14 @@ mod tests {
         });
 
         assert_eq!(table.get(&[1]), Some(WalPosition::test_value(25)));
-        // The older @10 still occupies a slot; the @20 tuple is gone and
+        // The older @10 still occupies a slot; the @20 position is gone and
         // replaced by @25.
         let offsets: Vec<u64> = table
             .data
+            .get([1].as_ref())
+            .unwrap()
             .iter()
-            .filter(|(k, _)| k.as_ref() == [1u8].as_ref())
-            .map(|(_, v)| v.offset)
+            .map(|v| v.offset)
             .collect();
         assert_eq!(offsets, vec![10, 25]);
     }
@@ -3671,10 +3644,11 @@ mod tests {
 
         table.clean_self();
 
-        let tuples: Vec<_> = table.data.iter().collect();
-        assert_eq!(tuples.len(), 1);
-        assert_eq!(tuples[0].1.offset, 20);
-        assert!(tuples[0].1.is_clean());
+        let entries: Vec<_> = table.data_iter_latest().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(table.data.get([1].as_ref()).map(|p| p.len()), Some(1));
+        assert_eq!(entries[0].1.offset, 20);
+        assert!(entries[0].1.is_clean());
         assert_eq!(table.get(&[1]), Some(WalPosition::test_value(20)));
         assert_eq!(table.dirty_count(), 0);
     }
@@ -3693,12 +3667,8 @@ mod tests {
         current.unmerge_flushed(&original, LastProcessed::new_test(u64::MAX));
 
         assert_eq!(current.get(&[1]), Some(WalPosition::test_value(20)));
-        let tuples_for_one: Vec<_> = current
-            .data
-            .iter()
-            .filter(|(k, _)| k.as_ref() == [1u8].as_ref())
-            .collect();
-        assert_eq!(tuples_for_one.len(), 1);
+        // One position remains for [1] (the post-snapshot @20).
+        assert_eq!(current.data.get([1].as_ref()).map(|p| p.len()), Some(1));
     }
 
     #[test]
