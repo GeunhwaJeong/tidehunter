@@ -426,7 +426,10 @@ impl IndexTable {
         flat_dirty
     }
 
-    /// Remove flushed index entries that have offset <= last_processed
+    /// Remove the snapshot entries the flush made durable, keeping only
+    /// post-snapshot writes. `last_processed` gates the `data` overlay (keep
+    /// unprocessed in-flight writes); `flat` unmerges on position match alone,
+    /// since every flat entry is covered by the post-flush fall-through read.
     pub fn unmerge_flushed(&mut self, original: &Self, last_processed: LastProcessed) {
         // Walk original.data; remove matching entries from self.data. If promote_flat_job
         // ran between snapshot capture and now, an entry present in original.data may now
@@ -474,13 +477,14 @@ impl IndexTable {
                 while orig_it.peek().map(|(ok, _)| *ok < sk).unwrap_or(false) {
                     orig_it.next();
                 }
-                // Check for an exact key match in original.flat and consume if found.
-                // Use into_update_position so two distinct Removed entries (both INVALID
-                // via into_wal_position) don't compare equal.
+                // Drop self.flat entries that position-match original.flat: they
+                // were flushed, and the post-flush read falls through to disk. No
+                // frontier gate (flat never holds unflushed writes), so a disk
+                // tombstone (offset u64::MAX) is fine here. into_update_position
+                // so two distinct Removed entries don't compare equal.
                 let remove_by_flat = if orig_it.peek().map(|(ok, _)| *ok == sk).unwrap_or(false) {
                     let (_, o_iwp) = orig_it.next().unwrap();
-                    last_processed.is_processed(&o_iwp)
-                        && s_iwp.into_update_position() == o_iwp.into_update_position()
+                    s_iwp.into_update_position() == o_iwp.into_update_position()
                 } else {
                     false
                 };
@@ -3054,6 +3058,45 @@ mod tests {
         assert!(current.get(&[2]).is_none());
         // No stale [1]@pos2 left behind in flat.
         assert_eq!(current.flat_binary_search(&[1]), None);
+    }
+
+    #[test]
+    fn test_unmerge_flushed_drops_disk_tombstone_from_flat() {
+        // A disk tombstone in `flat` has offset u64::MAX, which the old frontier
+        // gate read as "unprocessed" and kept. The position match drops it; the
+        // post-flush read falls through to disk, so the drop is correct.
+        let (shape, ks) = KeyShape::new_single_config_indexing(
+            KeyIndexing::variable_length(),
+            1,
+            KeyType::uniform(1),
+            Default::default(),
+        );
+        let ks = shape.ks(ks);
+
+        // Round-trip a blob (live [1], tombstone [2]) so [2] lands in `flat` as
+        // INVALID (offset u64::MAX).
+        let mut on_disk = IndexTable::default();
+        on_disk.insert(vec![1].into(), WalPosition::test_value(10));
+        on_disk.remove(vec![2].into(), WalPosition::test_value(25));
+        let mut buf = BytesMut::new();
+        on_disk.serialize_index_entries(ks, &mut buf);
+        let original = IndexTable::deserialize_index_entries(ks, Bytes::from(buf.freeze()));
+        assert_eq!(original.get(&[2]), Some(WalPosition::INVALID));
+        assert!(original.data.is_empty());
+
+        // Snapshot + a concurrent write to a different key, so the flat side is
+        // reconciled against original.flat (not short-circuited as same-shared).
+        let mut current = original.clone();
+        current.insert(vec![3].into(), WalPosition::test_value(40));
+
+        // Real frontier well below u64::MAX, as in production.
+        current.unmerge_flushed(&original, LastProcessed::new_test(1000));
+
+        // Both flat entries unmerged; only the post-snapshot write survives.
+        assert_eq!(current.get(&[1]), None);
+        assert_eq!(current.get(&[2]), None);
+        assert_eq!(current.get(&[3]), Some(WalPosition::test_value(40)));
+        assert!(current.flat_binary_search(&[2]).is_none());
     }
 
     // -----------------------------------------------------------------------
