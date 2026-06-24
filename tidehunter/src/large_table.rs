@@ -2863,10 +2863,13 @@ mod tests {
     fn test_ks_allocation() {
         let config = Config::small();
         let mut ks = KeyShapeBuilder::new();
-        let a = ks.add_key_space("a", 0, 1, KeyType::uniform(1));
-        let b = ks.add_key_space("b", 0, 1, KeyType::uniform(1));
+        ks.add_key_space("a", 0, 1, KeyType::uniform(1));
+        ks.add_key_space("b", 0, 1, KeyType::uniform(1));
         ks.add_key_space("c", 0, 1, KeyType::uniform(1));
         let ks = ks.build();
+        let kss = crate::key_shape::KeySpaces::from_key_shape(&ks);
+        let a = kss.ks("a");
+        let b = kss.ks("b");
         let tmp_dir = tempdir::TempDir::new("test_ks_allocation").unwrap();
         let wal = Wal::open(
             tmp_dir.path(),
@@ -2901,7 +2904,8 @@ mod tests {
 
         // Create key space with unloaded_iterator enabled
         let config = KeySpaceConfig::default().with_unloaded_iterator(true);
-        let (shape, ks_id) = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
+        let shape = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
+        let ks_id = KeySpace::first();
 
         let ks = shape.ks(ks_id);
         let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
@@ -3236,7 +3240,8 @@ mod tests {
     fn test_disk_levels_to_walk_for_key_sharded() {
         let metrics = Metrics::new();
         let config = KeySpaceConfig::default().with_unloaded_iterator(true);
-        let (shape, ks_id) = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
+        let shape = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
+        let ks_id = KeySpace::first();
         let ks = shape.ks(ks_id);
         let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
         let cell_id = CellId::Integer(0);
@@ -3461,7 +3466,8 @@ mod tests {
         // btree probe per step — no boundary retries.
         let metrics = Metrics::new();
         let config = KeySpaceConfig::default().with_unloaded_iterator(true);
-        let (shape, ks_id) = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
+        let shape = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
+        let ks_id = KeySpace::first();
         let ks = shape.ks(ks_id);
         let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
         let cell_id = CellId::Integer(0);
@@ -3517,7 +3523,8 @@ mod tests {
         // first and switches to A exactly when prev_key drops to B.min.
         let metrics = Metrics::new();
         let config = KeySpaceConfig::default().with_unloaded_iterator(true);
-        let (shape, ks_id) = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
+        let shape = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
+        let ks_id = KeySpace::first();
         let ks = shape.ks(ks_id);
         let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
         let cell_id = CellId::Integer(0);
@@ -3565,13 +3572,14 @@ mod tests {
         let mut ks_builder = KeyShapeBuilder::new();
 
         // Create a PrefixedUniform keyspace with 3-byte prefix and 1024 mutexes
-        let ks_id = ks_builder.add_key_space(
+        ks_builder.add_key_space(
             "test",
             36,   // key_size in bytes
             1024, // mutexes (must be power of 2)
             KeyType::prefix_uniform(3, 0),
         );
         let shape = ks_builder.build();
+        let ks_id = crate::key_shape::KeySpaces::from_key_shape(&shape).ks("test");
         let tmp_dir = tempdir::TempDir::new("test_next_cell_prefixed").unwrap();
         let wal = Wal::open(
             tmp_dir.path(),
@@ -3708,8 +3716,9 @@ mod tests {
         let metrics = Arc::new(Metrics::new());
         let mut ks_builder = KeyShapeBuilder::new();
         // Single-cell KS: 1-byte key, 1 mutex
-        let ks_id = ks_builder.add_key_space("test", 1, 1, KeyType::uniform(1));
+        ks_builder.add_key_space("test", 1, 1, KeyType::uniform(1));
         let shape = ks_builder.build();
+        let ks_id = crate::key_shape::KeySpaces::from_key_shape(&shape).ks("test");
         let tmp_dir = tempdir::TempDir::new("test_report_entries_state").unwrap();
         let wal = Wal::open(
             tmp_dir.path(),

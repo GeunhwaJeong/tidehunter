@@ -76,10 +76,11 @@ fn list_wal_files(path: &Path) -> Vec<String> {
 fn checkpoint_survives_relocation(config: Arc<Config>, ksc: KeySpaceConfig) {
     let dir = tempdir::TempDir::new("test_ckpt_reloc").unwrap();
     let mut ksb = KeyShapeBuilder::new();
-    let ks = ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ksc);
+    ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ksc);
     let key_shape = ksb.build();
     let metrics = Metrics::new();
     let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let ks = db.ks("k");
 
     let big = |b: u8| -> Vec<u8> { vec![b; 12 * 1000] };
     let overwritten = 3u64;
@@ -168,11 +169,13 @@ fn test_checkpoint_survives_relocation_overlay_asof_value() {
     config.wal_file_size = 2 * config.frag_size;
     let config = force_unload_config(&config); // snapshot_unload_threshold = 0
     let mut ksb = KeyShapeBuilder::new();
-    let ks = ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
-    let ks2 = ksb.add_key_space_config("k2", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    ksb.add_key_space_config("k2", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
     let key_shape = ksb.build();
     let metrics = Metrics::new();
     let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let ks = db.ks("k");
+    let ks2 = db.ks("k2");
 
     let big = |b: u8| -> Vec<u8> { vec![b; 12 * 1000] };
     let target = 3u64;
@@ -249,8 +252,8 @@ fn test_wal_relocation_basic_flow() {
             Decision::Remove
         }
     });
-    let ks = ksb.add_key_space_config("k", 4, 1, KeyType::uniform(1), ksc);
-    let ks2 = ksb.add_key_space_config("k2", 4, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    ksb.add_key_space_config("k", 4, 1, KeyType::uniform(1), ksc);
+    ksb.add_key_space_config("k2", 4, 1, KeyType::uniform(1), KeySpaceConfig::new());
     let key_shape = ksb.build();
     let metrics = Metrics::new();
     let sample_key = 3_u32.to_be_bytes().to_vec();
@@ -264,6 +267,8 @@ fn test_wal_relocation_basic_flow() {
             metrics.clone(),
         )
         .unwrap();
+        let ks = db.ks("k");
+        let ks2 = db.ks("k2");
         for i in 0..insert_count {
             db.insert(ks, i.to_be_bytes().to_vec(), value.clone())
                 .unwrap();
@@ -301,6 +306,8 @@ fn test_wal_relocation_basic_flow() {
         metrics.clone(),
     )
     .unwrap();
+    let ks = db.ks("k");
+    let ks2 = db.ks("k2");
     assert_eq!(db.get(ks, &sample_key).unwrap(), None);
     assert_eq!(
         db.get(ks2, &sample_key).unwrap(),
@@ -318,7 +325,7 @@ fn test_index_based_relocation_point_deletes() {
     let dir = tempdir::TempDir::new("test_index_based_relocation_point_deletes").unwrap();
     let mut ksb = KeyShapeBuilder::new();
     let ksc = KeySpaceConfig::new().with_bloom_filter(0.01, 2000);
-    let ks = ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ksc);
+    ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ksc);
     let key_shape = ksb.build();
     let metrics = Metrics::new();
     let db = Db::open(
@@ -328,6 +335,7 @@ fn test_index_based_relocation_point_deletes() {
         metrics.clone(),
     )
     .unwrap();
+    let ks = db.ks("k");
     for key in 0..200u64 {
         db.insert(ks, key.to_be_bytes().to_vec(), vec![0, 1, 2])
             .unwrap();
@@ -382,7 +390,7 @@ fn test_index_based_relocation_filter() {
             Decision::Remove
         }
     });
-    let ks = ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ksc);
+    ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ksc);
     let key_shape = ksb.build();
     let metrics = Metrics::new();
     let sample_key = 3_u64.to_be_bytes().to_vec();
@@ -395,6 +403,7 @@ fn test_index_based_relocation_filter() {
             metrics.clone(),
         )
         .unwrap();
+        let ks = db.ks("k");
         loop {
             db.insert(ks, insert_count.to_be_bytes().to_vec(), vec![0, 1, 2])
                 .unwrap();
@@ -434,6 +443,7 @@ fn test_index_based_relocation_filter() {
             metrics.clone(),
         )
         .unwrap();
+        let ks = db.ks("k");
         for key in insert_count..(insert_count + 100) {
             db.insert(ks, key.to_be_bytes().to_vec(), vec![0, 1, 2])
                 .unwrap();
@@ -454,6 +464,7 @@ fn test_index_based_relocation_filter() {
         metrics.clone(),
     )
     .unwrap();
+    let ks = db.ks("k");
 
     // Verify sample_key still exists (wasn't filtered because no relocation occurred)
     assert_eq!(db.get(ks, &sample_key).unwrap(), Some(vec![0, 1, 2].into()));
@@ -488,14 +499,14 @@ fn test_relocation_strategies_produce_identical_results() {
     // Create identical keyspace configurations
     let mut ksb = KeyShapeBuilder::new();
     let ksc = KeySpaceConfig::new().with_bloom_filter(0.01, 2000);
-    let ks = ksb.add_key_space_config("test", 8, 1, KeyType::uniform(1), ksc);
+    ksb.add_key_space_config("test", 8, 1, KeyType::uniform(1), ksc);
     let key_shape = ksb.build();
 
     let metrics_wal = Metrics::new();
     let metrics_index = Metrics::new();
 
     // Create identical databases with identical operations
-    let (db_wal, db_index) = {
+    let (db_wal, db_index, ks) = {
         let db_wal = Db::open(
             dir1.path(),
             key_shape.clone(),
@@ -510,6 +521,7 @@ fn test_relocation_strategies_produce_identical_results() {
             metrics_index.clone(),
         )
         .unwrap();
+        let ks = db_wal.ks("test");
 
         // Apply identical operations to both databases
         for key in 0..1000u64 {
@@ -539,7 +551,7 @@ fn test_relocation_strategies_produce_identical_results() {
             db_index.remove(ks, key.to_be_bytes().to_vec()).unwrap();
         }
 
-        (db_wal, db_index)
+        (db_wal, db_index, ks)
     };
 
     // Run different relocation strategies
@@ -587,11 +599,12 @@ fn test_both_strategies_handle_concurrent_writes() {
         };
         let mut ksb = KeyShapeBuilder::new();
         let ksc = KeySpaceConfig::new();
-        let ks = ksb.add_key_space_config("concurrent", 8, 1, KeyType::uniform(1), ksc);
+        ksb.add_key_space_config("concurrent", 8, 1, KeyType::uniform(1), ksc);
         let key_shape = ksb.build();
         let metrics = Metrics::new();
 
-        let db = Arc::new(Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap());
+        let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+        let ks = db.ks("concurrent");
 
         // Pre-populate data
         for i in 0..1000u64 {
@@ -719,8 +732,8 @@ fn test_index_based_relocation_progress_tracking() {
 
     // Create multiple keyspaces to ensure cross-keyspace progress tracking
     let mut ksb = KeyShapeBuilder::new();
-    let ks1 = ksb.add_key_space_config("ks1", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
-    let ks2 = ksb.add_key_space_config("ks2", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    ksb.add_key_space_config("ks1", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    ksb.add_key_space_config("ks2", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
     let key_shape = ksb.build();
     let metrics = Metrics::new();
 
@@ -733,6 +746,8 @@ fn test_index_based_relocation_progress_tracking() {
             metrics.clone(),
         )
         .unwrap();
+        let ks1 = db.ks("ks1");
+        let ks2 = db.ks("ks2");
 
         for ks in [ks1, ks2] {
             for key in 0..500u64 {
@@ -777,11 +792,12 @@ fn test_index_based_relocation_empty_and_sparse_cells() {
     let dir = tempdir::TempDir::new("test_sparse_cells").unwrap();
     let mut ksb = KeyShapeBuilder::new();
     let ksc = KeySpaceConfig::new();
-    let ks = ksb.add_key_space_config("sparse", 8, 4, KeyType::uniform(128), ksc); // 128 cells per mutex (power of 2)
+    ksb.add_key_space_config("sparse", 8, 4, KeyType::uniform(128), ksc); // 128 cells per mutex (power of 2)
     let key_shape = ksb.build();
     let metrics = Metrics::new();
 
     let db = Db::open(dir.path(), key_shape, index_based_config(), metrics.clone()).unwrap();
+    let ks = db.ks("sparse");
 
     // Create very sparse data - only populate every 10th cell
     for cell_idx in (0..128).step_by(10) {
@@ -822,11 +838,12 @@ fn test_index_based_relocation_large_cells() {
     let mut ksb = KeyShapeBuilder::new();
     let ksc = KeySpaceConfig::new();
     // Use fewer cells so we can pack more entries per cell
-    let ks = ksb.add_key_space_config("dense", 8, 2, KeyType::uniform(2), ksc); // Only 2 cells per mutex
+    ksb.add_key_space_config("dense", 8, 2, KeyType::uniform(2), ksc); // Only 2 cells per mutex
     let key_shape = ksb.build();
     let metrics = Metrics::new();
 
     let db = Db::open(dir.path(), key_shape, index_based_config(), metrics.clone()).unwrap();
+    let ks = db.ks("dense");
 
     // Fill cells with many entries each
     let entries_per_cell = 1000u64;
@@ -872,11 +889,12 @@ fn test_index_based_relocation_large_cells() {
 fn test_watermark_highest_wal_position_tracking() {
     let dir = tempdir::TempDir::new("test_watermark_wal_position").unwrap();
     let mut ksb = KeyShapeBuilder::new();
-    let ks = ksb.add_key_space_config("test", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    ksb.add_key_space_config("test", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
     let key_shape = ksb.build();
     let metrics = Metrics::new();
 
     let db = Db::open(dir.path(), key_shape, index_based_config(), metrics.clone()).unwrap();
+    let ks = db.ks("test");
 
     // Insert multiple entries to create WAL entries at different positions
     for key in 0..50u64 {
@@ -976,10 +994,11 @@ fn test_index_based_relocation_with_target_position() {
     let dir = tempdir::TempDir::new("test_target_position").unwrap();
     let config = index_based_config();
     let mut ksb = KeyShapeBuilder::new();
-    let ks = ksb.add_key_space("default", 8, 1, KeyType::uniform(1));
+    ksb.add_key_space("default", 8, 1, KeyType::uniform(1));
     let key_shape = ksb.build();
     let metrics = Metrics::new();
     let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let ks = db.ks("default");
 
     // Insert 1000 entries sequentially
     for i in 0..500u64 {
@@ -1051,7 +1070,7 @@ fn test_index_based_relocation_with_target_position() {
 fn test_index_based_relocation_preserves_overwrite_above_target() {
     let dir = tempdir::TempDir::new("test_index_cas_overwrite").unwrap();
     let mut ksb = KeyShapeBuilder::new();
-    let ks = ksb.add_key_space("k", 8, 1, KeyType::uniform(1));
+    ksb.add_key_space("k", 8, 1, KeyType::uniform(1));
     let key_shape = ksb.build();
     let metrics = Metrics::new();
     // No forced unload: the cell must stay loaded so the as-of value is still
@@ -1064,6 +1083,7 @@ fn test_index_based_relocation_preserves_overwrite_above_target() {
         metrics.clone(),
     )
     .unwrap();
+    let ks = db.ks("k");
 
     let key = 3u64.to_be_bytes().to_vec();
     db.insert(ks, key.clone(), vec![1; 64]).unwrap();
@@ -1121,7 +1141,7 @@ fn test_force_relocate_concurrent_write_keeps_below_l0_keys() {
     let mut ksb = KeyShapeBuilder::new();
     // Unloaded iteration off so that stepping an iterator loads the cell
     // (point reads never load; this is the only read-path load trigger).
-    let ks = ksb.add_key_space_config(
+    ksb.add_key_space_config(
         "k",
         8,
         1,
@@ -1131,6 +1151,7 @@ fn test_force_relocate_concurrent_write_keeps_below_l0_keys() {
     let key_shape = ksb.build();
     let metrics = Metrics::new();
     let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let ks = db.ks("k");
 
     let value = |b: u8| -> Vec<u8> { vec![b; 100] };
     let key = |i: u64| -> Vec<u8> { i.to_be_bytes().to_vec() };
@@ -1278,9 +1299,10 @@ fn test_compute_target_position_from_ratio() {
     let dir = tempdir::TempDir::new("test_compute_ratio").unwrap();
     let config = Arc::new(Config::small());
     let mut ksb = KeyShapeBuilder::new();
-    let ks = ksb.add_key_space("default", 8, 1, KeyType::uniform(1));
+    ksb.add_key_space("default", 8, 1, KeyType::uniform(1));
     let key_shape = ksb.build();
-    let db = Arc::new(Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap());
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+    let ks = db.ks("default");
 
     // Initially should return None (empty WAL)
     assert_eq!(compute_target_position_from_ratio(&db, 0.5), None);

@@ -135,20 +135,25 @@ fn main() {
     let config = Arc::new(config);
 
     let mut key_shape_builder = KeyShapeBuilder::new();
-    let key_space = key_shape_builder.add_key_space("main", 1, 8, KeyType::uniform(1));
-    let key_space2 = key_shape_builder.add_key_space("secondary", 4, 8, KeyType::uniform(1));
+    key_shape_builder.add_key_space("main", 1, 8, KeyType::uniform(1));
+    key_shape_builder.add_key_space("secondary", 4, 8, KeyType::uniform(1));
     let key_shape = key_shape_builder.build();
 
     // Shared metrics across restarts so relocation counters accumulate
     let shared_metrics = Metrics::new();
 
-    // Wrap database in RwLock with Option to allow safe restarts
-    let db = Arc::new(RwLock::new(Some(open_db_with_snapshots(
+    // Open once to obtain the canonical key space handles (stable across the
+    // same-shape reopens below), then wrap the db in RwLock<Option<_>> to
+    // allow safe restarts.
+    let initial_db = open_db_with_snapshots(
         temp_dir.path(),
         key_shape.clone(),
         config.clone(),
         shared_metrics.clone(),
-    ))));
+    );
+    let key_space = initial_db.ks("main");
+    let key_space2 = initial_db.ks("secondary");
+    let db = Arc::new(RwLock::new(Some(initial_db)));
 
     // Track number of database restarts and rebuilds for debugging
     let restart_count = Arc::new(AtomicU64::new(0));
@@ -287,7 +292,8 @@ fn main() {
                             }
                         }
 
-                        // Create new database while still holding the write lock
+                        // Create new database while still holding the write lock.
+                        // The key space handles are stable across same-shape reopens.
                         *db_write = Some(open_db_with_snapshots(
                             &db_path,
                             key_shape.clone(),

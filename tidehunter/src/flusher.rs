@@ -948,8 +948,9 @@ mod tests {
         if auto_sharding {
             config.with_index_auto_sharding();
         }
-        let (shape, ks_id) =
+        let shape =
             KeyShape::new_single_config(8, 1, KeyType::uniform(8), KeySpaceConfig::default());
+        let ks_id = KeySpace::first();
         let ks = shape.ks(ks_id).clone();
         KsContext::new(Arc::new(config), ks, Metrics::new())
     }

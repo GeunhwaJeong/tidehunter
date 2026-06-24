@@ -102,13 +102,13 @@ fn bench_index_iter(c: &mut Criterion) {
         ("varlen", KeyIndexing::variable_length()),
     ];
     for (label, key_indexing) in layouts {
-        let (shape, ks_id) = KeyShape::new_single_config_indexing(
+        let shape = KeyShape::new_single_config_indexing(
             key_indexing,
             16,
             KeyType::uniform(16),
             Default::default(),
         );
-        bench_keyspace(c, label, shape.ks(ks_id));
+        bench_keyspace(c, label, shape.iter_ks().next().unwrap());
     }
 }
 
@@ -148,13 +148,13 @@ fn scan_at(table: &IndexTable, reverse: bool, lp: LastProcessed) -> usize {
 
 fn bench_next_entry_at(c: &mut Criterion) {
     // Fixed-length keys (the common case) for the as-of iteration path.
-    let (shape, ks_id) = KeyShape::new_single_config_indexing(
+    let shape = KeyShape::new_single_config_indexing(
         KeyIndexing::fixed(32),
         16,
         KeyType::uniform(16),
         Default::default(),
     );
-    let ks = shape.ks(ks_id);
+    let ks = shape.iter_ks().next().unwrap();
     // Frontier above every offset used in `build_interleaved`, so all entries
     // are processed (no skipping) — isolates the per-step overlay cost.
     let lp = LastProcessed::from_u64_for_test(u64::MAX);

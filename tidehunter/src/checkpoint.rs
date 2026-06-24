@@ -107,7 +107,7 @@ impl DbCheckpoint {
     }
 
     pub(crate) fn ks(&self, ks: KeySpace) -> &KeySpaceDesc {
-        self.db.ks(ks)
+        self.db.ks_desc(ks)
     }
 
     pub(crate) fn next_cell(
@@ -183,8 +183,9 @@ mod tests {
     fn test_checkpoint_snapshot_read() {
         let dir = tempdir::TempDir::new("test-checkpoint").unwrap();
         let config = Arc::new(Config::small());
-        let (key_shape, ks) = KeyShape::new_single(8, 16, KeyType::uniform(16));
+        let key_shape = KeyShape::new_single(8, 16, KeyType::uniform(16));
         let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+        let ks = db.single_ks();
 
         let key = 42u64.to_be_bytes().to_vec();
         let v1: Bytes = vec![1u8].into();
@@ -247,8 +248,9 @@ mod tests {
     fn test_checkpoint_iterator_snapshot() {
         let dir = tempdir::TempDir::new("test-checkpoint-iter").unwrap();
         let config = Arc::new(Config::small());
-        let (key_shape, ks) = KeyShape::new_single(8, 16, KeyType::uniform(16));
+        let key_shape = KeyShape::new_single(8, 16, KeyType::uniform(16));
         let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+        let ks = db.single_ks();
 
         let k = |n: u64| n.to_be_bytes().to_vec();
         let v = |b: u8| -> Bytes { vec![b].into() };
@@ -325,10 +327,11 @@ mod tests {
         let ksc = KeySpaceConfig::new()
             .with_value_cache_size(512)
             .with_bloom_filter(0.01, 2000);
-        let ks = ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ksc);
+        ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ksc);
         let key_shape = ksb.build();
         let metrics = Metrics::new();
         let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+        let ks = db.ks("k");
 
         let k = |n: u64| n.to_be_bytes().to_vec();
         let v = |b: u8| -> Bytes { vec![b].into() };

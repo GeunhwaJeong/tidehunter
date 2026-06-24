@@ -21,7 +21,7 @@ pub(crate) enum IterationSource {
 impl IterationSource {
     fn ks(&self, ks: KeySpace) -> &KeySpaceDesc {
         match self {
-            IterationSource::Db(db) => db.ks(ks),
+            IterationSource::Db(db) => db.ks_desc(ks),
             IterationSource::Checkpoint(cp) => cp.ks(ks),
         }
     }

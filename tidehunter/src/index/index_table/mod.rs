@@ -1932,7 +1932,7 @@ impl<'a> Iterator for VariableLenKeyIndexIterator<'a> {
 mod tests {
     use super::flat::{decode_kind_from_len, encode_kind_in_len};
     use super::*;
-    use crate::key_shape::{KeyIndexing, KeyShape, KeyType};
+    use crate::key_shape::{KeyIndexing, KeyShape, KeySpace, KeyType};
 
     #[test]
     fn test_encode_decode_kind_in_len() {
@@ -1965,12 +1965,13 @@ mod tests {
             key_size: None,
             dirty_count: 0,
         };
-        let (shape, ks) = KeyShape::new_single_config_indexing(
+        let shape = KeyShape::new_single_config_indexing(
             KeyIndexing::variable_length(),
             1,
             KeyType::uniform(1),
             Default::default(),
         );
+        let ks = KeySpace::first();
         let ks = shape.ks(ks);
         let mut buf = BytesMut::new();
         index.serialize_index_entries(ks, &mut buf);
@@ -2719,12 +2720,13 @@ mod tests {
         // New entry after promote (in BTreeMap).
         table.insert(vec![2].into(), WalPosition::test_value(20));
 
-        let (shape, ks) = KeyShape::new_single_config_indexing(
+        let shape = KeyShape::new_single_config_indexing(
             KeyIndexing::variable_length(),
             1,
             KeyType::uniform(1),
             Default::default(),
         );
+        let ks = KeySpace::first();
         let ks = shape.ks(ks);
         let mut buf = BytesMut::new();
         table.serialize_index_entries(ks, &mut buf);
@@ -2753,12 +2755,13 @@ mod tests {
         // Tombstone on key [2].
         table.remove(vec![2].into(), WalPosition::test_value(25));
 
-        let (shape, ks) = KeyShape::new_single_config_indexing(
+        let shape = KeyShape::new_single_config_indexing(
             KeyIndexing::variable_length(),
             1,
             KeyType::uniform(1),
             Default::default(),
         );
+        let ks = KeySpace::first();
         let ks = shape.ks(ks);
 
         let mut buf = BytesMut::new();
@@ -2783,12 +2786,13 @@ mod tests {
         // WAL offsets, so a sentinel-offset entry in `data` is misread as an
         // unprocessed post-frontier write and dropped by retain_processed,
         // resurrecting the value the tombstone shadows in a deeper level.
-        let (shape, ks) = KeyShape::new_single_config_indexing(
+        let shape = KeyShape::new_single_config_indexing(
             KeyIndexing::variable_length(),
             1,
             KeyType::uniform(1),
             Default::default(),
         );
+        let ks = KeySpace::first();
         let ks = shape.ks(ks);
 
         // Build an on-disk blob holding a tombstone for [2], then round-trip it
@@ -3037,12 +3041,13 @@ mod tests {
         // A disk tombstone in `flat` has offset u64::MAX, which the old frontier
         // gate read as "unprocessed" and kept. The position match drops it; the
         // post-flush read falls through to disk, so the drop is correct.
-        let (shape, ks) = KeyShape::new_single_config_indexing(
+        let shape = KeyShape::new_single_config_indexing(
             KeyIndexing::variable_length(),
             1,
             KeyType::uniform(1),
             Default::default(),
         );
+        let ks = KeySpace::first();
         let ks = shape.ks(ks);
 
         // Round-trip a blob (live [1], tombstone [2]) so [2] lands in `flat` as
@@ -3697,12 +3702,13 @@ mod tests {
         table.insert(vec![1].into(), WalPosition::test_value(20));
         table.insert(vec![2].into(), WalPosition::test_value(30));
 
-        let (shape, ks) = KeyShape::new_single_config_indexing(
+        let shape = KeyShape::new_single_config_indexing(
             KeyIndexing::variable_length(),
             1,
             KeyType::uniform(1),
             Default::default(),
         );
+        let ks = KeySpace::first();
         let ks = shape.ks(ks);
         let mut buf = BytesMut::new();
         table.serialize_index_entries(ks, &mut buf);
