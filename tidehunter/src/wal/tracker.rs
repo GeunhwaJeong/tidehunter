@@ -1,7 +1,6 @@
 use super::WalPosition;
 use super::position::LastProcessed;
 use crate::WalLayout;
-#[cfg(test)]
 use crate::latch::LatchGuard;
 use crate::metrics::{MetricIntGauge, Metrics, TimerExt};
 use crate::wal::allocator::AllocationResult;
@@ -123,7 +122,6 @@ enum WalTrackerMessage {
     LatchRequest(mpsc::Sender<WalTrackerLatch>),
     /// Release a previously acquired latch, handing it back to the tracker.
     LatchRelease(WalTrackerLatch),
-    #[cfg(test)]
     Barrier(#[allow(dead_code)] LatchGuard),
 }
 
@@ -241,7 +239,6 @@ impl WalTracker {
         self.mapper.is_alive()
     }
 
-    #[cfg(test)]
     pub fn barrier(&self) {
         use crate::latch::Latch;
         let (latch, guard) = Latch::new();
@@ -367,7 +364,6 @@ impl WalTrackerThread {
                     self.latches.remove(&(latch.position, latch.id));
                     self.publish();
                 }
-                #[cfg(test)]
                 WalTrackerMessage::Barrier(_) => {
                     // Drop the barrier guard to unblock the caller. A barrier
                     // changes no state, so it does not publish.

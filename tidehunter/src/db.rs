@@ -932,6 +932,8 @@ impl Db {
     }
 
     pub fn force_rebuild_control_region(&self) -> DbResult<u64> {
+        // Wait for the async WAL tracker to catch up so all recent writes are included in the snapshot.
+        self.wal_writer.wal_tracker_barrier();
         self.rebuild_control_region_from(self.wal_writer.position())
     }
 

@@ -179,6 +179,63 @@ fn test_multi_thread_write() {
     }
 }
 
+// `force_rebuild_control_region` must include all recent writes in the snapshot,
+// leaving the table fully clean even when the async WAL tracker lags behind writes
+// under load (a lagging tracker used to leave flushed entries stuck dirty).
+#[test]
+fn test_force_rebuild_clean_under_load() {
+    // Spinners keep all cores busy so the WAL tracker lags behind writes.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut spinners = Vec::new();
+    for _ in 0..8 {
+        let stop = stop.clone();
+        spinners.push(thread::spawn(move || {
+            let mut x = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                std::hint::black_box(x);
+            }
+        }));
+    }
+
+    for iter in 0..60 {
+        let dir = tempdir::TempDir::new("test-rebuild-clean").unwrap();
+        let mut builder = KeyShapeBuilder::new();
+        let objects = builder.add_key_space("objects", 8, 16, KeyType::uniform(8));
+        let metadata = builder.add_key_space("metadata", 8, 16, KeyType::uniform(8));
+        let key_shape = builder.build();
+        let db = Db::open(
+            dir.path(),
+            key_shape,
+            Arc::new(Config::default()),
+            Metrics::new(),
+        )
+        .unwrap();
+        for i in 0..5u8 {
+            db.insert(objects, format!("key{i:02}___").into_bytes(), vec![i; 16])
+                .unwrap();
+        }
+        for i in 0..3u8 {
+            db.insert(
+                metadata,
+                format!("key{i:02}___").into_bytes(),
+                vec![i + 10; 8],
+            )
+            .unwrap();
+        }
+        db.force_rebuild_control_region().unwrap();
+        assert!(
+            db.large_table.is_all_clean(),
+            "iter {iter}: table not clean after force_rebuild_control_region",
+        );
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for s in spinners {
+        s.join().unwrap();
+    }
+}
+
 #[test]
 fn test_batch() {
     test_batch_impl(Config::small());

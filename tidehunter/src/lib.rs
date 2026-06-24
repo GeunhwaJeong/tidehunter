@@ -35,7 +35,6 @@ mod wal_replay;
 
 pub(crate) mod wal;
 
-#[cfg(test)]
 mod latch;
 
 // todo remove re-export

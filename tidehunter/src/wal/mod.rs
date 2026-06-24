@@ -219,7 +219,6 @@ impl WalWriter {
         Ok(())
     }
 
-    #[cfg(test)]
     /// Waits until wal_tracker processes all in-flight messages.
     pub fn wal_tracker_barrier(&self) {
         self.wal_tracker.barrier()
