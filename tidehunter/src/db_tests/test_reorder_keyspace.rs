@@ -361,3 +361,64 @@ fn test_open_with_loaded_shape_roundtrip() {
 fn test_duplicate_keyspace_name_panics() {
     shape(&["a", "a"]);
 }
+
+/// Opens (or creates) a single-keyspace "a" database with the given layout.
+/// Returns the result so the layout check — which panics inside `Db::open` —
+/// surfaces to the caller.
+fn open_a(
+    dir: &Path,
+    config: &Arc<Config>,
+    key_size: usize,
+    mutexes: usize,
+    key_type: KeyType,
+) -> DbResult<Arc<Db>> {
+    let mut builder = KeyShapeBuilder::new();
+    builder.add_key_space("a", key_size, mutexes, key_type);
+    Db::open(dir, builder.build(), config.clone(), Metrics::new())
+}
+
+#[test]
+#[should_panic(expected = "was created with a different layout")]
+fn test_change_mutex_count_panics() {
+    let dir = tempdir::TempDir::new("test-layout-mutexes").unwrap();
+    let config = Arc::new(Config::small());
+    open_a(dir.path(), &config, 4, 8, KeyType::uniform(4)).unwrap();
+    // Reopen "a" with a different mutex count — misroutes existing data.
+    let _ = open_a(dir.path(), &config, 4, 16, KeyType::uniform(4));
+}
+
+#[test]
+#[should_panic(expected = "was created with a different layout")]
+fn test_change_cells_per_mutex_panics() {
+    let dir = tempdir::TempDir::new("test-layout-cells").unwrap();
+    let config = Arc::new(Config::small());
+    open_a(dir.path(), &config, 4, 8, KeyType::uniform(4)).unwrap();
+    let _ = open_a(dir.path(), &config, 4, 8, KeyType::uniform(8));
+}
+
+#[test]
+#[should_panic(expected = "was created with a different layout")]
+fn test_change_key_length_panics() {
+    let dir = tempdir::TempDir::new("test-layout-keylen").unwrap();
+    let config = Arc::new(Config::small());
+    open_a(dir.path(), &config, 4, 8, KeyType::uniform(4)).unwrap();
+    let _ = open_a(dir.path(), &config, 8, 8, KeyType::uniform(4));
+}
+
+#[test]
+#[should_panic(expected = "was created with a different layout")]
+fn test_change_key_type_panics() {
+    let dir = tempdir::TempDir::new("test-layout-keytype").unwrap();
+    let config = Arc::new(Config::small());
+    open_a(dir.path(), &config, 4, 8, KeyType::uniform(4)).unwrap();
+    let _ = open_a(dir.path(), &config, 4, 8, KeyType::prefix_uniform(2, 0));
+}
+
+#[test]
+fn test_same_layout_reopens_fine() {
+    // The layout check must not reject an unchanged reopen.
+    let dir = tempdir::TempDir::new("test-layout-ok").unwrap();
+    let config = Arc::new(Config::small());
+    open_a(dir.path(), &config, 4, 8, KeyType::uniform(4)).unwrap();
+    open_a(dir.path(), &config, 4, 8, KeyType::uniform(4)).unwrap();
+}

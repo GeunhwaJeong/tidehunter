@@ -90,7 +90,7 @@ impl Default for KeySpaceConfig {
 ///
 /// This allows for various use cases such as
 /// * Key reduction (reducing index size by using fewer bytes from the key in the index)
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyIndexing {
     Fixed(usize),
     Reduction(usize, Range<usize>),
@@ -98,18 +98,18 @@ pub enum KeyIndexing {
     Hash,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyType {
     Uniform(UniformKeyConfig),
     PrefixedUniform(PrefixedUniformKeyConfig),
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UniformKeyConfig {
     cells_per_mutex: usize,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrefixedUniformKeyConfig {
     /// First prefix_len_bytes of a key considered a 'prefix'
     prefix_len_bytes: usize,
@@ -241,6 +241,35 @@ impl KeyShapeBuilder {
 impl KeySpaceDesc {
     pub(crate) fn check_key(&self, k: &[u8]) {
         self.key_indexing.check_key_size(k.len(), self.name());
+    }
+
+    /// Panics if `self` (a declared key space) has a different on-disk layout
+    /// than `stored` (the same-named key space recorded in the registry).
+    ///
+    /// The mutex count, key type (uniform vs prefixed, cells-per-mutex, prefix
+    /// bits) and key indexing (indexing kind and key length) all determine how
+    /// keys map to cells. Changing any of them across reopens would misroute
+    /// reads against data laid out by the original configuration, so it is
+    /// rejected loudly rather than silently corrupting.
+    pub(crate) fn assert_layout_matches(&self, stored: &KeySpaceDesc) {
+        if self.mutexes == stored.mutexes
+            && self.key_type == stored.key_type
+            && self.key_indexing == stored.key_indexing
+        {
+            return;
+        }
+        panic!(
+            "Key space '{}' was created with a different layout than the \
+             configuration declares and cannot be changed (it would misroute \
+             existing data).\n  stored:   mutexes={}, key_type={:?}, key_indexing={:?}\n  declared: mutexes={}, key_type={:?}, key_indexing={:?}",
+            self.name(),
+            stored.mutexes,
+            stored.key_type,
+            stored.key_indexing,
+            self.mutexes,
+            self.key_type,
+            self.key_indexing,
+        );
     }
 
     /// Returns a copy of this descriptor with the given id.
@@ -739,6 +768,9 @@ impl KeyShape {
             let id = next_id(&ordered);
             match take_declared(&mut remaining, reg.name()) {
                 Some(desc) => {
+                    // The declared config overrides the registry's, but its
+                    // on-disk layout (mutexes/key type/indexing) must match.
+                    desc.assert_layout_matches(reg);
                     exposed.insert(desc.name().to_string(), id);
                     ordered.push(desc.with_id(id));
                 }
