@@ -475,12 +475,22 @@ impl Db {
     pub fn exists(&self, ks: KeySpace, k: &[u8]) -> DbResult<bool> {
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Exists);
-        // todo check collision ?
         let reduced_key = context.ks_config.reduce_key(k);
-        Ok(self
-            .large_table
-            .get(context, reduced_key.as_ref(), self)?
-            .is_found())
+        match self.large_table.get(context, reduced_key.as_ref(), self)? {
+            GetResult::Value(full_key, _) => {
+                Ok(!context.ks_config.need_check_index_key() || full_key.as_ref() == k)
+            }
+            GetResult::WalPosition(w) => {
+                if context.ks_config.need_check_index_key() {
+                    // With key reduction an index hit may be a different key that
+                    // reduces to the same index key, so read the record to compare.
+                    Ok(self.read_record_check_key(context, k, w)?.is_some())
+                } else {
+                    Ok(true)
+                }
+            }
+            GetResult::NotFound => Ok(false),
+        }
     }
 
     /// Drops all cells in the specified key range for the given key space.
