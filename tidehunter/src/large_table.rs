@@ -925,13 +925,13 @@ impl LargeTable {
     /// reclaims the original WAL file.
     ///
     /// Correctness hinge: the overlay is filtered (`retain_processed`) on its
-    /// *uncollapsed* positions, BEFORE the latest-per-key collapse that
-    /// `maybe_load`/`merge_dirty` perform. A key with a below-frontier write
-    /// shadowed by a post-frontier overwrite holds both positions in the overlay;
-    /// collapsing first keeps only the latest (post-frontier) one, which the
-    /// filter then drops — losing the as-of value entirely and stranding its WAL
-    /// file for GC. We therefore build the view here without `maybe_load` (which
-    /// would also destructively collapse the live cell's overlay). `retain_processed`
+    /// full position lists BEFORE any latest-per-key collapse downstream (the
+    /// relocation consumer serializes latest-per-key). A key with a
+    /// below-frontier write shadowed by a post-frontier overwrite holds both
+    /// positions in the overlay; filtering first leaves the below-frontier
+    /// position as the key's latest, so the collapse yields the as-of value.
+    /// The view is built on a clone, without `maybe_load`, so the live cell
+    /// stays unloaded and its overlay untouched. `retain_processed`
     /// touches only `data`; disk-derived levels are merged unfiltered (they are
     /// as-of-safe by the unprocessed-write retention invariant — see `crate::checkpoint`).
     pub fn get_index_for_cell<L: Loader>(
@@ -2123,6 +2123,15 @@ impl LargeTableEntry {
         self.data.next_entry(prev_key, reverse)
     }
 
+    /// Loads an unloaded cell's L0 blob and folds the dirty overlay on top.
+    ///
+    /// The fold (`merge_dirty_no_clean`) preserves the overlay's full per-key
+    /// position lists, including processed below-frontier positions: they are
+    /// not yet durable in any blob, and a held checkpoint reads them via
+    /// `get_at`. Collapsing to latest-per-key here would drop the
+    /// as-of-frontier position for a key overwritten across the frontier and
+    /// serve the stale flat/L0 entry to checkpoint reads. The backlog drains
+    /// through the usual `promote_to_flat`/flush paths once processed.
     pub fn maybe_load<L: Loader>(&mut self, loader: &L) -> Result<(), L::Error> {
         let Some(unloaded) = self.as_unloaded_state() else {
             return Ok(());

@@ -240,20 +240,34 @@ impl IndexTable {
         // offset-based filters (`retain_processed`, `retain_unprocessed`,
         // `promote_to_flat`) ever act on. `_and_clean` demotes Modified→Clean
         // because they are about to become clean on disk.
-        for (k, v) in dirty.data_iter_latest() {
-            #[cfg(any(debug_assertions, feature = "test_methods"))]
-            if promote_to_clean
-                && let Some(found) = self.data_get_latest(k)
-                && found.offset > v.offset
-            {
-                panic!("found.offset {} > v.offset {}", found.offset, v.offset);
+        //
+        // Every position is folded, not just each key's latest. A key
+        // overwritten across the WAL frontier holds both a processed and an
+        // unprocessed position; the flush path runs its per-position
+        // `retain_processed` on the merged table, so the merge must hand it
+        // the processed position too. Collapsing to latest-per-key here would
+        // leave only the post-frontier position, which the filter then drops —
+        // reverting the key to its stale base entry in the blob while
+        // `unmerge_flushed` removes the as-of-frontier position from the live
+        // overlay (checkpoint reads then serve the stale value). Blob
+        // serialization collapses to latest-per-key at write time
+        // (`iter_with_tombstones`), after the frontier filter has run.
+        for (k, positions) in dirty.data.iter() {
+            for v in positions {
+                #[cfg(any(debug_assertions, feature = "test_methods"))]
+                if promote_to_clean
+                    && let Some(found) = self.data_get_latest(k)
+                    && found.offset > v.offset
+                {
+                    panic!("found.offset {} > v.offset {}", found.offset, v.offset);
+                }
+                let incoming = if promote_to_clean && !v.is_removed() {
+                    v.as_clean_modified()
+                } else {
+                    *v
+                };
+                self.data_insert_sorted(k.clone(), incoming);
             }
-            let incoming = if promote_to_clean && !v.is_removed() {
-                v.as_clean_modified()
-            } else {
-                *v
-            };
-            self.data_insert_sorted(k.clone(), incoming);
         }
 
         // ---- flat side: dirty's disk-derived `flat` folds into self.flat ----
@@ -428,9 +442,10 @@ impl IndexTable {
             // both rely on it — a same-offset pair with differing lengths
             // would wedge the cursor and leave a stale flushed position in
             // the overlay. Producers enforce it (`checked_insert` asserts on
-            // append; merge/rebase insert latest-per-key from already-unique
-            // lists); pin it on both sides of the diff, under the same gate
-            // as `checked_insert`'s ordering assert.
+            // append; `merge_dirty`/`rebase_on_as_of` fold already-unique
+            // lists into bases holding no data-side positions for the key);
+            // pin it on both sides of the diff, under the same gate as
+            // `checked_insert`'s ordering assert.
             #[cfg(any(debug_assertions, feature = "test_methods"))]
             assert!(
                 Self::offsets_strictly_ascending(orig_positions),
@@ -3925,9 +3940,13 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_dirty_uses_latest_per_key_from_dirty() {
-        // dirty.data has multi-position state for [1]; merge_dirty must only
-        // project the latest (per the user's contract).
+    fn test_merge_dirty_folds_every_position_per_key() {
+        // dirty.data has multi-position state for [1]; merge_dirty must fold
+        // every position, not just the latest — the flush path runs its
+        // per-position `retain_processed` frontier filter on the merged table,
+        // and a latest-per-key collapse here would hide below-frontier
+        // positions from it (checkpoint staleness, issue #123). `get` still
+        // resolves to the latest position.
         let mut self_table = IndexTable::default();
         self_table.insert(vec![1].into(), WalPosition::test_value(5));
         self_table.demote_data_modified_to_clean();
@@ -3939,6 +3958,9 @@ mod tests {
         self_table.merge_dirty_and_clean(&dirty);
 
         assert_eq!(self_table.get(&[1]), Some(WalPosition::test_value(20)));
+        // All three positions coexist for [1]: the base @5 plus both dirty
+        // positions — the below-latest @10 must survive the merge.
+        assert_eq!(self_table.data.get([1].as_ref()).map(|p| p.len()), Some(3));
     }
 
     #[test]
