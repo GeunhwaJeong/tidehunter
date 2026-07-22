@@ -795,9 +795,8 @@ impl LargeTable {
                 let promoted: Vec<(CellId, Arc<IndexTable>, IndexTable)> = snapshots
                     .iter()
                     .filter_map(|(cell, arc, threshold)| {
-                        // Single decision point for this cell: cells that
-                        // fail the gate skip the deep clone below, and cells
-                        // that pass drain without re-evaluating the trigger.
+                        // Single decision point: failing cells skip the deep
+                        // clone; passing cells drain without re-checking.
                         if !arc.should_promote_to_flat(*threshold) {
                             return None;
                         }
