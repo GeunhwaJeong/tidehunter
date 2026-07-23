@@ -223,6 +223,19 @@ impl LargeTable {
             .into_par_iter()
             .map(
                 |(ks, ks_cells): (_, &BTreeMap<CellId, SnapshotEntryData>)| {
+                    // A destroyed keyspace ignores its snapshot slot: it
+                    // initializes as an empty stub (no cells, no bloom
+                    // filters loaded), so stale control-region data left by
+                    // a destroy that crashed before the next snapshot is
+                    // never loaded. Nothing routes keys into a destroyed
+                    // keyspace, so its uniform cell array staying empty is
+                    // fine (any access would panic loudly).
+                    let empty_cells = BTreeMap::new();
+                    let ks_cells = if ks.destroyed() {
+                        &empty_cells
+                    } else {
+                        ks_cells
+                    };
                     let context = KsContext::new(config.clone(), ks.clone(), metrics.clone());
                     let bloom_filter_start = Instant::now();
                     let num_mutexes = ks.num_mutexes();
@@ -1428,6 +1441,35 @@ impl LargeTable {
                 break;
             }
         }
+    }
+
+    /// Clears every cell of a keyspace. Used by `Db::destroy_key_space`
+    /// after the registry tombstone is durable. The keyspace is retained
+    /// (no user handle exists), so only internal machinery can touch it
+    /// concurrently; any pending async flush per row is waited out before
+    /// clearing, mirroring `drop_cells_in_range`.
+    pub(crate) fn drop_all_cells(&self, context: &KsContext) {
+        let ks_table = self.ks_table(&context.ks_config);
+        for mutex in ks_table.rows.mutexes() {
+            loop {
+                let mut row = mutex.lock();
+                if row
+                    .entries
+                    .iter()
+                    .any(|entry| entry.pending_last_processed.is_some())
+                {
+                    drop(row);
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                row.entries.clear_all();
+                break;
+            }
+        }
+        // Stale cells in the per-ks cell index are tolerated by iteration,
+        // but a destroyed keyspace is never iterated again — release the
+        // memory.
+        ks_table.cell_index.write().clear();
     }
 
     pub fn report_entries_state(&self) {
@@ -2785,6 +2827,21 @@ impl Entries {
                     entry.clear();
                 }
             }
+        }
+    }
+
+    /// Clears every entry: array entries are cleared in place, tree entries
+    /// are removed. Caller must ensure no entry has a pending async flush.
+    pub fn clear_all(&mut self) {
+        for entry in self.iter_mut() {
+            assert!(
+                entry.pending_last_processed.is_none(),
+                "clear_all on cell while async flush is pending"
+            );
+            entry.clear();
+        }
+        if let Entries::Tree(tree) = self {
+            tree.clear();
         }
     }
 
