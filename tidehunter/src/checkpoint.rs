@@ -160,7 +160,11 @@ impl DbCheckpoint {
                 GetResult::WalPosition(w) => {
                     match db.read_record_for_indexed_key(context, w, result.key.as_ref())? {
                         // Deliberately no `update_lru`: a checkpoint read must
-                        // not mutate the live database's value cache.
+                        // not seed the live value LRU with as-of values that
+                        // may be stale for live reads. (Sharing the
+                        // decompressed-batch cache is sound: it is keyed by
+                        // WAL position and holds immutable frame bodies, not
+                        // per-key values.)
                         Some((k, v)) => (k, v),
                         // Same as `Db::next_entry`: a stale index entry must be
                         // skipped, not treated as the end of the key space.
