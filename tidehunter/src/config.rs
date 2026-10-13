@@ -115,6 +115,35 @@ pub struct Config {
     /// `batch_codec`.
     #[serde(default)]
     pub compressed_batch_cache_bytes: Option<usize>,
+    /// Opt-in cache of whole index blobs that have aged out of the index
+    /// WAL's mmap window, keyed by WAL position (see `index_blob_cache`).
+    /// `Some(bytes)` bounds the total blob bytes retained; must be non-zero
+    /// and at least `index_blob_cache_min_bytes`, since a blob larger than
+    /// the whole budget is never admitted (`index_blob_cache_rejected`
+    /// counts those). Size it at about twice the largest blob expected to
+    /// qualify: a cell's L0 and L1 can both qualify, fills in flight
+    /// overshoot the budget until their eviction sweeps settle, and blobs
+    /// orphaned by a synchronous flush on unload (`sync_flush`) or by
+    /// dropping cells are reclaimed only by the sweep. `None` (default)
+    /// disables the cache, and every syscall-path lookup copies its
+    /// micro-cell section out of the file.
+    #[serde(default)]
+    pub index_blob_cache_bytes: Option<usize>,
+    /// Admission floor for the index blob cache: a blob read through the
+    /// syscall path is cached only if its frame payload (the bytes the index
+    /// reader serves) is at least this many bytes. Blobs below the floor
+    /// keep the plain section read, which is cheap for a normally sized
+    /// cell; only blobs inflated by key skew (one micro-cell holding
+    /// millions of entries) are worth retaining. Mapped blobs are never
+    /// admitted regardless of size. Default 64 MiB; 0 admits every
+    /// syscall-path blob that fits the budget. Ignored while
+    /// `index_blob_cache_bytes` is `None`.
+    #[serde(default = "default_index_blob_cache_min_bytes")]
+    pub index_blob_cache_min_bytes: usize,
+}
+
+fn default_index_blob_cache_min_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 fn default_open_lock_retry_timeout() -> Duration {
@@ -163,6 +192,8 @@ impl Default for Config {
             index_auto_shard_threshold: None,
             batch_codec: None,
             compressed_batch_cache_bytes: None,
+            index_blob_cache_bytes: None,
+            index_blob_cache_min_bytes: default_index_blob_cache_min_bytes(),
         }
     }
 }
@@ -193,6 +224,8 @@ impl Config {
             index_auto_shard_threshold: None,
             batch_codec: None,
             compressed_batch_cache_bytes: None,
+            index_blob_cache_bytes: None,
+            index_blob_cache_min_bytes: default_index_blob_cache_min_bytes(),
         }
     }
 
@@ -231,6 +264,18 @@ impl Config {
                 "compressed_batch_cache_bytes requires batch_codec: the cache only holds \
                  decompressed CompressedBatch bodies, and running with the codec off while \
                  compressed frames are live is unsafe (see batch_codec docs)"
+            );
+        }
+        if let Some(cache_bytes) = self.index_blob_cache_bytes {
+            assert!(
+                cache_bytes > 0,
+                "index_blob_cache_bytes must be non-zero; use None to disable the cache"
+            );
+            assert!(
+                self.index_blob_cache_min_bytes <= cache_bytes,
+                "index_blob_cache_min_bytes {} exceeds index_blob_cache_bytes {cache_bytes}: \
+                 every blob that qualified for admission would be rejected as oversized",
+                self.index_blob_cache_min_bytes,
             );
         }
         let Some(threshold) = self.index_auto_shard_threshold else {
@@ -313,6 +358,32 @@ mod tests {
     fn validate_rejects_cache_without_codec() {
         let mut config = Config::small();
         config.compressed_batch_cache_bytes = Some(1024);
+        config.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "index_blob_cache_bytes must be non-zero")]
+    fn validate_rejects_zero_index_blob_cache_budget() {
+        let mut config = Config::small();
+        config.index_blob_cache_bytes = Some(0);
+        config.validate();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "index_blob_cache_min_bytes 1024 exceeds index_blob_cache_bytes 1023"
+    )]
+    fn validate_rejects_index_blob_floor_above_budget() {
+        let mut config = Config::small();
+        config.index_blob_cache_bytes = Some(1023);
+        config.index_blob_cache_min_bytes = 1024;
+        config.validate();
+    }
+
+    #[test]
+    fn validate_accepts_index_blob_cache_with_default_floor() {
+        let mut config = Config::small();
+        config.index_blob_cache_bytes = Some(default_index_blob_cache_min_bytes());
         config.validate();
     }
 }

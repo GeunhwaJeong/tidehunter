@@ -383,13 +383,14 @@ impl RelocationDriver {
             let ks = db.key_shape.ks(cell.keyspace);
             // For keyspaces with relocation filter, flush and clear stale entries
             if ks.relocation_filter().is_some() {
-                db.large_table.sync_flush_for_relocation(
+                let dropped = db.large_table.sync_flush_for_relocation(
                     db.ks_context(cell.keyspace),
                     &cell.cell_id,
                     db.as_ref(),
                     None,
                     Some(terminal_position),
                 )?;
+                db.retire_index_blobs(&dropped);
                 continue;
             }
             // For keyspaces without relocation filter, relocate entries

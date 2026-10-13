@@ -1,7 +1,7 @@
 use crate::cell::{CellId, CellIdBytesContainer};
 use crate::config::Config;
 use crate::container::LargeTableContainer;
-use crate::context::{KsContext, LookupResult, LookupSource};
+use crate::context::{KsContext, LookupResult, LookupSource, ReadType};
 use crate::control::RelocateFiles;
 use crate::flusher::{FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread};
 use crate::index::index_format::{Direction, IndexFormat, IndexIterCaches};
@@ -613,15 +613,17 @@ impl LargeTable {
             // `readers` is non-empty (guarded by callers' `level_positions.is_empty()`
             // check), and the loop reassigns `last_read_type` on every iteration
             // before the early-return branches can fire — so the init is just a seed.
-            let mut last_read_type = readers[0].read_type();
+            // The read type is taken *after* the level is read: a `CachedFill`
+            // reader only knows whether it led the fill once it has resolved.
+            let mut last_read_type = ReadType::Cached;
             let mut last_level = 0usize;
             for (level, reader) in readers.iter().enumerate() {
+                let found = ks
+                    .index_format()
+                    .lookup_unloaded(ks, reader, k, &self.metrics);
                 last_read_type = reader.read_type();
                 last_level = level;
-                match ks
-                    .index_format()
-                    .lookup_unloaded(ks, reader, k, &self.metrics)
-                {
+                match found {
                     // Valid hit — return it.
                     Some(pos) if pos.is_valid() => return (Some(pos), last_read_type, level),
                     // On-disk tombstone shadows any key in deeper levels.
@@ -986,6 +988,8 @@ impl LargeTable {
         Ok(Some(Arc::new(merged)))
     }
 
+    /// Returns the blob positions the flush removed from the cell's levels
+    /// so the caller can retire them (empty if the cell does not exist).
     pub fn sync_flush_for_relocation<L: Loader>(
         &self,
         context: &KsContext,
@@ -993,17 +997,19 @@ impl LargeTable {
         loader: &L,
         relocation_updates: Option<RelocationUpdates>,
         relocation_cutoff: Option<u64>,
-    ) -> Result<(), L::Error> {
+    ) -> Result<LevelPositions, L::Error> {
         let mut row = self.lock_cell_waiting_for_flush(context, cell_id);
 
         let entry = match row.try_entry_mut(cell_id) {
             Some(entry) => entry,
-            None => return Ok(()), // Cell doesn't exist
+            None => return Ok(LevelPositions::new()), // Cell doesn't exist
         };
 
         entry.promote_pending();
 
-        entry.sync_flush(loader, true, relocation_updates, relocation_cutoff)
+        let before = entry.level_positions();
+        entry.sync_flush(loader, true, relocation_updates, relocation_cutoff)?;
+        Ok(entry.dropped_positions(before))
     }
 
     fn ks_rows(&self, ks: &KeySpaceDesc) -> &ShardedMutex<Row> {
@@ -1502,30 +1508,37 @@ impl LargeTable {
         *prev_keys = states.into_keys().collect();
     }
 
+    /// Returns the blob positions the flush removed from the cell's levels
+    /// so the caller can retire them.
     pub fn update_flushed_index(
         &self,
         context: &KsContext,
         cell: &CellId,
         original_index: Arc<IndexTable>,
         new_levels: IndexLevels,
-    ) {
+    ) -> LevelPositions {
         self.with_promoted_entry(context, cell, |entry| {
+            let before = entry.level_positions();
             entry.update_flushed_index(original_index, new_levels);
-        });
+            entry.dropped_positions(before)
+        })
     }
 
     /// Called by the flusher after a `ForceRelocate` flush completes.
     /// Updates the entry's level state to reflect the relocated blob without
-    /// requiring the original index.
+    /// requiring the original index. Returns the blob positions the update
+    /// removed from the cell's levels so the caller can retire them.
     pub(crate) fn update_relocated_index(
         &self,
         context: &KsContext,
         cell: &CellId,
         new_levels: IndexLevels,
-    ) {
+    ) -> LevelPositions {
         self.with_promoted_entry(context, cell, |entry| {
+            let before = entry.level_positions();
             entry.update_relocated_position(new_levels);
-        });
+            entry.dropped_positions(before)
+        })
     }
 
     /// Test-only view of an entry's state name (the state enum is private).
@@ -1689,6 +1702,12 @@ impl Row {
         self.entries.remove_entry(id, &self.context)
     }
 }
+
+/// Blob positions of a cell's levels, shards included. The completion
+/// hooks hand the positions they removed from a cell back to `Db`, which
+/// retires them from the index blob cache; nothing references them any
+/// more and positions are never reused within a `Db` instance.
+pub(crate) type LevelPositions = SmallVec<[WalPosition; INLINE_LEVELS]>;
 
 pub trait Loader {
     type Error: std::fmt::Debug;
@@ -2633,6 +2652,21 @@ impl LargeTableEntry {
     /// Returns the on-disk index blobs for this cell.
     pub fn levels(&self) -> &IndexLevels {
         &self.levels
+    }
+
+    /// Every blob position the levels reference, shards included.
+    fn level_positions(&self) -> LevelPositions {
+        self.levels.iter().collect()
+    }
+
+    /// The positions in `before` that the current levels no longer
+    /// reference: the blobs a completed flush or relocation replaced.
+    fn dropped_positions(&self, before: LevelPositions) -> LevelPositions {
+        let after = self.level_positions();
+        before
+            .into_iter()
+            .filter(|position| !after.contains(position))
+            .collect()
     }
 
     /// If this entry is in an unloaded state, returns which flavor of

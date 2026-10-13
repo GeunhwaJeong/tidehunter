@@ -111,8 +111,14 @@ pub enum WalEntryKind {
 #[repr(usize)]
 #[strum(serialize_all = "snake_case")]
 pub enum ReadType {
+    /// Served from a memory-mapped WAL fragment.
     Mapped,
+    /// Read from the WAL file with a syscall. For index blobs this includes
+    /// the one whole-blob read that fills the index blob cache.
     Syscall,
+    /// Served from the index blob cache (see `index_blob_cache`): resident
+    /// at probe time, or supplied by another lookup's in-flight fill.
+    Cached,
 }
 
 impl KsContext {

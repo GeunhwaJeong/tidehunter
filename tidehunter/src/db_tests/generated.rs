@@ -13,6 +13,9 @@ mod test_reorder_keyspace;
 #[path = "test_destroy_keyspace.rs"]
 mod test_destroy_keyspace;
 
+#[path = "test_index_blob_cache.rs"]
+mod test_index_blob_cache;
+
 #[test]
 fn db_test_prefixed() {
     db_test(prefix_key_shape())

@@ -245,6 +245,18 @@ fn main() {
     config.l0_max_entries = Some(6);
     config.snapshot_unload_threshold = 1024;
     config.snapshot_written_bytes = 4 * 1024 * 1024; // 4 MB — trigger snapshots frequently
+    // Opt-in index blob cache: a budget in bytes, admitting every blob that
+    // leaves the index mmap window. Every cell here is rewritten constantly,
+    // so blobs leave the window mainly across restarts, when only the
+    // newest fragments are mapped again: small fragments and a three-map
+    // window keep that set small enough for the cache to see traffic.
+    let index_blob_cache_bytes = env_usize("CONCURRENT_TEST_INDEX_BLOB_CACHE_BYTES", 0);
+    if index_blob_cache_bytes > 0 {
+        config.index_blob_cache_bytes = Some(index_blob_cache_bytes);
+        config.index_blob_cache_min_bytes = 1;
+        config.frag_size = 64 * 1024;
+        config.max_index_maps = Some(3);
+    }
     let config = Arc::new(config);
 
     let mut key_shape_builder = KeyShapeBuilder::new();
@@ -754,6 +766,22 @@ fn main() {
         .with_label_values(&["secondary"])
         .get();
     println!("  relocation_kept: {relocation_kept}");
+    if index_blob_cache_bytes > 0 {
+        let fills = shared_metrics.index_blob_cache_fills.get();
+        println!(
+            "  index_blob_cache: fills={fills} hits={} drops={} evictions={} rejected={} unreadable={}",
+            shared_metrics.index_blob_cache_hits.get(),
+            shared_metrics.index_blob_cache_drops.get(),
+            shared_metrics.index_blob_cache_evictions.get(),
+            shared_metrics.index_blob_cache_rejected.get(),
+            shared_metrics.index_blob_cache_unreadable.get(),
+        );
+        assert!(
+            fills > 0,
+            "CONCURRENT_TEST_INDEX_BLOB_CACHE_BYTES is set but no index blob was ever cached"
+        );
+        assert_eq!(0, shared_metrics.index_blob_cache_unreadable.get());
+    }
     let relocation_removed = shared_metrics
         .relocation_removed
         .with_label_values(&["secondary"])

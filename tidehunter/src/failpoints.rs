@@ -2,6 +2,7 @@ use crate::latch::Latch;
 use rand::Rng;
 use rand::prelude::ThreadRng;
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -31,6 +32,17 @@ impl FailPoint {
     /// Failpoint that blocks until provided latch is unlocked
     pub fn latch(latch: Latch) -> Self {
         let fp = Box::new(move || {
+            latch.latch();
+        });
+        Self { fp }
+    }
+
+    /// Like [`Self::latch`], but counts the callers that reached the
+    /// failpoint in `arrivals` before they block, so a test can wait until
+    /// every participant is parked before releasing the latch.
+    pub fn latch_counting(latch: Latch, arrivals: Arc<AtomicUsize>) -> Self {
+        let fp = Box::new(move || {
+            let _: usize = arrivals.fetch_add(1, Ordering::SeqCst);
             latch.latch();
         });
         Self { fp }

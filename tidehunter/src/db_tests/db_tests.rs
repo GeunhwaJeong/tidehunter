@@ -3224,27 +3224,76 @@ fn test_force_rebuild_control_region() {
     );
 }
 
-/// Opens the db at `path`, looks up the cell-3 key written by
-/// `test_reopen_premaps_live_index_fragments` (its index blob lives in the
-/// first index fragment), and returns how many disk lookups went through the
-/// mapped vs the syscall read path.
-fn lookup_read_types(path: &Path, key_shape: &KeyShape, config: Arc<Config>) -> (u64, u64) {
-    let db_metrics = Metrics::new();
-    let db = Db::open(path, key_shape.clone(), config, db_metrics.clone()).unwrap();
-    let ks = db.single_ks();
-    assert_eq!(
-        Some(vec![3].into()),
-        db.get(ks, &[3 << 4, 0, 0, 0]).unwrap()
-    );
-    let lookups = |read_type: ReadType| {
-        let histogram = db_metrics
+/// Disk lookups of `ks` per read type: `(mapped, syscall, cached)`.
+pub(super) fn lookup_counts(metrics: &Metrics, db: &Db, ks: KeySpace) -> (u64, u64, u64) {
+    let count = |read_type: ReadType| {
+        let histogram = metrics
             .lookup_mcs
             .with_label_values(&[read_type.as_ref(), db.ks_context(ks).name()]);
         metrics::get_histogram_sum_count(&histogram)
             .expect("metrics are enabled")
             .1
     };
-    (lookups(ReadType::Mapped), lookups(ReadType::Syscall))
+    (
+        count(ReadType::Mapped),
+        count(ReadType::Syscall),
+        count(ReadType::Cached),
+    )
+}
+
+/// Opens the db at `path`, looks up the cell-3 key written by
+/// `write_blobs_outside_window` (its index blob lives in the first index
+/// fragment), and returns how many disk lookups went through the mapped vs
+/// the syscall read path.
+fn lookup_read_types(path: &Path, key_shape: &KeyShape, config: Arc<Config>) -> (u64, u64) {
+    let db_metrics = Metrics::new();
+    let db = Db::open(path, key_shape.clone(), config, db_metrics.clone()).unwrap();
+    let ks = db.single_ks();
+    assert_eq!(Some(vec![3].into()), db.get(ks, &cell_key(3)).unwrap());
+    let (mapped, syscall, _) = lookup_counts(&db_metrics, &db, ks);
+    (mapped, syscall)
+}
+
+/// `Config::small` with a 128 KiB fragment and a window of three maps
+/// (writer plus two lookahead), so blobs written before the index writer
+/// moved two fragments on are read through the syscall path after a reopen.
+pub(super) fn unmapped_window_config() -> Config {
+    let mut config = Config::small();
+    config.frag_size = 128 * 1024;
+    config.wal_file_size = 4 * 1024 * 1024;
+    config.max_maps = 3;
+    config
+}
+
+/// 16 cells; a key's cell is its first byte >> 4.
+pub(super) fn sixteen_cells() -> KeyShape {
+    KeyShape::new_single(4, 16, KeyType::uniform(1))
+}
+
+/// The one key `write_blobs_outside_window` puts in `cell`.
+pub(super) fn cell_key(cell: u8) -> Vec<u8> {
+    vec![cell << 4, 0, 0, 0]
+}
+
+/// Writes one key per cell of `sixteen_cells`, flushed into the first index
+/// fragment, then churns the last cell until the index writer sits at least
+/// two fragments past those blobs, which stay live and are never rewritten.
+pub(super) fn write_blobs_outside_window(dir: &Path, key_shape: &KeyShape, config: &Arc<Config>) {
+    let db = Db::open(dir, key_shape.clone(), config.clone(), Metrics::new()).unwrap();
+    let ks = db.single_ks();
+    for cell in 0..16u8 {
+        db.insert(ks, cell_key(cell), vec![cell]).unwrap();
+    }
+    db.force_rebuild_control_region().unwrap();
+    let mut i = 0u32;
+    while db.index_writer.position() < 2 * config.frag_size {
+        for _ in 0..200 {
+            i += 1;
+            let [_, b1, b2, b3] = i.to_be_bytes();
+            db.insert(ks, vec![0xF0, b1, b2, b3], vec![1]).unwrap();
+        }
+        db.force_rebuild_control_region().unwrap();
+    }
 }
 
 /// After a restart, index blobs written before the restart must be served
@@ -3253,41 +3302,9 @@ fn lookup_read_types(path: &Path, key_shape: &KeyShape, config: Arc<Config>) -> 
 #[test]
 fn test_reopen_premaps_live_index_fragments() {
     let dir = tempdir::TempDir::new("test-premap-index").unwrap();
-    let mut config = Config::small();
-    config.frag_size = 128 * 1024;
-    config.wal_file_size = 4 * 1024 * 1024;
-    // Writer's fragment + 2 lookahead: no room for historical maps.
-    config.max_maps = 3;
-    let config = Arc::new(config);
-    // 16 cells; a key's cell is its first byte >> 4.
-    let key_shape = KeyShape::new_single(4, 16, KeyType::uniform(1));
-    {
-        let db = Db::open(
-            dir.path(),
-            key_shape.clone(),
-            config.clone(),
-            Metrics::new(),
-        )
-        .unwrap();
-        let ks = db.single_ks();
-        // One key per cell, all flushed into the first index fragment.
-        for cell in 0..16u8 {
-            db.insert(ks, vec![cell << 4, 0, 0, 0], vec![cell]).unwrap();
-        }
-        db.force_rebuild_control_region().unwrap();
-        // Keep flushing fresh keys into the last cell only, until the index
-        // writer has moved at least two fragments past the blobs of the
-        // other cells. Those blobs stay live and are never rewritten.
-        let mut i = 0u32;
-        while db.index_writer.position() < 2 * config.frag_size {
-            for _ in 0..200 {
-                i += 1;
-                let [_, b1, b2, b3] = i.to_be_bytes();
-                db.insert(ks, vec![0xF0, b1, b2, b3], vec![1]).unwrap();
-            }
-            db.force_rebuild_control_region().unwrap();
-        }
-    }
+    let config = Arc::new(unmapped_window_config());
+    let key_shape = sixteen_cells();
+    write_blobs_outside_window(dir.path(), &key_shape, &config);
 
     // Sanity check of the setup: with no room to map history the lookup
     // takes the syscall path.

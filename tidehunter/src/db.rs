@@ -8,17 +8,19 @@ use crate::config::Config;
 use crate::context::{DbOpKind, KsContext, KsContextVec, ReadType, WalEntryKind};
 use crate::control::{ControlRegion, ControlRegionStore, RelocateFiles};
 use crate::crc::IntoBytesFixed;
-use crate::decompress_cache::{CacheOutcome, DecompressCache};
 use crate::flusher::IndexFlusher;
 use crate::index::index_format::{IndexFormat, IndexIterCaches};
 use crate::index::index_table::IndexTable;
 use crate::index::levels::IndexLevels;
+use crate::index_blob_cache::IndexBlobCache;
 use crate::iterators::IteratorResult;
 use crate::iterators::db_iterator::{DbIterator, IterationSource};
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc, KeySpaces, KeyType};
 use crate::large_table::{GetResult, LargeTable, Loader, PendingBatchOp};
 use crate::lock::DbLock;
+use crate::lookup::RandomRead;
 use crate::metrics::{Metrics, TimerExt};
+use crate::position_cache::{CacheOutcome, PositionCache};
 use crate::relocation::updates::RelocationUpdates;
 use crate::relocation::{RelocationCommand, RelocationDriver, RelocationStrategy, Relocator};
 use crate::state_snapshot;
@@ -57,7 +59,12 @@ pub struct Db {
     relocator: Relocator,
     /// Present when `Config::compressed_batch_cache_bytes` is set; serves
     /// decompressed `CompressedBatch` bodies on the read paths.
-    decompress_cache: Option<DecompressCache>,
+    decompress_cache: Option<PositionCache>,
+    /// Present when `Config::index_blob_cache_bytes` is set; serves whole
+    /// index blobs that have aged out of the index WAL's mmap window to the
+    /// index readers (see `index_blob_cache`). Shared with the lazy readers
+    /// it hands out, hence the `Arc`.
+    index_blob_cache: Option<Arc<IndexBlobCache>>,
     commit_pool: Option<rayon::ThreadPool>,
     /// One handle per pending-promotion shard, for waking threads after batch commits.
     /// Index `i` owns mutex shards where `mutex_idx % len == i`.
@@ -147,11 +154,22 @@ impl Db {
 
         let decompress_cache = config.compressed_batch_cache_bytes.map(|max_bytes| {
             let reachable_wal = wal.clone();
-            DecompressCache::new(
+            PositionCache::new(
                 max_bytes,
                 Box::new(move |position| reachable_wal.is_reachable(position)),
-                &metrics,
+                metrics.decompress_cache_metrics(),
             )
+        });
+        let index_blob_cache = config.index_blob_cache_bytes.map(|max_bytes| {
+            let reachable_indexes = indexes.clone();
+            let frame_indexes = indexes.clone();
+            Arc::new(IndexBlobCache::new(
+                max_bytes,
+                config.index_blob_cache_min_bytes,
+                Box::new(move |position| reachable_indexes.is_reachable(position)),
+                Box::new(move |position| frame_indexes.read(position).map(|(_, payload)| payload)),
+                &metrics,
+            ))
         });
 
         let this = Self {
@@ -168,6 +186,7 @@ impl Db {
             keyspaces,
             relocator,
             decompress_cache,
+            index_blob_cache,
             commit_pool,
             pending_promotion_threads,
             _lock: Mutex::new(Some(lock)),
@@ -865,8 +884,14 @@ impl Db {
             updates.add(reduced_key, pos);
         }
         // todo this do not hold guards before flushing the index - need to confirm if this is ok
-        self.large_table
-            .sync_flush_for_relocation(context, &cell_id, self, Some(updates), None)?;
+        let dropped = self.large_table.sync_flush_for_relocation(
+            context,
+            &cell_id,
+            self,
+            Some(updates),
+            None,
+        )?;
+        self.retire_index_blobs(&dropped);
         Ok(())
     }
 
@@ -1070,8 +1095,10 @@ impl Db {
     ) {
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::UpdateFlushedIndex);
-        self.large_table
-            .update_flushed_index(context, &cell, original_index, new_levels)
+        let dropped =
+            self.large_table
+                .update_flushed_index(context, &cell, original_index, new_levels);
+        self.retire_index_blobs(&dropped);
     }
 
     pub(crate) fn update_relocated_index(
@@ -1081,8 +1108,24 @@ impl Db {
         new_levels: IndexLevels,
     ) {
         let context = self.ks_context(ks);
-        self.large_table
+        let dropped = self
+            .large_table
             .update_relocated_index(context, &cell, new_levels);
+        self.retire_index_blobs(&dropped);
+    }
+
+    /// Drops from the index blob cache the blobs a completed flush or
+    /// relocation removed from a cell's levels. Positions are never reused
+    /// within a `Db` instance, so a blob that no level references is dead;
+    /// without this a superseded L1 would occupy the budget until the CLOCK
+    /// sweep got to it.
+    pub(crate) fn retire_index_blobs(&self, dropped: &[WalPosition]) {
+        let Some(cache) = &self.index_blob_cache else {
+            return;
+        };
+        for position in dropped {
+            cache.remove(*position);
+        }
     }
 
     pub(crate) fn read_record_check_key(
@@ -1227,12 +1270,12 @@ impl Db {
                 let _timer = context.read_decompress_mcs.clone().mcs_timer();
                 decompress_wal_entry(batch_entry).expect("caller matched WalEntry::CompressedBatch")
             };
-            match cache.get_or_decompress(position, decompress) {
+            match cache.get_or_fill(position, decompress) {
                 CacheOutcome::Hit(body) => {
                     context.read_decompress_cache_hits.inc();
                     return Ok(Some(body));
                 }
-                CacheOutcome::Decompressed(body) => {
+                CacheOutcome::Filled(body) => {
                     context.read_decompress_count.inc();
                     return Ok(Some(body));
                 }
@@ -1736,7 +1779,21 @@ impl Loader for Wal {
 impl Loader for Db {
     type Error = DbError;
 
+    /// Deserializes the index blob at `position`. A blob resident in the
+    /// index blob cache is adopted from there (the cached bytes are exactly
+    /// the `WalEntry::Index` payload, see `index_reader`), which spares a
+    /// promote or relocation of a hot cell the re-read of its L1 from disk.
+    /// `load` never admits a blob, only lookups fill the cache; and it
+    /// probes non-blocking because `maybe_load` calls it under the row lock.
     fn load(&self, ks: &KeySpaceDesc, position: WalPosition) -> DbResult<IndexTable> {
+        if let Some(cache) = &self.index_blob_cache
+            && let Some(blob) = cache.peek(position)
+        {
+            let context = self.ks_context(ks.id());
+            context.inc_read(WalEntryKind::Index, ReadType::Cached);
+            context.inc_read_bytes(WalEntryKind::Index, ReadType::Cached, blob.len() as u64);
+            return Ok(ks.index_format().deserialize_index(ks, blob));
+        }
         let entry = self.read_report_entry(&self.indexes, position)?;
         Self::read_index(
             ks,
@@ -1749,10 +1806,32 @@ impl Loader for Db {
         )
     }
 
+    /// Opens a reader over the index blob at `position`. Called under the
+    /// row lock by every disk-walking read path, so with the index blob
+    /// cache enabled the probe is non-blocking: a resident blob is served as
+    /// `WalRandomRead::Cached`, and a syscall-path blob within the admission
+    /// bounds becomes a `WalRandomRead::CachedFill` that fills the cache (or
+    /// joins the fill in flight) on its first read, after the caller has
+    /// released the lock. Mapped blobs, blobs below the floor and blobs
+    /// above the budget are returned as they are.
     fn index_reader(&self, position: WalPosition) -> Result<WalRandomRead, Self::Error> {
-        Ok(self
+        let Some(cache) = &self.index_blob_cache else {
+            return Ok(self
+                .indexes
+                .random_reader_at(position, WalEntry::INDEX_PREFIX_SIZE)?);
+        };
+        if let Some(blob) = cache.peek(position) {
+            return Ok(WalRandomRead::Cached(blob));
+        }
+        let reader = self
             .indexes
-            .random_reader_at(position, WalEntry::INDEX_PREFIX_SIZE)?)
+            .random_reader_at(position, WalEntry::INDEX_PREFIX_SIZE)?;
+        Ok(match reader {
+            WalRandomRead::File(file) if cache.admit(file.len()) => {
+                WalRandomRead::CachedFill(cache.lazy_reader(position, file))
+            }
+            reader => reader,
+        })
     }
 
     fn flush_supported(&self) -> bool {

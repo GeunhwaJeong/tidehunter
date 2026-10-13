@@ -12,6 +12,7 @@ use crate::context::ReadType;
 use crate::crc::{CrcFrame, CrcReadError, IntoBytesFixed};
 use crate::file_reader::FileReader;
 use crate::file_reader::set_direct_options;
+use crate::index_blob_cache::IndexBlobFill;
 use crate::lookup::{FileRange, RandomRead};
 use crate::metrics::{MetricIntGauge, Metrics};
 use arc_swap::ArcSwap;
@@ -78,6 +79,14 @@ pub(crate) struct Map {
 pub enum WalRandomRead {
     Mapped(Bytes),
     File(FileRange),
+    /// A whole index blob resident in the index blob cache; reads are
+    /// slices of it (see `index_blob_cache`).
+    Cached(Bytes),
+    /// A syscall-path index blob admitted to the index blob cache. Built
+    /// under the row lock from the `File` reader; the first read, after the
+    /// lock is released, fills the cache or joins an in-flight fill, and
+    /// every read is then a slice of the cached blob.
+    CachedFill(IndexBlobFill),
 }
 
 impl WalWriter {
@@ -794,10 +803,15 @@ impl WalIterator {
 }
 
 impl WalRandomRead {
+    /// How reads through this reader are served. For `CachedFill` the
+    /// answer depends on whether this reader led the fill, so call it after
+    /// the reads it is meant to label (see `IndexBlobFill::read_type`).
     pub fn read_type(&self) -> ReadType {
         match self {
             WalRandomRead::Mapped(_) => ReadType::Mapped,
             WalRandomRead::File(_) => ReadType::Syscall,
+            WalRandomRead::Cached(_) => ReadType::Cached,
+            WalRandomRead::CachedFill(fill) => fill.read_type(),
         }
     }
 }
@@ -805,15 +819,17 @@ impl WalRandomRead {
 impl RandomRead for WalRandomRead {
     fn read(&self, range: Range<usize>) -> Bytes {
         match self {
-            WalRandomRead::Mapped(bytes) => bytes.slice(range),
+            WalRandomRead::Mapped(bytes) | WalRandomRead::Cached(bytes) => bytes.slice(range),
             WalRandomRead::File(fr) => fr.read(range),
+            WalRandomRead::CachedFill(fill) => fill.read(range),
         }
     }
 
     fn len(&self) -> usize {
         match self {
-            WalRandomRead::Mapped(bytes) => bytes.len(),
+            WalRandomRead::Mapped(bytes) | WalRandomRead::Cached(bytes) => bytes.len(),
             WalRandomRead::File(range) => range.len(),
+            WalRandomRead::CachedFill(fill) => fill.len(),
         }
     }
 }

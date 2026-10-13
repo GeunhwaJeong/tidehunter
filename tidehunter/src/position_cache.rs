@@ -1,68 +1,84 @@
-//! Cache of decompressed `CompressedBatch` bodies.
+//! Position-keyed cache of immutable WAL frame content.
 //!
-//! Every key written in a compressed batch shares the `WalPosition` of the
-//! batch frame, so point reads, iterators and relocation repeatedly land on
-//! the same frame and each pay a full frame read plus a full-body
-//! decompression to extract one record. The cache keys decompressed bodies
-//! by the frame's WAL offset. Within a single open `Db` instance an offset
-//! identifies immutable frame content — the cache lives only in memory and
-//! starts empty at open, and the crash-replay rewind (which can rewrite tail
-//! offsets) happens before the `Db` is constructed. The cache must never be
-//! persisted or shared across `Db` instances; offsets are *not* unique
-//! across restarts.
+//! Two caches in `Db` are instances of [`PositionCache`]:
+//!
+//! - the decompressed-batch cache (`Config::compressed_batch_cache_bytes`).
+//!   Every key written in a compressed batch shares the `WalPosition` of the
+//!   batch frame, so point reads, iterators and relocation repeatedly land on
+//!   the same frame and each pay a full frame read plus a full-body
+//!   decompression to extract one record. The cache keys decompressed bodies
+//!   by the frame's WAL offset.
+//! - the index blob cache (`Config::index_blob_cache_bytes`, see
+//!   `index_blob_cache`). Whole index blobs that have aged out of the index
+//!   WAL's mmap window are kept by their WAL offset, so lookups into an
+//!   oversized micro-cell section stop copying the section out of the file
+//!   on every miss.
+//!
+//! Both rest on the same property: within a single open `Db` instance a WAL
+//! offset identifies immutable frame content — the cache lives only in
+//! memory and starts empty at open, and the crash-replay rewind (which can
+//! rewrite tail offsets) happens before the `Db` is constructed. The cache
+//! must never be persisted or shared across `Db` instances; offsets are
+//! *not* unique across restarts.
 //!
 //! Reachability: a WAL read of a garbage-collected position returns
 //! `Ok(None)`, and readers rely on that as deletion semantics for stale
 //! index entries (which survive until a promote rewrites the index). A
 //! cached body must not override it, so the cache owns the check: every
-//! body served by [`DecompressCache::get`] is re-validated against the
-//! `reachable` predicate supplied at construction (`Wal::is_reachable`),
-//! and bodies whose WAL file was reclaimed are dropped instead of served.
-//! Callers cannot bypass this. One caveat is inherent to caching: a warm
-//! hit skips the CRC-validating frame read, so on-disk corruption that
-//! appears *after* a body was cached is masked (reads keep succeeding with
-//! the correct data) until the entry is evicted or the process restarts —
-//! the uncached engine would surface a CRC error instead.
+//! body served by [`PositionCache::get`] or [`PositionCache::peek`] is
+//! re-validated against the `reachable` predicate supplied at construction
+//! (`Wal::is_reachable`), and bodies whose WAL file was reclaimed are
+//! dropped instead of served. Callers cannot bypass this. One caveat is
+//! inherent to caching: a warm hit skips the CRC-validating frame read, so
+//! on-disk corruption that appears *after* a body was cached is masked
+//! (reads keep succeeding with the correct data) until the entry is evicted
+//! or the process restarts — the uncached engine would surface a CRC error
+//! instead.
 //!
 //! Read paths consult the cache *before* reading the WAL frame
-//! ([`DecompressCache::get`]), so a hit skips the frame I/O, CRC pass and
-//! copy as well as the decompression. On a miss the caller reads the frame
-//! and enters [`DecompressCache::get_or_decompress`], which single-flights
-//! the decompression: one leader decompresses while concurrent readers of
-//! the same frame block on its result (`decompress_cache_wait_mcs` counts
-//! that wait). A reader that arrives while a fill is in flight waits in
-//! `get` too — a `Pending` slot proves the position is a batch frame whose
-//! body is already coming, so its own frame read would be wasted. Waiters
-//! release their own compressed-frame copy before blocking; if the leader
-//! fails (panics on a corrupt frame), they report
-//! [`CacheOutcome::RetryRead`] and the caller re-reads the frame. The
-//! trade-off is deliberate: waiters bound their latency to the leader's
-//! wall-clock decompression (no timeout), which eliminates N-1 duplicate
-//! frame reads and decompressions but lets a descheduled leader correlate
-//! waiter tail latency.
+//! ([`PositionCache::get`], or [`PositionCache::peek`] where blocking is not
+//! allowed), so a hit skips the frame I/O, CRC pass and copy as well as any
+//! decompression. On a miss the caller enters
+//! [`PositionCache::get_or_fill`] with a closure that produces the body
+//! (decompressing a frame it already read, or reading the blob from the
+//! file), which single-flights the fill: one leader runs the closure while
+//! concurrent readers of the same position block on its result
+//! (`wait_mcs` counts that wait). A reader that arrives while a fill is in
+//! flight waits in `get` too — a `Pending` slot proves the body is already
+//! coming, so its own frame read would be wasted. Waiters release their own
+//! fill closure (and whatever frame copy it captured) before blocking; if
+//! the leader fails (panics on a corrupt frame or a read error), they
+//! report [`CacheOutcome::RetryRead`] and the caller re-reads the frame.
+//! The trade-off is deliberate: waiters bound their latency to the leader's
+//! wall-clock fill (no timeout), which eliminates N-1 duplicate frame reads
+//! and fills but lets a descheduled leader correlate waiter tail latency.
 //!
 //! Eviction is second-chance (CLOCK) rather than strict LRU: a hit only
 //! sets an atomic `referenced` bit under a shard *read* lock, so concurrent
-//! hits on one hot frame do not serialize, and one-touch bodies streamed in
-//! by scans (relocation, iterators) are evicted before point-read entries
+//! hits on one hot position do not serialize, and one-touch bodies streamed
+//! in by scans (relocation, iterators) are evicted before point-read entries
 //! that keep re-setting their bit. Single-flight waiters count as hits for
-//! this purpose — after a fill they set the bit too, so a burst-read frame
-//! ranks as hot. This is also why `primitives::ShardedMutex` is not reused
-//! here — the hit path needs a shared (read) lock, not a mutex; the shard
-//! locks mirror its acquisition protocol instead (try-lock fast path, then
-//! `runtime::block_in_place` with the `decompress_cache_contention`
-//! histogram timing the blocking acquisition).
+//! this purpose — after a fill they set the bit too, so a burst-read
+//! position ranks as hot. This is also why `primitives::ShardedMutex` is not
+//! reused here — the hit path needs a shared (read) lock, not a mutex; the
+//! shard locks mirror its acquisition protocol instead (try-lock fast path,
+//! then `runtime::block_in_place` with the `contention` histogram timing
+//! the blocking acquisition).
 //!
 //! The byte budget is accounted globally across shards and bounded by total
-//! decompressed bytes rather than entry count, because bodies span several
-//! orders of magnitude in size. A fill inserts first and then sweeps shards
+//! body bytes rather than entry count, because bodies span several orders of
+//! magnitude in size. A fill inserts first and then sweeps shards
 //! round-robin starting after its own, so eviction pressure drains
 //! one-touch garbage anywhere in the cache rather than thrashing the
 //! inserting shard; retained bytes can transiently exceed the budget by the
 //! bodies of in-flight fills until their sweeps settle. A body larger than
-//! the whole budget is returned to the caller but never cached
-//! (`decompress_cache_rejected` counts these).
-use crate::metrics::{MetricHistogram, MetricIntCounter, MetricIntGauge, Metrics, TimerExt};
+//! the whole budget is returned to the caller but never cached (`rejected`
+//! counts these). Owners can also drop a body explicitly with
+//! [`PositionCache::remove`] once nothing references its position any more
+//! (the index blob cache does this when a flush replaces a cell's levels);
+//! a fill in flight for such a position still serves its waiters but is not
+//! retained.
+use crate::metrics::{MetricHistogram, MetricIntCounter, MetricIntGauge, TimerExt};
 use crate::runtime;
 use crate::wal::position::WalPosition;
 use minibytes::Bytes;
@@ -75,21 +91,37 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// Supplied by `Db::open` as `Wal::is_reachable`; tests substitute stubs.
 pub(crate) type ReachabilityCheck = Box<dyn Fn(WalPosition) -> bool + Send + Sync>;
 
-pub(crate) struct DecompressCache {
+/// Metric handles for one [`PositionCache`] instance. Each cache registers
+/// its own set under its own metric names (see
+/// `Metrics::decompress_cache_metrics` and `Metrics::index_blob_cache_metrics`).
+pub(crate) struct PositionCacheMetrics {
+    /// Total body bytes currently retained, across all shards.
+    pub bytes: MetricIntGauge,
+    /// Bodies returned to a caller but not cached because they exceed the
+    /// whole budget.
+    pub rejected: MetricIntCounter,
+    /// Cumulative microseconds callers spent blocked on another thread's
+    /// in-flight fill of the same position.
+    pub wait_mcs: MetricIntCounter,
+    /// Time to acquire a contended shard lock; uncontended acquisitions are
+    /// not recorded.
+    pub contention: MetricHistogram,
+    /// Bodies evicted by the CLOCK sweep to stay under the budget.
+    pub evictions: MetricIntCounter,
+}
+
+pub(crate) struct PositionCache {
     shards: Box<[RwLock<Shard>]>,
     max_bytes: usize,
-    /// Total decompressed bytes retained across all shards; mirrored into
-    /// the `decompress_cache_bytes` gauge.
+    /// Total body bytes retained across all shards; mirrored into the
+    /// `metrics.bytes` gauge.
     bytes: AtomicUsize,
     /// Total slots across all shards, `Pending` fills included — the
     /// `is_empty` gate, so pre-I/O probes resume the moment a first fill is
     /// in flight (its body has no bytes yet) and waiters can join it.
     occupied: AtomicUsize,
     reachable: ReachabilityCheck,
-    cache_bytes: MetricIntGauge,
-    rejected_oversized: MetricIntCounter,
-    wait_mcs: MetricIntCounter,
-    contention_mcs: MetricHistogram,
+    metrics: PositionCacheMetrics,
 }
 
 #[derive(Default)]
@@ -102,7 +134,7 @@ struct Shard {
 
 enum Slot {
     Ready(CachedBody),
-    /// A leader thread is decompressing this frame; readers block on the
+    /// A leader thread is filling this position; readers block on the
     /// cell until the leader publishes the body (or fails).
     Pending(Arc<FillCell>),
 }
@@ -116,6 +148,10 @@ struct CachedBody {
 struct FillCell {
     state: Mutex<FillState>,
     cv: Condvar,
+    /// Set by [`PositionCache::remove`] while the fill is in flight: the
+    /// owner has stopped referencing the position, so the leader hands the
+    /// body to its waiters but does not retain it.
+    retired: AtomicBool,
 }
 
 #[derive(Default)]
@@ -123,7 +159,8 @@ enum FillState {
     #[default]
     Filling,
     Done(Bytes),
-    /// The leader panicked (corrupt frame); waiters re-read and retry.
+    /// The leader panicked (corrupt frame, read error); waiters re-read
+    /// and retry.
     Failed,
 }
 
@@ -134,15 +171,15 @@ impl FillCell {
     }
 }
 
-/// Result of [`DecompressCache::get_or_decompress`]. `Hit` means this
-/// thread did not run a decompression (cached body, or waited on another
-/// thread's in-flight fill); `Decompressed` means it did. `RetryRead` means
-/// the leader this thread waited on failed after the thread had already
-/// released its frame copy — the caller must re-read the frame and call
+/// Result of [`PositionCache::get_or_fill`]. `Hit` means this thread did
+/// not run the fill (cached body, or waited on another thread's in-flight
+/// fill); `Filled` means it did. `RetryRead` means the leader this thread
+/// waited on failed after the thread had already released its fill closure
+/// — the caller must rebuild the closure (re-read the frame) and call
 /// again.
 pub(crate) enum CacheOutcome {
     Hit(Bytes),
-    Decompressed(Bytes),
+    Filled(Bytes),
     RetryRead,
 }
 
@@ -150,16 +187,16 @@ impl CacheOutcome {
     #[cfg(test)]
     pub fn into_body(self) -> Bytes {
         match self {
-            CacheOutcome::Hit(body) | CacheOutcome::Decompressed(body) => body,
+            CacheOutcome::Hit(body) | CacheOutcome::Filled(body) => body,
             CacheOutcome::RetryRead => panic!("RetryRead carries no body"),
         }
     }
 }
 
-/// Removes the leader's `Pending` slot and publishes `Failed` if the
-/// decompression closure unwinds, so waiters do not hang on a dead leader.
+/// Removes the leader's `Pending` slot and publishes `Failed` if the fill
+/// closure unwinds, so waiters do not hang on a dead leader.
 struct FillGuard<'a> {
-    cache: &'a DecompressCache,
+    cache: &'a PositionCache,
     position: WalPosition,
     cell: &'a Arc<FillCell>,
     completed: bool,
@@ -193,9 +230,13 @@ fn shard_count() -> usize {
         .clamp(8, 64)
 }
 
-impl DecompressCache {
-    pub fn new(max_bytes: usize, reachable: ReachabilityCheck, metrics: &Metrics) -> Self {
-        assert!(max_bytes > 0, "decompress cache budget must be non-zero");
+impl PositionCache {
+    pub fn new(
+        max_bytes: usize,
+        reachable: ReachabilityCheck,
+        metrics: PositionCacheMetrics,
+    ) -> Self {
+        assert!(max_bytes > 0, "position cache budget must be non-zero");
         let shards = (0..shard_count()).map(|_| RwLock::default()).collect();
         Self {
             shards,
@@ -203,10 +244,7 @@ impl DecompressCache {
             bytes: AtomicUsize::new(0),
             occupied: AtomicUsize::new(0),
             reachable,
-            cache_bytes: metrics.decompress_cache_bytes.clone(),
-            rejected_oversized: metrics.decompress_cache_rejected.clone(),
-            wait_mcs: metrics.decompress_cache_wait_mcs.clone(),
-            contention_mcs: metrics.decompress_cache_contention.clone(),
+            metrics,
         }
     }
 
@@ -228,7 +266,7 @@ impl DecompressCache {
         if let Some(guard) = lock.try_read() {
             return guard;
         }
-        let _timer = self.contention_mcs.clone().mcs_timer();
+        let _timer = self.metrics.contention.clone().mcs_timer();
         runtime::block_in_place(|| lock.read())
     }
 
@@ -237,18 +275,17 @@ impl DecompressCache {
         if let Some(guard) = lock.try_write() {
             return guard;
         }
-        let _timer = self.contention_mcs.clone().mcs_timer();
+        let _timer = self.metrics.contention.clone().mcs_timer();
         runtime::block_in_place(|| lock.write())
     }
 
-    /// Pre-I/O lookup: returns the decompressed body for the frame at
-    /// `position` without touching the WAL, waiting on an in-flight fill if
-    /// one is running. Bodies are served only while the frame is still
-    /// reachable; a body whose WAL file was reclaimed is dropped and
-    /// reported as a miss, preserving the read path's `None`-for-GC'd
-    /// deletion semantics. `None` means the caller must read the frame
-    /// itself and, if it turns out to be a `CompressedBatch`, feed it to
-    /// [`Self::get_or_decompress`].
+    /// Pre-I/O lookup: returns the body for `position` without touching
+    /// the WAL, waiting on an in-flight fill if one is running. Bodies are
+    /// served only while the frame is still reachable; a body whose WAL
+    /// file was reclaimed is dropped and reported as a miss, preserving the
+    /// read path's `None`-for-GC'd deletion semantics. `None` means the
+    /// caller must produce the body itself, normally through
+    /// [`Self::get_or_fill`].
     pub fn get(&self, position: WalPosition) -> Option<Bytes> {
         let cell = {
             let shard = self.read_shard(self.shard(position));
@@ -267,6 +304,26 @@ impl DecompressCache {
         self.check_reachable(position, body)
     }
 
+    /// Non-blocking variant of [`Self::get`] for callers that hold a lock
+    /// the fill must not stall (the row mutex in `Db::index_reader`): a
+    /// resident body is served and touched exactly as by `get`, while an
+    /// in-flight fill is reported as a miss instead of waited on. The
+    /// caller then joins that fill through [`Self::get_or_fill`] once the
+    /// lock is released.
+    pub fn peek(&self, position: WalPosition) -> Option<Bytes> {
+        let body = {
+            let shard = self.read_shard(self.shard(position));
+            match shard.slots.get(&position.offset()) {
+                Some(Slot::Ready(cached)) => {
+                    cached.referenced.store(true, Ordering::Relaxed);
+                    cached.body.clone()
+                }
+                Some(Slot::Pending(_)) | None => return None,
+            }
+        };
+        self.check_reachable(position, body)
+    }
+
     /// Serves `body` only if the frame is still readable; otherwise drops
     /// the stale entry and reports a miss.
     fn check_reachable(&self, position: WalPosition, body: Bytes) -> Option<Bytes> {
@@ -281,19 +338,34 @@ impl DecompressCache {
     /// True when the cache holds nothing — no bodies and no in-flight
     /// fills. Lets read paths skip the shard-lock probe entirely on
     /// databases where the cache never fills (e.g. no compressed frames are
-    /// being read).
+    /// being read, or no index blob ever qualifies for admission).
     pub fn is_empty(&self) -> bool {
         self.occupied.load(Ordering::Relaxed) == 0
     }
 
-    /// Drops the cached body for `position` — the frame's WAL file was
-    /// reclaimed, so the stale body must stop being served. An in-flight
-    /// fill is left alone: its leader read the frame before the reclaim,
-    /// which is indistinguishable from a plain read racing GC.
-    fn remove(&self, position: WalPosition) {
+    /// The byte budget; a single body larger than this is never retained.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Drops the cached body for `position`, either because the frame's
+    /// WAL file was reclaimed (the stale body must stop being served) or
+    /// because the owner knows nothing references the position any more
+    /// (an index blob superseded by a flush). Returns whether a resident
+    /// body was dropped. An in-flight fill is marked retired instead: its
+    /// leader started from a position that was referenced at the time, so
+    /// the body is still correct for its waiters, but it is not retained
+    /// afterwards — otherwise an unreferenced body would sit in the cache,
+    /// touched by those waiters, until the CLOCK sweep got to it.
+    pub fn remove(&self, position: WalPosition) -> bool {
         let mut shard = self.write_shard(self.shard(position));
-        if !matches!(shard.slots.get(&position.offset()), Some(Slot::Ready(_))) {
-            return;
+        match shard.slots.get(&position.offset()) {
+            Some(Slot::Ready(_)) => {}
+            Some(Slot::Pending(cell)) => {
+                cell.retired.store(true, Ordering::Relaxed);
+                return false;
+            }
+            None => return false,
         }
         let Some(Slot::Ready(cached)) = shard.slots.remove(&position.offset()) else {
             unreachable!("checked above");
@@ -301,19 +373,21 @@ impl DecompressCache {
         shard.clock.retain(|offset| *offset != position.offset());
         let _: usize = self.occupied.fetch_sub(1, Ordering::Relaxed);
         self.sub_bytes(cached.body.len());
+        true
     }
 
-    /// Post-I/O entry point for a frame the caller just read as a
-    /// `CompressedBatch` (which is why the reachability predicate is not
-    /// re-checked here): returns the body from the cache, or runs
-    /// `decompress` as the single leader across all concurrent callers for
-    /// this position while the rest wait on its result. Waiters release
-    /// `decompress` (and the frame copy it captures) before blocking, so a
+    /// Miss-path entry point for a position the caller has already resolved
+    /// in the WAL — a `CompressedBatch` frame it just read, or an index blob
+    /// whose file reader it opened under the row lock — which is why the
+    /// reachability predicate is not re-checked here. Returns the body from
+    /// the cache, or runs `fill` as the single leader across all concurrent
+    /// callers for this position while the rest wait on its result. Waiters
+    /// release `fill` (and any frame copy it captures) before blocking, so a
     /// failed leader surfaces as [`CacheOutcome::RetryRead`].
-    pub fn get_or_decompress<F: FnOnce() -> Bytes>(
+    pub fn get_or_fill<F: FnOnce() -> Bytes>(
         &self,
         position: WalPosition,
-        decompress: F,
+        fill: F,
     ) -> CacheOutcome {
         let cell = {
             let mut shard = self.write_shard(self.shard(position));
@@ -330,28 +404,28 @@ impl DecompressCache {
                         .insert(position.offset(), Slot::Pending(cell.clone()));
                     let _: usize = self.occupied.fetch_add(1, Ordering::Relaxed);
                     drop(shard);
-                    return CacheOutcome::Decompressed(self.lead_fill(position, cell, decompress));
+                    return CacheOutcome::Filled(self.lead_fill(position, cell, fill));
                 }
             }
         };
-        // Release the caller's compressed-frame copy before blocking, so N
-        // waiters do not pin N frame copies for the leader's whole
-        // decompression.
-        drop(decompress);
+        // Release the caller's fill closure (and the frame copy it may hold)
+        // before blocking, so N waiters do not pin N frame copies for the
+        // leader's whole fill.
+        drop(fill);
         match self.wait_and_touch(position, &cell) {
             Some(body) => CacheOutcome::Hit(body),
             None => CacheOutcome::RetryRead,
         }
     }
 
-    /// Runs the decompression as the leader for `position`, then swaps the
-    /// `Pending` slot for the cached body, wakes waiters, and sweeps shards
-    /// back under the byte budget.
+    /// Runs `fill` as the leader for `position`, then swaps the `Pending`
+    /// slot for the cached body, wakes waiters, and sweeps shards back under
+    /// the byte budget.
     fn lead_fill<F: FnOnce() -> Bytes>(
         &self,
         position: WalPosition,
         cell: Arc<FillCell>,
-        decompress: F,
+        fill: F,
     ) -> Bytes {
         let mut guard = FillGuard {
             cache: self,
@@ -359,10 +433,15 @@ impl DecompressCache {
             cell: &cell,
             completed: false,
         };
-        let body = decompress();
+        let body = fill();
         {
             let mut shard = self.write_shard(self.shard(position));
-            if body.len() <= self.max_bytes {
+            if cell.retired.load(Ordering::Relaxed) {
+                // Nothing references the position any more: serve the
+                // waiters, retain nothing.
+                shard.slots.remove(&position.offset());
+                let _: usize = self.occupied.fetch_sub(1, Ordering::Relaxed);
+            } else if body.len() <= self.max_bytes {
                 // Replaces our Pending slot: `occupied` is unchanged.
                 shard.slots.insert(
                     position.offset(),
@@ -379,7 +458,7 @@ impl DecompressCache {
             } else {
                 shard.slots.remove(&position.offset());
                 let _: usize = self.occupied.fetch_sub(1, Ordering::Relaxed);
-                self.rejected_oversized.inc();
+                self.metrics.rejected.inc();
             }
         }
         guard.completed = true;
@@ -396,7 +475,7 @@ impl DecompressCache {
     /// touch a burst-read frame would rank below a once-probed cold entry.
     fn wait_and_touch(&self, position: WalPosition, cell: &FillCell) -> Option<Bytes> {
         let body = {
-            let _timer = self.wait_mcs.clone().mcs_timer();
+            let _timer = self.metrics.wait_mcs.clone().mcs_timer();
             runtime::block_in_place(|| {
                 let mut state = cell.state.lock();
                 loop {
@@ -447,6 +526,7 @@ impl DecompressCache {
                 if evicted > 0 {
                     let _: usize = self.occupied.fetch_sub(evicted, Ordering::Relaxed);
                     self.sub_bytes(freed);
+                    self.metrics.evictions.inc_by(evicted as u64);
                 }
             }
         }
@@ -454,12 +534,12 @@ impl DecompressCache {
 
     fn add_bytes(&self, len: usize) {
         let _: usize = self.bytes.fetch_add(len, Ordering::Relaxed);
-        self.cache_bytes.add(len as i64);
+        self.metrics.bytes.add(len as i64);
     }
 
     fn sub_bytes(&self, len: usize) {
         let _: usize = self.bytes.fetch_sub(len, Ordering::Relaxed);
-        self.cache_bytes.add(-(len as i64));
+        self.metrics.bytes.add(-(len as i64));
     }
 }
 
@@ -508,15 +588,20 @@ impl Shard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Metrics;
     use std::sync::Barrier;
 
-    fn cache_with_metrics(max_bytes: usize) -> (DecompressCache, Arc<Metrics>) {
+    fn cache_with_metrics(max_bytes: usize) -> (PositionCache, Arc<Metrics>) {
         let metrics = Metrics::new();
-        let cache = DecompressCache::new(max_bytes, Box::new(|_| true), &metrics);
+        let cache = PositionCache::new(
+            max_bytes,
+            Box::new(|_| true),
+            metrics.decompress_cache_metrics(),
+        );
         (cache, metrics)
     }
 
-    fn cache(max_bytes: usize) -> DecompressCache {
+    fn cache(max_bytes: usize) -> PositionCache {
         cache_with_metrics(max_bytes).0
     }
 
@@ -524,13 +609,13 @@ mod tests {
         Bytes::from(vec![fill; len])
     }
 
-    fn fill(cache: &DecompressCache, pos: WalPosition, b: Bytes) -> CacheOutcome {
-        cache.get_or_decompress(pos, move || b)
+    fn fill(cache: &PositionCache, pos: WalPosition, b: Bytes) -> CacheOutcome {
+        cache.get_or_fill(pos, move || b)
     }
 
     /// Positions that map to the same shard, so eviction tests exercise a
     /// single clock ring deterministically.
-    fn same_shard_positions(cache: &DecompressCache, n: usize) -> Vec<WalPosition> {
+    fn same_shard_positions(cache: &PositionCache, n: usize) -> Vec<WalPosition> {
         let target = cache.shard_index(WalPosition::test_value(0));
         (0..u64::MAX)
             .map(WalPosition::test_value)
@@ -540,7 +625,7 @@ mod tests {
     }
 
     /// A position guaranteed to hash to a different shard than `other`.
-    fn position_in_other_shard(cache: &DecompressCache, other: WalPosition) -> WalPosition {
+    fn position_in_other_shard(cache: &PositionCache, other: WalPosition) -> WalPosition {
         (0..u64::MAX)
             .map(WalPosition::test_value)
             .find(|p| cache.shard_index(*p) != cache.shard_index(other))
@@ -554,28 +639,104 @@ mod tests {
         assert!(cache.get(pos).is_none());
         assert!(matches!(
             fill(&cache, pos, body(100, 1)),
-            CacheOutcome::Decompressed(_)
+            CacheOutcome::Filled(_)
         ));
         assert_eq!(cache.get(pos).unwrap(), body(100, 1));
+        assert_eq!(cache.peek(pos).unwrap(), body(100, 1));
         assert!(matches!(
-            cache.get_or_decompress(pos, || unreachable!("cached")),
+            cache.get_or_fill(pos, || unreachable!("cached")),
             CacheOutcome::Hit(_)
         ));
     }
 
     #[test]
+    fn remove_drops_body_and_reports_it() {
+        let (cache, metrics) = cache_with_metrics(8 * 1024);
+        let pos = WalPosition::test_value(5);
+        assert!(!cache.remove(pos));
+        let _: CacheOutcome = fill(&cache, pos, body(100, 1));
+        assert_eq!(100, metrics.decompress_cache_bytes.get());
+        assert!(cache.remove(pos));
+        assert!(cache.get(pos).is_none());
+        assert!(cache.is_empty());
+        assert_eq!(0, metrics.decompress_cache_bytes.get());
+        assert!(!cache.remove(pos));
+    }
+
+    #[test]
+    fn peek_does_not_wait_on_in_flight_fill() {
+        let cache = Arc::new(cache(8 * 1024));
+        let pos = WalPosition::test_value(1);
+        let in_fill = Arc::new(Barrier::new(2));
+        let finish = Arc::new(Barrier::new(2));
+        let leader = {
+            let cache = cache.clone();
+            let in_fill = in_fill.clone();
+            let finish = finish.clone();
+            std::thread::spawn(move || {
+                let _: CacheOutcome = cache.get_or_fill(pos, move || {
+                    in_fill.wait();
+                    finish.wait();
+                    body(100, 1)
+                });
+            })
+        };
+        in_fill.wait();
+        // The fill is in flight: `get` would block here, `peek` must not.
+        assert!(cache.peek(pos).is_none());
+        finish.wait();
+        leader.join().unwrap();
+        assert_eq!(cache.peek(pos).unwrap(), body(100, 1));
+    }
+
+    #[test]
     fn second_chance_protects_referenced_entries() {
         // Budget fits two 400-byte bodies, not three.
-        let cache = cache(1000);
+        let (cache, metrics) = cache_with_metrics(1000);
         let pos = same_shard_positions(&cache, 3);
         let _: CacheOutcome = fill(&cache, pos[0], body(400, 0));
         let _: CacheOutcome = fill(&cache, pos[1], body(400, 1));
+        assert_eq!(0, metrics.decompress_cache_evictions.get());
         // Touch pos[0]: its referenced bit protects it over pos[1].
         let _: Option<Bytes> = cache.get(pos[0]);
         let _: CacheOutcome = fill(&cache, pos[2], body(400, 2));
         assert!(cache.get(pos[1]).is_none());
         assert_eq!(cache.get(pos[0]).unwrap(), body(400, 0));
         assert_eq!(cache.get(pos[2]).unwrap(), body(400, 2));
+        assert_eq!(1, metrics.decompress_cache_evictions.get());
+    }
+
+    #[test]
+    fn remove_during_fill_retains_nothing() {
+        let (cache, metrics) = cache_with_metrics(8 * 1024);
+        let cache = Arc::new(cache);
+        let pos = WalPosition::test_value(1);
+        let in_fill = Arc::new(Barrier::new(2));
+        let finish = Arc::new(Barrier::new(2));
+        let leader = {
+            let cache = cache.clone();
+            let in_fill = in_fill.clone();
+            let finish = finish.clone();
+            std::thread::spawn(move || {
+                cache.get_or_fill(pos, move || {
+                    in_fill.wait();
+                    finish.wait();
+                    body(100, 1)
+                })
+            })
+        };
+        in_fill.wait();
+        // Retired while the fill is in flight: nothing resident to drop yet.
+        assert!(!cache.remove(pos));
+        finish.wait();
+        // The leader still gets its body, but the cache keeps nothing.
+        assert_eq!(leader.join().unwrap().into_body(), body(100, 1));
+        assert!(cache.peek(pos).is_none());
+        assert!(cache.is_empty());
+        assert_eq!(0, metrics.decompress_cache_bytes.get());
+        // A later fill of the same position is retained as usual.
+        let _: CacheOutcome = fill(&cache, pos, body(100, 2));
+        assert_eq!(cache.peek(pos).unwrap(), body(100, 2));
     }
 
     #[test]
@@ -605,10 +766,10 @@ mod tests {
             let metrics = Metrics::new();
             let reachable = Arc::new(AtomicBool::new(true));
             let flag = reachable.clone();
-            let cache = DecompressCache::new(
+            let cache = PositionCache::new(
                 1000,
                 Box::new(move |_| flag.load(Ordering::Relaxed)),
-                &metrics,
+                metrics.decompress_cache_metrics(),
             );
             (CacheAndFlag { cache, reachable }, metrics)
         };
@@ -638,7 +799,7 @@ mod tests {
     }
 
     struct CacheAndFlag {
-        cache: DecompressCache,
+        cache: PositionCache,
         reachable: Arc<AtomicBool>,
     }
 
@@ -687,12 +848,11 @@ mod tests {
             let in_fill = in_fill.clone();
             let finish = finish.clone();
             std::thread::spawn(move || {
-                let _: CacheOutcome =
-                    cache.get_or_decompress(WalPosition::test_value(1), move || {
-                        in_fill.wait();
-                        finish.wait();
-                        body(100, 1)
-                    });
+                let _: CacheOutcome = cache.get_or_fill(WalPosition::test_value(1), move || {
+                    in_fill.wait();
+                    finish.wait();
+                    body(100, 1)
+                });
             })
         };
         in_fill.wait();
@@ -705,20 +865,20 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_misses_decompress_once() {
+    fn concurrent_misses_fill_once() {
         let cache = Arc::new(cache(1024 * 1024));
         let pos = WalPosition::test_value(11);
-        let decompressions = Arc::new(AtomicUsize::new(0));
+        let fills = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(Barrier::new(8));
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 let cache = cache.clone();
-                let decompressions = decompressions.clone();
+                let fills = fills.clone();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    let outcome = cache.get_or_decompress(pos, || {
-                        let _: usize = decompressions.fetch_add(1, Ordering::Relaxed);
+                    let outcome = cache.get_or_fill(pos, || {
+                        let _: usize = fills.fetch_add(1, Ordering::Relaxed);
                         std::thread::sleep(std::time::Duration::from_millis(20));
                         body(512, 7)
                     });
@@ -729,7 +889,7 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
-        assert_eq!(1, decompressions.load(Ordering::Relaxed));
+        assert_eq!(1, fills.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -741,7 +901,7 @@ mod tests {
             let cache = cache.clone();
             let leader_running = leader_running.clone();
             std::thread::spawn(move || {
-                let _: CacheOutcome = cache.get_or_decompress(pos, || {
+                let _: CacheOutcome = cache.get_or_fill(pos, || {
                     leader_running.wait();
                     panic!("simulated corrupt frame");
                 });
@@ -752,7 +912,7 @@ mod tests {
         // its frame copy) or arrives after the cleanup (leads itself), it
         // must end up producing the body.
         let outcome = loop {
-            match cache.get_or_decompress(pos, || body(64, 9)) {
+            match cache.get_or_fill(pos, || body(64, 9)) {
                 CacheOutcome::RetryRead => continue,
                 outcome => break outcome,
             }
@@ -774,7 +934,7 @@ mod tests {
                         if let Some(hit) = cache.get(pos) {
                             assert_eq!(hit.len(), 512);
                         } else {
-                            let _: CacheOutcome = cache.get_or_decompress(pos, || body(512, t));
+                            let _: CacheOutcome = cache.get_or_fill(pos, || body(512, t));
                         }
                     }
                 })

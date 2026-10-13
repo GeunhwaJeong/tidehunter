@@ -39,6 +39,10 @@ correctness checks, and skips the local `lsof` file-descriptor check.
   on startup; in Docker it should point to a subdirectory such as `/data/run`, not
   the volume mountpoint. If unset, the workload uses a fresh tempdir.
 - `NO_PROGRESS`: hide progress bars when set.
+- `CONCURRENT_TEST_INDEX_BLOB_CACHE_BYTES`: when set to a non-zero byte budget, runs with
+  the index blob cache enabled: every blob that leaves the index mmap window is admitted,
+  and fragments are shrunk to 64 KiB with a three-map window so blobs leave it across the
+  workload's restarts. The run then asserts that blobs were cached.
 
 ## Scope
 
