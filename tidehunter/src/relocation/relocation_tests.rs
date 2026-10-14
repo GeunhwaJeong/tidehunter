@@ -156,6 +156,115 @@ fn test_checkpoint_survives_relocation_without_unload() {
     checkpoint_survives_relocation(Arc::new(config), KeySpaceConfig::new().disable_unload());
 }
 
+/// A write allocated before a relocation copies its key's as-of value, but
+/// applied only after the copy has landed in the loaded cell's `flat`, must
+/// still be applied. The copy sits at a higher WAL-tail offset yet holds the
+/// older value, so neither the stale-write check (`skip_stale_update`) nor the
+/// flat ordering assert in `IndexTable::checked_insert` may order the write
+/// against it. Unloading is disabled so the relocation flush re-points the
+/// loaded overlay at the relocated blob (`rebase_on_as_of`) instead of
+/// unloading the cell; the writer is parked on `fp_insert_before_lock`
+/// between its WAL write and the row lock.
+#[test]
+fn test_relocation_racing_write_on_loaded_cell() {
+    use std::time::Instant;
+
+    let dir = tempdir::TempDir::new("test_reloc_racing_write").unwrap();
+    let config = Arc::new(Config::small());
+    let mut ksb = KeyShapeBuilder::new();
+    ksb.add_key_space_config(
+        "k",
+        8,
+        1,
+        KeyType::uniform(1),
+        KeySpaceConfig::new().disable_unload(),
+    );
+    let key_shape = ksb.build();
+    let metrics = Metrics::new();
+    let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let ks = db.ks("k");
+    let context = db.ks_context(ks);
+    let key = 3u64.to_be_bytes().to_vec();
+    let cell = context.ks_config.cell_id(&key);
+    let old_value = vec![1u8; 64];
+    let new_value = vec![2u8; 64];
+    let indexed_position = || {
+        db.large_table.with_entry_for_test(context, &cell, |entry| {
+            entry.get(&key).expect("key must be indexed")
+        })
+    };
+    let skipped_inserts = || {
+        metrics
+            .skip_stale_update
+            .with_label_values(&["k", "insert"])
+            .get()
+    };
+
+    db.insert(ks, key.clone(), old_value.clone()).unwrap();
+    // The relocation only considers positions the tracker has processed.
+    db.wal_writer.wal_tracker_barrier();
+    let original = indexed_position();
+
+    // Park the racing writer between its WAL write (guard held, so the
+    // tracker frontier stays at or below it) and the row lock.
+    let (latch, latch_guard) = Latch::new();
+    db.large_table.fp.0.write().fp_insert_before_lock = FailPoint::latch(latch);
+    let written_before = metrics.wal_written_bytes.get();
+    let writer = {
+        let db = db.clone();
+        let key = key.clone();
+        let new_value = new_value.clone();
+        thread::spawn(move || db.insert(ks, key, new_value).unwrap())
+    };
+    // `Db::insert` publishes the frame offset right after the WAL write and
+    // before the failpoint, so a changed gauge means the write is in flight.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while metrics.wal_written_bytes.get() == written_before {
+        assert!(
+            Instant::now() < deadline,
+            "racing writer did not reach the WAL before the deadline"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let in_flight_offset = metrics.wal_written_bytes.get() as u64;
+
+    // Relocate just the key's original record: everything below its
+    // successor offset. The copy lands past the in-flight write.
+    db.start_blocking_relocation_with_strategy(RelocationStrategy::IndexBased(Some(
+        original.offset() + 1,
+    )));
+    assert_eq!(
+        1,
+        metrics.relocation_kept.with_label_values(&["k"]).get(),
+        "relocation must have copied the key's record"
+    );
+    let relocated = indexed_position();
+    assert!(
+        relocated.offset() > in_flight_offset,
+        "relocated copy at {} must sit past the in-flight write at {}",
+        relocated.offset(),
+        in_flight_offset
+    );
+    db.large_table.each_entry(|entry| {
+        assert!(entry.is_index_loaded(), "cell must stay loaded");
+    });
+
+    // Release the writer: its write is newer than the copy and must win.
+    drop(latch_guard);
+    writer
+        .join()
+        .expect("racing write must be applied without panicking");
+    assert_eq!(0, skipped_inserts(), "racing write was skipped as stale");
+    assert_eq!(in_flight_offset, indexed_position().offset());
+    assert_eq!(Some(new_value.clone().into()), db.get(ks, &key).unwrap());
+
+    // A flush of that shape (copy in `flat`, newer write in the overlay)
+    // must persist the newer write.
+    db.force_rebuild_control_region().unwrap();
+    assert_eq!(Some(new_value.into()), db.get(ks, &key).unwrap());
+    assert_eq!(0, skipped_inserts());
+}
+
 // Regression: a key overwritten after a checkpoint, whose as-of value lives as a
 // distinct *overlay* position (not promoted to flat/L1) in a multi-level/unloaded
 // cell, must survive relocation. Before the fix, `get_index_for_cell` collapsed

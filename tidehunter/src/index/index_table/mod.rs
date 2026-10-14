@@ -172,16 +172,25 @@ impl IndexTable {
         let k = k.into_owned();
         // Only update index entry if new entry has higher wal position then the previous entry
         // See test_concurrent_single_value_update for details how this is tested
-        // todo handle this comparison correctly when we have data relocation
         // todo might want a separate test with snapshot enabled
 
         // Enforce the ordering assertion for keys promoted to flat but not yet
         // in `data`. Done before `entry` so the immutable flat read doesn't
         // overlap the mutable `data` borrow the entry holds (the `contains_key`
         // probe is debug/test-only — release does a single `data` descent).
+        // Only `Modified`/`Removed`-kind flat entries with a genuine offset are
+        // checked: those are promoted in-memory writes, which are always
+        // older than a write landing now. A `Clean` flat entry is disk-derived
+        // (`maybe_load`, `rebase_on_as_of`) or a demoted in-memory write, and
+        // a disk-derived entry's offset says nothing about ordering: a
+        // relocated copy sits at a WAL-tail offset that can exceed a write
+        // allocated before the copy, and a disk tombstone carries the
+        // `INVALID` sentinel.
         #[cfg(any(debug_assertions, feature = "test_methods"))]
         if !self.data.contains_key(&k)
             && let Some(existing) = self.flat_binary_search(&k)
+            && !existing.is_clean()
+            && existing.offset != WalPosition::INVALID.offset()
         {
             assert!(
                 existing.offset < v.offset,
@@ -272,11 +281,11 @@ impl IndexTable {
 
         // ---- flat side: dirty's disk-derived `flat` folds into self.flat ----
         // Invariant: entries that originated on disk live only in `flat`, never
-        // in the `data` overlay. The old code lifted them into `data`, where
-        // the offset-based filters then misread them — most damagingly,
-        // `retain_processed` saw a disk tombstone's INVALID sentinel offset
-        // (u64::MAX) as an unprocessed post-frontier write and dropped it,
-        // resurrecting the value the tombstone shadowed in a deeper level.
+        // in the `data` overlay. Lifting them into `data` would expose them to
+        // the offset-based filters, which misread them — most damagingly,
+        // `retain_processed` would take a disk tombstone's INVALID sentinel
+        // offset (u64::MAX) for an unprocessed post-frontier write and drop
+        // it, resurrecting the value the tombstone shadows in a deeper level.
         // `flat`'s dirty-entry count: `fold_dirty_flat` tallies it while building
         // the new buffer, so the merged blob is not re-decoded here. When there
         // is no `dirty.flat` to fold, `self.flat` is unchanged and counted once.
@@ -377,18 +386,13 @@ impl IndexTable {
                         // Overlay is freshest; keep self.flat's entry beneath it.
                         merged.push((self_flat.slice_to_bytes(sk), sv));
                     } else {
-                        // Caller contract: `dirty` is the fresher side. Offsets
-                        // are comparable unless either side is a disk tombstone
-                        // (`INVALID` sentinel offset, meaningless for ordering).
-                        debug_assert!(
-                            sv.offset == WalPosition::INVALID.offset()
-                                || dv.offset == WalPosition::INVALID.offset()
-                                || dv.offset >= sv.offset,
-                            "fold_dirty_flat: dirty.flat entry at offset {} is older than \
-                             self.flat entry at offset {} for the same key",
-                            dv.offset,
-                            sv.offset
-                        );
+                        // Caller contract: `dirty` is the fresher side. The two
+                        // offsets are not comparable, so this is not asserted:
+                        // either side may be a disk tombstone (`INVALID`
+                        // sentinel) or a relocated copy, which sits at a
+                        // WAL-tail offset above genuine writes it predates (a
+                        // copy promoted into L1 under a held checkpoint versus
+                        // the newer overwrite that later reaches L0).
                         let key = dirty.flat.slice_to_bytes(dk);
                         keys_from_dirty.push((key.clone(), dv));
                         merged.push((key, demote(dv)));
@@ -622,10 +626,12 @@ impl IndexTable {
     /// The data overlay is searched for the latest *processed* position; if the
     /// key only has unprocessed positions there (a write that postdates the
     /// checkpoint), we fall through to `flat`. Falling through is correct
-    /// because, for any key, `data` entries always have a higher WAL offset
-    /// than a `flat` entry for the same key (data is the newer write buffer;
-    /// `promote_to_flat` only ever moves lower offsets down). So a processed
-    /// data entry, when present, is the freshest as-of-frontier value and wins.
+    /// because `data` shadows `flat` for the same key: a `flat` entry is
+    /// either an older processed write (`promote_to_flat` only moves
+    /// processed positions down) or disk-derived — a tombstone, or a
+    /// relocated copy that may sit at a higher WAL-tail offset yet holds the
+    /// as-of-frontier value. So a processed data entry, when present, is the
+    /// freshest as-of-frontier value and wins.
     ///
     /// `flat` is always safe to consult in full: by the unprocessed-write
     /// retention invariant (see the `crate::checkpoint` module docs) no user
@@ -640,14 +646,30 @@ impl IndexTable {
             .map(|iwp| iwp.into_wal_position())
     }
 
-    /// Similar to `get`, but returns the WAL position of the update operation for both
-    /// inserts and deletes.
-    pub fn get_update_position(&self, k: &Bytes) -> Option<WalPosition> {
-        if let Some(p) = self.data_get_latest(k) {
-            return Some(p.into_update_position());
-        }
-        self.flat_binary_search(k)
-            .map(|iwp| iwp.into_update_position())
+    /// WAL position of the latest update (insert or delete) recorded for `k`
+    /// in the `data` overlay, or `None` when the overlay holds no position
+    /// for the key.
+    ///
+    /// Deliberately ignores `flat`. The stale-write check this backs
+    /// (`LargeTableEntry::skip_stale_update`) only has to order a write
+    /// against the other *in-flight* writes to the same key, and those are
+    /// always still in `data` when the check runs:
+    ///   - a direct write holds its WAL guard until it is applied, so the
+    ///     tracker frontier, and with it every promote threshold, stays at or
+    ///     below it and nothing newer is promoted into `flat` meanwhile;
+    ///   - a batch write releases its guards at commit while its ops wait in
+    ///     `pending_data`, but every frontier capture reads `last_processed`
+    ///     before `promote_pending` under the row lock, and `insert`/`remove`
+    ///     run `promote_pending_for` first, so a pending op is applied (and
+    ///     ordered against `data` here) before anything newer leaves `data`.
+    ///
+    /// Every `flat` entry is therefore either an older processed write or
+    /// disk-derived, and disk-derived entries carry offsets that are
+    /// meaningless for ordering — a tombstone's `INVALID` sentinel (u64::MAX)
+    /// and a relocated copy's WAL-tail offset would both wrongly outrank a
+    /// genuine newer write.
+    pub fn overlay_update_position(&self, k: &Bytes) -> Option<WalPosition> {
+        self.data_get_latest(k).map(|p| p.into_update_position())
     }
 
     /// If prev is None returns first entry.
@@ -3039,6 +3061,48 @@ mod tests {
             deserialized.get(&[2]),
             Some(WalPosition::INVALID),
             "tombstone failed to round-trip through serialize/deserialize"
+        );
+    }
+
+    #[test]
+    fn test_overlay_update_position_ignores_disk_tombstone() {
+        // A tombstone loaded from disk sits in `flat` with the INVALID
+        // sentinel offset (u64::MAX). It must neither order a later write as
+        // stale nor trip the flat ordering assert when that write lands.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(10));
+        table.remove(vec![2].into(), WalPosition::test_value(25));
+
+        let shape = KeyShape::new_single_config_indexing(
+            KeyIndexing::variable_length(),
+            1,
+            KeyType::uniform(1),
+            Default::default(),
+        );
+        let ks = shape.ks(KeySpace::first());
+        let mut buf = BytesMut::new();
+        table.serialize_index_entries(ks, &mut buf);
+        let mut loaded = IndexTable::deserialize_index_entries(ks, Bytes::from(buf.freeze()));
+        assert_eq!(loaded.get(&[2]), Some(WalPosition::INVALID));
+
+        // Nothing in the overlay for either key: no ordering information.
+        assert_eq!(loaded.overlay_update_position(&vec![1].into()), None);
+        assert_eq!(loaded.overlay_update_position(&vec![2].into()), None);
+
+        // Re-inserting the tombstoned key must succeed and shadow the tombstone.
+        let reinsert = WalPosition::test_value(30);
+        loaded.insert(vec![2].into(), reinsert);
+        assert_eq!(loaded.get(&[2]), Some(reinsert));
+        assert_eq!(
+            loaded.overlay_update_position(&vec![2].into()),
+            Some(reinsert)
+        );
+        assert_eq!(
+            loaded.iter().collect::<Vec<_>>(),
+            vec![
+                (Bytes::from(vec![1]), WalPosition::test_value(10)),
+                (Bytes::from(vec![2]), reinsert),
+            ]
         );
     }
 

@@ -4479,6 +4479,176 @@ fn test_compact_with_preserves_tombstones_shadowing_l1() {
     );
 }
 
+/// A key deleted and flushed into an L0 that sits above an L1 leaves a
+/// tombstone in that L0. When the cell is then loaded (here by the live
+/// iterator of a keyspace with the unloaded iterator disabled), the tombstone
+/// is lifted into the entry's `flat` with the `INVALID` sentinel offset. A
+/// later write to the key must land in the index: the stale-write check must
+/// not read the sentinel as a newer position and drop the write, which would
+/// lose the key for good once the next promote folds the tombstone into L1.
+///
+/// `remove_first` first deletes the key again on the loaded cell (a tombstone
+/// over the flat tombstone), `use_batch` re-inserts through `write_batch`
+/// instead of `insert`, and `hold_checkpoint` keeps a `Db::checkpoint` latch
+/// across the re-insert and the following flush, so that flush rewrites the
+/// as-of-frontier L0 (tombstone included) while the re-insert stays in the
+/// overlay.
+fn reinsert_after_loaded_disk_tombstone(
+    remove_first: bool,
+    use_batch: bool,
+    hold_checkpoint: bool,
+) {
+    let dir = tempdir::TempDir::new("test-reinsert-after-loaded-disk-tombstone").unwrap();
+    let config = Arc::new(Config::small());
+    // One cell. l0_max_entries=2: a flush of three keys promotes into L1,
+    // a flush of a lone tombstone writes an L0 above it.
+    let ks_config = KeySpaceConfig::new()
+        .with_l0_max_entries(2)
+        .with_unloaded_iterator(false);
+    let mut ksb = KeyShapeBuilder::new();
+    ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ks_config);
+    let key_shape = ksb.build();
+    let metrics = Metrics::new();
+    let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let ks = db.ks("k");
+
+    let k = |n: u64| n.to_be_bytes().to_vec();
+    let v = |b: u8| -> Bytes { vec![b].into() };
+    let live = |db: &Arc<Db>| -> Vec<(Bytes, Bytes)> {
+        db.iterator(ks).collect::<DbResult<Vec<_>>>().unwrap()
+    };
+    let skipped = |op: &str| {
+        metrics
+            .skip_stale_update
+            .with_label_values(&["k", op])
+            .get()
+    };
+
+    // Phase 1: three keys, flushed. 3 > l0_max_entries promotes everything
+    // into L1; the cell ends as [INVALID, L1].
+    for n in 1..=3u64 {
+        db.insert(ks, k(n), v(n as u8)).unwrap();
+    }
+    db.force_rebuild_control_region().unwrap();
+    db.large_table.each_entry(|entry| {
+        assert!(
+            entry.levels().l0().is_none(),
+            "expected post-promote L0 to be INVALID"
+        );
+        assert!(
+            entry.levels().l1().is_some(),
+            "expected L1 to hold the blob"
+        );
+    });
+
+    // Phase 2: delete k1 and flush. A lone tombstone is under the threshold,
+    // so it is written as a new L0 above L1, tombstone preserved.
+    db.remove(ks, k(1)).unwrap();
+    db.force_rebuild_control_region().unwrap();
+    db.large_table.each_entry(|entry| {
+        assert!(
+            entry.levels().l0().is_some(),
+            "expected the tombstone L0 above L1"
+        );
+        assert!(entry.levels().l1().is_some(), "L1 must still be populated");
+    });
+    assert_eq!(None, db.get(ks, &k(1)).unwrap());
+
+    // Phase 3: a live iterator loads the cell; the L0 tombstone now sits in
+    // the entry's `flat`.
+    assert_eq!(live(&db), vec![(k(2).into(), v(2)), (k(3).into(), v(3))]);
+    db.large_table
+        .each_entry(|entry| assert!(entry.is_index_loaded(), "iterator must load the cell"));
+
+    let checkpoint = hold_checkpoint.then(|| db.checkpoint());
+
+    // Phase 4: write k1 on the loaded cell. Every write must be applied, not
+    // skipped as stale against the tombstone's sentinel offset.
+    if remove_first {
+        db.remove(ks, k(1)).unwrap();
+        assert_eq!(0, skipped("remove"), "remove was skipped as a stale update");
+        assert_eq!(None, db.get(ks, &k(1)).unwrap());
+    }
+    if use_batch {
+        let mut batch = db.write_batch();
+        batch.write(ks, k(1), v(11));
+        batch.commit().unwrap();
+    } else {
+        db.insert(ks, k(1), v(11)).unwrap();
+    }
+    // `get` promotes a committed batch op before reading, so the skip counter
+    // is final once it returns.
+    assert_eq!(Some(v(11)), db.get(ks, &k(1)).unwrap());
+    assert_eq!(
+        0,
+        skipped("insert"),
+        "re-insert was skipped as a stale update"
+    );
+    assert!(db.exists(ks, &k(1)).unwrap());
+    assert_eq!(
+        live(&db),
+        vec![
+            (k(1).into(), v(11)),
+            (k(2).into(), v(2)),
+            (k(3).into(), v(3)),
+        ]
+    );
+    if let Some(checkpoint) = &checkpoint {
+        assert_eq!(None, checkpoint.get(ks, &k(1)).unwrap());
+    }
+
+    // Phase 5: flush the loaded cell. With no latch held the new L0 carries
+    // the re-insert rather than the tombstone it shadows; with the latch held
+    // the flush rewrites the as-of-frontier L0 (tombstone included) and the
+    // re-insert stays in the overlay. Live and checkpoint reads must not
+    // change either way.
+    db.force_rebuild_control_region().unwrap();
+    assert_eq!(Some(v(11)), db.get(ks, &k(1)).unwrap());
+    if let Some(checkpoint) = checkpoint {
+        assert_eq!(None, checkpoint.get(ks, &k(1)).unwrap());
+        drop(checkpoint);
+        db.force_rebuild_control_region().unwrap();
+        assert_eq!(Some(v(11)), db.get(ks, &k(1)).unwrap());
+    }
+
+    // Phase 6: push over the threshold so the next flush promotes into L1
+    // (the deepest level, where tombstones are stripped). k1 must survive.
+    db.insert(ks, k(4), v(4)).unwrap();
+    db.insert(ks, k(5), v(5)).unwrap();
+    db.force_rebuild_control_region().unwrap();
+    db.large_table.each_entry(|entry| {
+        assert!(entry.levels().l0().is_none(), "expected a promote into L1");
+    });
+    assert_eq!(Some(v(11)), db.get(ks, &k(1)).unwrap());
+    assert_eq!(
+        live(&db),
+        vec![
+            (k(1).into(), v(11)),
+            (k(2).into(), v(2)),
+            (k(3).into(), v(3)),
+            (k(4).into(), v(4)),
+            (k(5).into(), v(5)),
+        ]
+    );
+    assert_eq!(0, skipped("insert"));
+    assert_eq!(0, skipped("remove"));
+}
+
+#[test]
+fn test_reinsert_after_loaded_disk_tombstone() {
+    reinsert_after_loaded_disk_tombstone(false, false, false);
+}
+
+#[test]
+fn test_reinsert_after_loaded_disk_tombstone_batch_after_remove() {
+    reinsert_after_loaded_disk_tombstone(true, true, false);
+}
+
+#[test]
+fn test_reinsert_after_loaded_disk_tombstone_checkpoint_held() {
+    reinsert_after_loaded_disk_tombstone(false, false, true);
+}
+
 #[test]
 fn test_auto_sharding_concurrent() {
     use parking_lot::Mutex;

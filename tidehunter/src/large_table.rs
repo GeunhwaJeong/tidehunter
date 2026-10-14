@@ -435,8 +435,8 @@ impl LargeTable {
     /// Live-write checks intentionally skipped (replay is sequential, no
     /// in-flight transactions, no concurrent writers):
     ///   - `promote_pending_for` / `pending_data` (always empty)
-    ///   - `skip_stale_update` (WAL is monotonic; later-position wins
-    ///     naturally via HashMap overwrite semantics)
+    ///   - `skip_stale_update` (WAL is monotonic; the key-ASC/offset-DESC
+    ///     sort plus dedup below keeps the later position per key)
     ///   - Value LRU (churns + evicts during replay, ends up holding a
     ///     random tail; not worth the cost)
     ///   - `too_many_dirty` / flush trigger (replay loader has
@@ -857,9 +857,13 @@ impl LargeTable {
     /// 128+ keys per cell.
     ///
     /// The promote threshold is captured the same way `promote_flat_job`
-    /// does: `entry.pending_last_processed.unwrap_or(loader_lp)`. Passing
-    /// `u64::MAX` instead would promote unprocessed entries too and falsify
-    /// the test against the real production invariant.
+    /// does: `last_processed` is read before `promote_pending` under the row
+    /// lock, then `entry.pending_last_processed.unwrap_or(loader_lp)`. The
+    /// `promote_pending` matters: a committed batch op still in
+    /// `pending_data` must land in `data` before anything newer is promoted
+    /// out of it, which is what lets `skip_stale_update` consult `data`
+    /// alone. Passing `u64::MAX` instead would promote unprocessed entries
+    /// too and falsify the test against the real production invariant.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn test_promote_flat_force<L: Loader>(&self, loader: &L) {
         for ks_table in &self.table {
@@ -867,6 +871,7 @@ impl LargeTable {
                 let mut row = mutex.lock();
                 let loader_lp = loader.last_processed_wal_position();
                 for entry in row.entries.iter_mut() {
+                    entry.promote_pending();
                     if entry.data.data_btree_is_empty() {
                         continue;
                     }
@@ -1834,9 +1839,15 @@ impl LargeTableEntry {
     /// Checks if the update is potentially stale and the operation needs to be canceled.
     /// This can happen if there are multiple concurrent updates for the same key.
     /// Returns true if the update is outdated and should be skipped
+    ///
+    /// Only the `data` overlay is consulted (see
+    /// `IndexTable::overlay_update_position`): a loaded cell's `flat` holds
+    /// disk-derived entries whose offsets do not order against live writes.
+    /// Comparing against a disk tombstone's `INVALID` sentinel there would
+    /// skip every later write to a key deleted and re-inserted across a
+    /// flush, silently losing the re-insert.
     fn skip_stale_update(&self, key: &Bytes, wal_position: &WalPosition, op: &'static str) -> bool {
-        // check the existing loaded WAL position first, if present
-        let skip = if let Some(last_position) = self.data.get_update_position(key) {
+        let skip = if let Some(last_position) = self.data.overlay_update_position(key) {
             &last_position > wal_position
         } else {
             false
