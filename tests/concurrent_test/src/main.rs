@@ -245,6 +245,9 @@ fn main() {
     config.l0_max_entries = Some(6);
     config.snapshot_unload_threshold = 1024;
     config.snapshot_written_bytes = 4 * 1024 * 1024; // 4 MB — trigger snapshots frequently
+    // Auto-shard L1 at 2 KiB so the secondary key space's cells split into
+    // many shards and its promotes and relocations run over them.
+    config.with_index_auto_shard_threshold(2 * 1024);
     // Opt-in index blob cache: a budget in bytes, admitting every blob that
     // leaves the index mmap window. Every cell here is rewritten constantly,
     // so blobs leave the window mainly across restarts, when only the
@@ -808,6 +811,18 @@ fn main() {
             .with_label_values(&[ks])
             .get();
         let promotes = shared_metrics.promote_total.with_label_values(&[ks]).get();
+        let shard_blobs = shared_metrics
+            .l1_shards_total
+            .with_label_values(&[ks])
+            .get();
+        let shard_splits = shared_metrics
+            .l1_shard_split_total
+            .with_label_values(&[ks])
+            .get();
+        let shard_rewrites = shared_metrics
+            .l1_shard_rewritten_total
+            .with_label_values(&[ks])
+            .get();
         let mut read_index_0 = 0u64;
         let mut read_index_1 = 0u64;
         for result in ["found", "not_found"] {
@@ -822,8 +837,19 @@ fn main() {
         }
         println!(
             "  lsm[{ks}]: l0_bytes={l0_bytes} l1_bytes={l1_bytes} promotes={promotes} \
-             reads_index_0={read_index_0} reads_index_1={read_index_1}"
+             shard_blobs={shard_blobs} shard_splits={shard_splits} \
+             shard_rewrites={shard_rewrites} reads_index_0={read_index_0} \
+             reads_index_1={read_index_1}"
         );
+        if ks == "secondary" && total_operations >= 1_000_000 {
+            // A full-size run writes enough secondary keys for its cells to
+            // split; a short run may not.
+            assert!(shard_splits > 0, "secondary cells never split into shards");
+            assert!(
+                shard_rewrites > 0,
+                "no secondary shard was rewritten by a promote or a relocation"
+            );
+        }
     }
     drop(db_read);
 
