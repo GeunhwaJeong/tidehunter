@@ -606,6 +606,12 @@ impl IndexTable {
         self.flat = build_flat_bytes(kept, self.key_size);
     }
 
+    /// True when this table holds an entry for `k`, in the overlay or in
+    /// flat, tombstones included.
+    pub fn contains_key(&self, k: &[u8]) -> bool {
+        self.data_contains_key(k) || self.flat_binary_search(k).is_some()
+    }
+
     pub fn get(&self, k: &[u8]) -> Option<WalPosition> {
         // `data` (write buffer) takes priority over `flat` — its latest entry
         // for `k` shadows any flat entry for the same key.
@@ -1073,11 +1079,12 @@ impl IndexTable {
     }
 
     /// Build a flat-backed IndexTable from a vector of entries that the caller
-    /// has already sorted by key. Used by the replay accumulator path to skip
-    /// the BTreeMap on the hot insert path — replay batches per-cell writes
-    /// into a HashMap, then converts them in bulk via a single sort + flat
-    /// build. `data` is empty; `key_size` is `None` (varlen flat), matching
-    /// what `promote_to_flat` produces from a default IndexTable.
+    /// has already sorted by key. The replay accumulator uses it to skip the
+    /// BTreeMap on the hot insert path — replay batches per-cell writes into a
+    /// HashMap, then converts them in bulk via a single sort + flat build —
+    /// and `concat_disjoint_flats` to re-encode decoded shard flats. `data` is
+    /// empty; `key_size` is `None` (varlen flat), matching what
+    /// `promote_to_flat` produces from a default IndexTable.
     pub(crate) fn from_sorted_entries(entries: Vec<(Bytes, IndexWalPosition)>) -> Self {
         let dirty_count = entries.iter().filter(|(_, iwp)| !iwp.is_clean()).count();
         let flat = build_flat_bytes(entries, None);
@@ -1088,6 +1095,84 @@ impl IndexTable {
             key_size: None,
             dirty_count,
         }
+    }
+
+    /// Builds one table from tables whose key ranges are disjoint, given in
+    /// ascending range order — the levels below L0 of one cell. A single
+    /// table is returned as is. The inputs must share one key layout, all
+    /// fixed-size or all var-len, as the blobs of one key space do.
+    /// Disk-loaded blobs are flat-only and take a path linear in the total
+    /// entry count: fixed-size flats are concatenated byte by byte, var-len
+    /// flats are decoded once and re-encoded into a single buffer. Inputs
+    /// that carry `data` entries are folded one by one instead.
+    pub(crate) fn concat_disjoint_flats(mut tables: Vec<IndexTable>) -> Self {
+        if tables.len() <= 1 {
+            return tables.pop().unwrap_or_default();
+        }
+        assert!(
+            Self::flats_ascend_disjoint(&tables),
+            "concat_disjoint_flats: inputs must ascend without overlap"
+        );
+        if tables.iter().any(|t| !t.data.is_empty()) {
+            let mut merged = IndexTable::default();
+            for t in &tables {
+                merged.merge_dirty_and_clean(t);
+            }
+            return merged;
+        }
+        let key_size = tables
+            .iter()
+            .find(|t| !t.flat.is_empty())
+            .and_then(|t| t.key_size);
+        assert!(
+            tables
+                .iter()
+                .all(|t| t.flat.is_empty() || t.key_size == key_size),
+            "concat_disjoint_flats: inputs must share one key layout"
+        );
+        if key_size.is_none() {
+            let cap: usize = tables.iter().map(|t| t.flat_len()).sum();
+            let mut entries: Vec<(Bytes, IndexWalPosition)> = Vec::with_capacity(cap);
+            for t in &tables {
+                entries.extend(
+                    FlatIter::new(&t.flat, t.key_size).map(|(k, v)| (t.flat.slice_to_bytes(k), v)),
+                );
+            }
+            return Self::from_sorted_entries(entries);
+        }
+        let total: usize = tables.iter().map(|t| t.flat.len()).sum();
+        let mut out = BytesMut::with_capacity(total);
+        for t in &tables {
+            out.extend_from_slice(&t.flat[..]);
+        }
+        IndexTable {
+            data: BTreeMap::new(),
+            key_bytes: 0,
+            flat: Bytes::from(out.freeze()),
+            key_size,
+            dirty_count: tables.iter().map(|t| t.dirty_count).sum(),
+        }
+    }
+
+    /// True when the flats' key ranges ascend without overlap, reading only
+    /// the first and last entry of each non-empty flat.
+    fn flats_ascend_disjoint(tables: &[IndexTable]) -> bool {
+        let mut prev_last: Option<Bytes> = None;
+        for t in tables {
+            let n = t.flat_len();
+            if n == 0 {
+                continue;
+            }
+            let (first, _) = flat_entry_at(&t.flat, t.key_size, 0);
+            if let Some(prev) = &prev_last
+                && &prev[..] >= first
+            {
+                return false;
+            }
+            let (last, _) = flat_entry_at(&t.flat, t.key_size, n - 1);
+            prev_last = Some(t.flat.slice_to_bytes(last));
+        }
+        true
     }
 
     /// Deserializes IndexTable from bytes.
@@ -3104,6 +3189,125 @@ mod tests {
                 (Bytes::from(vec![2]), reinsert),
             ]
         );
+    }
+
+    #[test]
+    fn test_concat_disjoint_flats_matches_fold() {
+        // Three disjoint, ascending shards reach `concat_disjoint_flats` as
+        // fixed-key disk blobs (byte concatenation) and as var-len flats
+        // (decode and re-encode). Both must yield the entries the one-by-one
+        // fold yields.
+        let shard = |lo: u8, hi: u8| {
+            let mut t = IndexTable::default();
+            for k in lo..=hi {
+                t.insert(Bytes::from(vec![k]), WalPosition::test_value(k as u64 * 10));
+            }
+            t
+        };
+        let shards = || vec![shard(1, 3), shard(10, 12), shard(20, 25)];
+        let mut fold = IndexTable::default();
+        for t in &shards() {
+            fold.merge_dirty_and_clean(t);
+        }
+        let expected: Vec<(Bytes, WalPosition)> = fold.iter().collect();
+        assert_eq!(expected.len(), 12);
+
+        let disk: Vec<IndexTable> = shards().iter().map(fixed_key_disk_blob).collect();
+        assert!(
+            disk.iter()
+                .all(|t| t.data.is_empty() && t.key_size == Some(1))
+        );
+        let concat = IndexTable::concat_disjoint_flats(disk);
+        assert_eq!(concat.key_size, Some(1));
+        assert_eq!(concat.iter().collect::<Vec<_>>(), expected);
+
+        let mut var_len = shards();
+        for t in var_len.iter_mut() {
+            t.promote_to_flat_unconditionally(LastProcessed::new(u64::MAX));
+        }
+        assert!(
+            var_len
+                .iter()
+                .all(|t| t.data.is_empty() && t.key_size.is_none())
+        );
+        assert_eq!(
+            IndexTable::concat_disjoint_flats(var_len)
+                .iter()
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    /// Round-trips `table` through the fixed-key disk format, the way a shard
+    /// blob of a one-byte-key space is loaded.
+    fn fixed_key_disk_blob(table: &IndexTable) -> IndexTable {
+        let shape = KeyShape::new_single_config_indexing(
+            KeyIndexing::fixed(1),
+            1,
+            KeyType::uniform(1),
+            Default::default(),
+        );
+        let ks = shape.ks(KeySpace::first());
+        let mut buf = BytesMut::new();
+        table.serialize_index_entries(ks, &mut buf);
+        IndexTable::deserialize_index_entries(ks, Bytes::from(buf.freeze()))
+    }
+
+    /// A var-len flat-only table holding `keys` as one-byte keys.
+    fn var_len_flat(keys: &[u8]) -> IndexTable {
+        let mut t = IndexTable::default();
+        for k in keys {
+            t.insert(
+                Bytes::from(vec![*k]),
+                WalPosition::test_value(*k as u64 * 10),
+            );
+        }
+        t.promote_to_flat_unconditionally(LastProcessed::new(u64::MAX));
+        t
+    }
+
+    #[test]
+    fn test_flats_ascend_disjoint() {
+        assert!(IndexTable::flats_ascend_disjoint(&[
+            var_len_flat(&[1, 2]),
+            var_len_flat(&[3]),
+            var_len_flat(&[7, 9]),
+        ]));
+        // Empty inputs anywhere are skipped.
+        assert!(IndexTable::flats_ascend_disjoint(&[
+            IndexTable::default(),
+            var_len_flat(&[1, 2]),
+            IndexTable::default(),
+            var_len_flat(&[3]),
+        ]));
+        // A shared boundary key, an overlap and a descending order all fail.
+        assert!(!IndexTable::flats_ascend_disjoint(&[
+            var_len_flat(&[1, 2]),
+            var_len_flat(&[2, 3]),
+        ]));
+        assert!(!IndexTable::flats_ascend_disjoint(&[
+            var_len_flat(&[1, 5]),
+            var_len_flat(&[3]),
+        ]));
+        assert!(!IndexTable::flats_ascend_disjoint(&[
+            var_len_flat(&[3]),
+            var_len_flat(&[1, 2]),
+        ]));
+    }
+
+    #[test]
+    #[should_panic(expected = "must ascend without overlap")]
+    fn test_concat_disjoint_flats_rejects_overlap() {
+        let _: IndexTable =
+            IndexTable::concat_disjoint_flats(vec![var_len_flat(&[1, 5]), var_len_flat(&[3])]);
+    }
+
+    #[test]
+    #[should_panic(expected = "must share one key layout")]
+    fn test_concat_disjoint_flats_rejects_mixed_key_layouts() {
+        let fixed = fixed_key_disk_blob(&var_len_flat(&[1]));
+        assert_eq!(fixed.key_size, Some(1));
+        let _: IndexTable = IndexTable::concat_disjoint_flats(vec![fixed, var_len_flat(&[5])]);
     }
 
     #[test]

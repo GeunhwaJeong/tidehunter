@@ -244,6 +244,12 @@ impl IndexFlusherThread {
         relocation_updates: Option<RelocationUpdates>,
         relocation_cutoff: Option<u64>,
     ) -> Option<(Arc<IndexTable>, IndexLevels)> {
+        // A cutoff flush that changes nothing returns early without a level
+        // set, which would discard shards the updates had rewritten.
+        assert!(
+            relocation_updates.is_none() || relocation_cutoff.is_none(),
+            "relocation updates and a relocation cutoff are mutually exclusive"
+        );
         // Sharded ForceRelocate short-circuits before the merge-build
         // path below, which would collapse the shard btree into one blob.
         if let FlushKind::ForceRelocate {
@@ -329,8 +335,6 @@ impl IndexFlusherThread {
                 )
             }
         };
-        let existing_l1 = current_levels.l1();
-
         // Unprocessed entries may still be read by an in-flight checkpoint, so
         // don't merge them to disk; keep them in the in-memory overlay.
         //
@@ -342,28 +346,42 @@ impl IndexFlusherThread {
         merged_l0.retain_processed(loader.last_processed_wal_position());
 
         // `RelocationUpdates::apply` uses compare-and-set semantics — it can
-        // only rewrite positions for keys already in `merged_l0`. Keys that
-        // live only in L1 (the common case for post-promote `[INVALID, L1]`
-        // cells) would be silently dropped. Pre-load L1 into `merged_l0` so
-        // apply sees the full key set. The subsequent promote branch still
-        // re-loads L1 from disk; the duplication is acceptable on the
-        // relocation path — correctness first, optimize later.
-        if relocation_updates.is_some() {
-            assert!(
-                !current_levels.is_sharded(),
-                "RelocationUpdates on sharded cells is not yet supported",
-            );
-            if existing_l1.is_some() {
-                let mut combined = Self::load_l1_or_default(loader, ctx, existing_l1);
-                // `merged_l0` is the fresher overlay (L0 + dirty) — it wins
-                // on overlapping keys, so treat it as the "dirty" side.
-                combined.merge_dirty_and_clean(&merged_l0);
-                merged_l0 = combined;
+        // only rewrite positions for keys already in the table it is applied
+        // to, so keys living only below L0 need that level brought in:
+        //
+        // - a single L1 blob (the common post-promote `[INVALID, L1]` shape)
+        //   is pre-loaded into `merged_l0` so apply sees the full key set.
+        //   The subsequent promote branch still re-loads L1 from disk; the
+        //   duplication is acceptable on the relocation path;
+        // - a sharded L1 is re-pointed shard by shard instead, rewriting only
+        //   the shards that changed (see `apply_relocation_updates_sharded`).
+        //   A promote in the same flush rewrites those shards once more; the
+        //   duplicate write is acceptable on the relocation path.
+        let current_levels = match relocation_updates {
+            Some(updates) if current_levels.is_sharded() => Self::apply_relocation_updates_sharded(
+                loader,
+                ctx,
+                command.ks,
+                &mut merged_l0,
+                current_levels,
+                updates,
+            ),
+            Some(updates) => {
+                if let Some(l1) = current_levels.l1() {
+                    let mut combined = loader
+                        .load(&ctx.ks_config, l1)
+                        .expect("Failed to load L1 index in flusher thread");
+                    // `merged_l0` is the fresher overlay (L0 + dirty) — it wins
+                    // on overlapping keys, so treat it as the "dirty" side.
+                    combined.merge_dirty_and_clean(&merged_l0);
+                    merged_l0 = combined;
+                }
+                updates.apply(&mut merged_l0);
+                current_levels
             }
-        }
-        if let Some(relocation_updates) = relocation_updates {
-            relocation_updates.apply(&mut merged_l0);
-        }
+            None => current_levels,
+        };
+        let existing_l1 = current_levels.l1();
 
         match relocation_cutoff {
             Some(cutoff) => {
@@ -386,6 +404,7 @@ impl IndexFlusherThread {
         let is_relocation = matches!(&command.flush_kind, FlushKind::ForceRelocate { .. });
         let l0_threshold = ctx.l0_max_entries();
         let over_threshold = !is_relocation && merged_l0.len() > l0_threshold;
+        let deeper_level_exists = existing_l1.is_some() || current_levels.is_sharded();
 
         let new_levels = if over_threshold {
             ctx.metrics
@@ -413,12 +432,20 @@ impl IndexFlusherThread {
                 Self::process_l1_blob(loader, ctx, &mut new_l1);
                 Self::write_promoted_l1(loader, ctx, command.ks, new_l1)
             }
+        } else if merged_l0.is_empty() && deeper_level_exists {
+            // An empty L0 shadows nothing, and a blob for it would only add a
+            // level for every lookup on this cell to probe until the next
+            // promote. Leave the cell on its deeper levels.
+            if current_levels.is_sharded() {
+                IndexLevels::sharded(current_levels.shards().clone())
+            } else {
+                IndexLevels::promoted(existing_l1.expect("deeper level below L0 is L1"))
+            }
         } else {
             Self::run_compactor(ctx, &mut merged_l0);
             // If no deeper level exists, this L0 is the deepest — strip
             // tombstones. Otherwise (L1 or shards below) leave them in so
             // they shadow the level beneath.
-            let deeper_level_exists = existing_l1.is_some() || current_levels.is_sharded();
             if !deeper_level_exists {
                 merged_l0.clean_self();
             }
@@ -444,8 +471,8 @@ impl IndexFlusherThread {
 
         // Post-pass: any blob in `new_levels` whose position is still in
         // `relocate_positions` wasn't naturally rewritten by the merge/promote
-        // above (untouched re-sharding shards, or a stale L1 under the L0-write
-        // branch). Reflush those at fresh positions.
+        // above (untouched re-sharding shards, or the L1 or shards beneath an
+        // L0 write or a flush that wrote no L0). Reflush those at fresh positions.
         let new_levels = match &command.flush_kind {
             FlushKind::Flush {
                 relocate_positions, ..
@@ -599,9 +626,6 @@ impl IndexFlusherThread {
         // original offset. Use the WAL tail as the placeholder so the merge
         // path's monotonic-offset assertion holds.
         let tombstone_placeholder = WalPosition::new(loader.current_wal_position().max(1), 1);
-        // `usize::MAX` when auto-sharding is disabled: re-sharding still
-        // rewrites touched shards but never splits any further.
-        let split_threshold = ctx.config.index_auto_shard_threshold.unwrap_or(usize::MAX);
         let first_owner: &[u8] = current_shards
             .keys()
             .next()
@@ -627,68 +651,18 @@ impl IndexFlusherThread {
             }
         }
 
-        let mut new_shards: BTreeMap<Vec<u8>, IndexShard> = BTreeMap::new();
-        let mut total_bytes: u64 = 0;
-        let mut rewritten: u64 = 0;
-        let mut split_events: u64 = 0;
-
-        for (btree_key, shard) in current_shards.iter() {
-            let Some(dirty_subset) = partitions.remove(btree_key.as_slice()) else {
-                new_shards.insert(btree_key.clone(), shard.clone());
-                continue;
-            };
-            rewritten += 1;
-            let mut shard_table = loader
-                .load(&ctx.ks_config, shard.position)
-                .expect("Failed to load shard for sharded promote");
-            shard_table.merge_dirty_and_clean(&dirty_subset);
-            // This shard is being rewritten anyway, so it is reclaimed here.
-            // Untouched shards keep their blobs until a later promote touches
-            // them.
-            Self::process_l1_blob(loader, ctx, &mut shard_table);
-
-            if shard_table.is_empty() {
-                // All entries in this shard's range were tombstoned out.
-                continue;
-            }
-
-            let entries: Vec<(Bytes, WalPosition)> = shard_table.iter().collect();
-            let serialized = ctx
-                .ks_config
-                .index_format()
-                .serialize_index(&shard_table, &ctx.ks_config);
-            if serialized.len() <= split_threshold {
-                let (min_key, max_key) = shard_bounds(&entries);
-                let single = [(min_key, max_key, shard_table)];
-                total_bytes += Self::flush_shard_tables(loader, ks, &single, &mut new_shards);
-            } else {
-                split_events += 1;
-                let mut sub_shards: Vec<(Vec<u8>, Vec<u8>, IndexTable)> = Vec::new();
-                Self::split_recursive(&entries, &ctx.ks_config, split_threshold, &mut sub_shards);
-                total_bytes += Self::flush_shard_tables(loader, ks, &sub_shards, &mut new_shards);
-            }
-        }
-        debug_assert!(
-            partitions.is_empty(),
-            "every partition key must match a current shard btree key",
+        let new_shards = Self::rewrite_shards(
+            loader,
+            ctx,
+            ks,
+            current_shards,
+            partitions,
+            |shard_table, dirty_subset| {
+                // Every partition holds keys for its shard, so it is written back.
+                shard_table.merge_dirty_and_clean(&dirty_subset);
+                true
+            },
         );
-
-        ctx.metrics
-            .l1_bytes_written
-            .with_label_values(&[ctx.name()])
-            .inc_by(total_bytes);
-        ctx.metrics
-            .l1_shard_rewritten_total
-            .with_label_values(&[ctx.name()])
-            .inc_by(rewritten);
-        ctx.metrics
-            .l1_shards_total
-            .with_label_values(&[ctx.name()])
-            .inc_by(new_shards.len() as u64);
-        ctx.metrics
-            .l1_shard_split_total
-            .with_label_values(&[ctx.name()])
-            .inc_by(split_events);
 
         if new_shards.is_empty() {
             // Every shard got tombstoned out. Fall back to a single empty
@@ -703,6 +677,148 @@ impl IndexFlusherThread {
         IndexLevels::sharded(new_shards)
     }
 
+    /// Rewrites the shards of `current_shards` that `work` names, in btree
+    /// order. Each is loaded and handed to `rewrite` with its work item;
+    /// `rewrite` returns whether the shard must be written back. A shard
+    /// written back is first reclaimed below the WAL floor, compacted and
+    /// stripped of tombstones, then flushed under its content bounds — as one
+    /// blob, or several when it outgrew the auto-shard threshold — and
+    /// dropped if the cleanup emptied it. Shards without work, or that
+    /// `rewrite` leaves alone, keep their blobs. Every key of `work` must be
+    /// a btree key of `current_shards`. Records the L1 shard metrics and
+    /// returns the new shard btree, which is empty only when the cleanup
+    /// emptied every rewritten shard and no other shard existed.
+    fn rewrite_shards<'a, L: Loader, T>(
+        loader: &L,
+        ctx: &KsContext,
+        ks: KeySpace,
+        current_shards: &'a BTreeMap<Vec<u8>, IndexShard>,
+        mut work: BTreeMap<&'a [u8], T>,
+        mut rewrite: impl FnMut(&mut IndexTable, T) -> bool,
+    ) -> BTreeMap<Vec<u8>, IndexShard> {
+        // `usize::MAX` when auto-sharding is disabled: a rewrite still
+        // happens but never splits the shard any further.
+        let split_threshold = ctx.config.index_auto_shard_threshold.unwrap_or(usize::MAX);
+        let mut new_shards: BTreeMap<Vec<u8>, IndexShard> = BTreeMap::new();
+        let mut total_bytes: u64 = 0;
+        let mut rewritten: u64 = 0;
+        let mut blobs_written: u64 = 0;
+        let mut split_events: u64 = 0;
+        for (btree_key, shard) in current_shards {
+            let Some(item) = work.remove(btree_key.as_slice()) else {
+                new_shards.insert(btree_key.clone(), shard.clone());
+                continue;
+            };
+            let mut shard_table = loader
+                .load(&ctx.ks_config, shard.position)
+                .expect("Failed to load shard for rewrite");
+            if !rewrite(&mut shard_table, item) {
+                new_shards.insert(btree_key.clone(), shard.clone());
+                continue;
+            }
+            rewritten += 1;
+            // This shard is being rewritten anyway, so it is reclaimed here.
+            // Untouched shards keep their blobs until a later rewrite touches
+            // them.
+            Self::process_l1_blob(loader, ctx, &mut shard_table);
+            if shard_table.is_empty() {
+                // All entries in this shard's range were tombstoned out.
+                continue;
+            }
+            let entries: Vec<(Bytes, WalPosition)> = shard_table.iter().collect();
+            let serialized = ctx
+                .ks_config
+                .index_format()
+                .serialize_index(&shard_table, &ctx.ks_config);
+            let sub_shards = if serialized.len() <= split_threshold {
+                let (min_key, max_key) = shard_bounds(&entries);
+                vec![(min_key, max_key, shard_table)]
+            } else {
+                split_events += 1;
+                let mut sub_shards: Vec<(Vec<u8>, Vec<u8>, IndexTable)> = Vec::new();
+                Self::split_recursive(&entries, &ctx.ks_config, split_threshold, &mut sub_shards);
+                sub_shards
+            };
+            total_bytes += Self::flush_shard_tables(loader, ks, &sub_shards, &mut new_shards);
+            blobs_written += sub_shards.len() as u64;
+        }
+        assert!(
+            work.is_empty(),
+            "every work item must match a current shard btree key",
+        );
+
+        ctx.metrics
+            .l1_bytes_written
+            .with_label_values(&[ctx.name()])
+            .inc_by(total_bytes);
+        ctx.metrics
+            .l1_shard_rewritten_total
+            .with_label_values(&[ctx.name()])
+            .inc_by(rewritten);
+        ctx.metrics
+            .l1_shards_total
+            .with_label_values(&[ctx.name()])
+            .inc_by(blobs_written);
+        ctx.metrics
+            .l1_shard_split_total
+            .with_label_values(&[ctx.name()])
+            .inc_by(split_events);
+        new_shards
+    }
+
+    /// Relocation compare-and-set on a sharded cell. Updates whose key
+    /// `merged_l0` (L0 + overlay) holds apply there: that copy shadows the
+    /// shard copy, the way an L0 copy shadows L1 on an unsharded cell. The
+    /// rest are routed to the shard whose content range covers their key and
+    /// applied shard by shard; a shard with at least one re-pointed key is
+    /// rewritten, the others keep their blobs. Updates for keys no level
+    /// holds are dropped. Returns the level set the caller builds L0 over
+    /// (its own L0 slot, if any, is ignored): `levels` when no shard changed,
+    /// the rewritten shard set otherwise, or an empty set when the cleanup
+    /// emptied every shard.
+    fn apply_relocation_updates_sharded<L: Loader>(
+        loader: &L,
+        ctx: &KsContext,
+        ks: KeySpace,
+        merged_l0: &mut IndexTable,
+        levels: IndexLevels,
+        updates: RelocationUpdates,
+    ) -> IndexLevels {
+        let frontier = updates.last_processed();
+        let mut local = RelocationUpdates::new(frontier);
+        let mut by_shard: BTreeMap<&[u8], RelocationUpdates> = BTreeMap::new();
+        for (key, position) in updates.into_entries() {
+            if merged_l0.contains_key(&key) {
+                local.add(key, position);
+            } else if let Some((min_key, _)) = levels.shard_entry_for(&key) {
+                by_shard
+                    .entry(min_key.as_slice())
+                    .or_insert_with(|| RelocationUpdates::new(frontier))
+                    .add(key, position);
+            }
+        }
+        local.apply(merged_l0);
+        if by_shard.is_empty() {
+            return levels;
+        }
+
+        let new_shards = Self::rewrite_shards(
+            loader,
+            ctx,
+            ks,
+            levels.shards(),
+            by_shard,
+            |shard_table, shard_updates| shard_updates.apply(shard_table),
+        );
+
+        if new_shards.is_empty() {
+            // The cleanup emptied every rewritten shard and there were no
+            // others: the cell is unsharded again, with nothing below L0.
+            return IndexLevels::new();
+        }
+        IndexLevels::sharded(new_shards)
+    }
+
     /// Walks `levels` and reflushes every blob whose position appears in
     /// `relocate_positions` at a fresh WAL position; preserves the rest in
     /// place. Returns new `IndexLevels` with the same shape (sharded vs
@@ -711,8 +827,8 @@ impl IndexFlusherThread {
     /// Used by two call paths:
     /// - Sharded `ForceRelocate` (clean entry): the entire rewrite.
     /// - Flush post-pass: rewrite the blobs the normal merge/promote left
-    ///   in place (e.g. untouched shards under re-sharding, or a stale L1 when
-    ///   the dirty overlay was small enough for the L0-write branch).
+    ///   in place (e.g. untouched shards under re-sharding, or the L1 or
+    ///   shards beneath a flush that took the L0-write branch or wrote no L0).
     fn relocate_in_levels<L: Loader>(
         loader: &L,
         ctx: &KsContext,
@@ -1751,5 +1867,238 @@ mod tests {
         assert_eq!(b_keys.first(), Some(&200));
         assert_eq!(b_keys.last(), Some(&300));
         assert_eq!(b_keys.len(), 101);
+    }
+
+    fn relocation_updates(frontier: u64, entries: &[(u64, u64)]) -> RelocationUpdates {
+        let mut updates = RelocationUpdates::new(frontier);
+        for (k, pos) in entries {
+            updates.add(
+                Bytes::from(k.to_be_bytes().to_vec()),
+                WalPosition::test_value(*pos),
+            );
+        }
+        updates
+    }
+
+    /// Runs a relocation flush over the two-shard cell A [1, 100], B [200, 300]
+    /// (position == key), with `dirty` as the overlay and `updates` routed by
+    /// the flusher. Returns the loader, the seeded shard positions and the
+    /// resulting levels.
+    fn sharded_relocation_flush(
+        ctx: &KsContext,
+        dirty: &[(u64, Option<u64>)],
+        updates: RelocationUpdates,
+    ) -> (RecordingLoader, Vec<WalPosition>, IndexLevels) {
+        let loader = RecordingLoader::new();
+        let (current_levels, positions) = seed_sharded_cell(&loader, &[(1, 100), (200, 300)]);
+        let cmd = flush_command(ctx.id(), build_dirty(dirty), current_levels);
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, ctx, Some(updates), None).unwrap();
+        (loader, positions, new_levels)
+    }
+
+    #[test]
+    fn sharded_relocation_updates_repoint_keys_in_their_shard() {
+        // Shards A [1, 100] and B [200, 300] (position == key); the dirty
+        // overlay holds 50 (also in A) and 400 (in no shard). Updates for 10
+        // (A only), 50 (overlay shadows A), 250 (B only) and 400 (overlay
+        // only): the overlay keys re-point in the new L0, the shard-only keys
+        // in their shard, and the shadowed shard copy of 50 is left alone.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let (loader, positions, new_levels) = sharded_relocation_flush(
+            &ctx,
+            &[(50, Some(5_000)), (400, Some(5_001))],
+            relocation_updates(
+                6_000,
+                &[(10, 10_010), (50, 10_050), (250, 10_250), (400, 10_400)],
+            ),
+        );
+
+        assert!(new_levels.is_sharded());
+        assert_eq!(
+            index_entries(&loader, new_levels.l0().expect("new L0 written")),
+            vec![(50, 10_050), (400, 10_400)]
+        );
+        let a = new_levels.shards().get(&shard_key(1)).unwrap();
+        assert_ne!(a.position, positions[0], "shard A rewritten");
+        assert_eq!(a.max_key, shard_key(100), "shard A bounds unchanged");
+        let a_entries = index_entries(&loader, a.position);
+        assert_eq!(a_entries.len(), 100);
+        assert!(a_entries.contains(&(10, 10_010)));
+        assert!(
+            a_entries.contains(&(50, 50)),
+            "shadowed shard copy untouched"
+        );
+        let b = new_levels.shards().get(&shard_key(200)).unwrap();
+        assert_ne!(b.position, positions[1], "shard B rewritten");
+        let b_entries = index_entries(&loader, b.position);
+        assert_eq!(b_entries.len(), 101);
+        assert!(b_entries.contains(&(250, 10_250)));
+        assert!(b_entries.contains(&(200, 200)));
+        // Shard A, shard B, the new L0.
+        assert_eq!(loader.flush_count(), 3);
+    }
+
+    #[test]
+    fn sharded_relocation_updates_leave_other_shards_in_place() {
+        // Only shard A owns a re-pointed key; B keeps its blob. The update for
+        // 150 sits in the gap between the shards: no level holds it, so it is
+        // dropped.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let (loader, positions, new_levels) = sharded_relocation_flush(
+            &ctx,
+            &[(400, Some(5_001))],
+            relocation_updates(6_000, &[(10, 10_010), (150, 10_150)]),
+        );
+
+        assert_eq!(new_levels.shards().len(), 2);
+        let a = new_levels.shards().get(&shard_key(1)).unwrap();
+        assert_ne!(a.position, positions[0], "shard A rewritten");
+        assert!(index_entries(&loader, a.position).contains(&(10, 10_010)));
+        let b = new_levels.shards().get(&shard_key(200)).unwrap();
+        assert_eq!(b.position, positions[1], "shard B untouched");
+        // Shard A and the new L0.
+        assert_eq!(loader.flush_count(), 2);
+        assert_eq!(
+            ctx.metrics
+                .l1_shard_rewritten_total
+                .with_label_values(&[ctx.name()])
+                .get(),
+            1,
+            "only shard A counts as rewritten"
+        );
+    }
+
+    #[test]
+    fn sharded_relocation_updates_skip_keys_at_or_past_the_frontier() {
+        // The compare-and-set only re-points positions below the relocation
+        // frontier. With the frontier at 5, key 10 (position 10) stays put
+        // and its shard is not rewritten.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let (loader, positions, new_levels) = sharded_relocation_flush(
+            &ctx,
+            &[(400, Some(5_001))],
+            relocation_updates(5, &[(10, 10_010)]),
+        );
+
+        assert_eq!(
+            new_levels.shards().get(&shard_key(1)).unwrap().position,
+            positions[0]
+        );
+        assert_eq!(
+            new_levels.shards().get(&shard_key(200)).unwrap().position,
+            positions[1]
+        );
+        // Only the new L0.
+        assert_eq!(loader.flush_count(), 1);
+        assert_eq!(
+            ctx.metrics
+                .l1_shard_rewritten_total
+                .with_label_values(&[ctx.name()])
+                .get(),
+            0,
+            "a shard the compare-and-set leaves alone is not counted as rewritten"
+        );
+    }
+
+    #[test]
+    fn sharded_relocation_flush_with_nothing_in_l0_writes_no_l0() {
+        // Nothing dirty and no L0 blob: the flush rewrites only the shard
+        // holding the re-pointed key and leaves the cell without an L0 slot
+        // instead of writing an empty blob above the shards.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let (loader, positions, new_levels) =
+            sharded_relocation_flush(&ctx, &[], relocation_updates(5_000, &[(250, 10_250)]));
+
+        assert!(new_levels.is_sharded());
+        assert_eq!(new_levels.l0(), None, "no blob for an empty L0");
+        assert_eq!(
+            new_levels.shards().get(&shard_key(1)).unwrap().position,
+            positions[0]
+        );
+        let b = new_levels.shards().get(&shard_key(200)).unwrap();
+        assert!(index_entries(&loader, b.position).contains(&(250, 10_250)));
+        // Only the rewritten shard.
+        assert_eq!(loader.flush_count(), 1);
+        assert_eq!(
+            ctx.metrics
+                .l1_shards_total
+                .with_label_values(&[ctx.name()])
+                .get(),
+            1,
+            "one shard blob written"
+        );
+    }
+
+    #[test]
+    fn sharded_relocation_flush_with_nothing_to_do_writes_nothing() {
+        // Nothing dirty, no L0 blob, and every update at or past the
+        // frontier: no blob is written and the levels are unchanged.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let (loader, positions, new_levels) =
+            sharded_relocation_flush(&ctx, &[], relocation_updates(5, &[(10, 10_010)]));
+
+        assert_eq!(new_levels.l0(), None);
+        assert_eq!(
+            new_levels.shards().get(&shard_key(1)).unwrap().position,
+            positions[0]
+        );
+        assert_eq!(
+            new_levels.shards().get(&shard_key(200)).unwrap().position,
+            positions[1]
+        );
+        assert_eq!(loader.flush_count(), 0);
+    }
+
+    #[test]
+    fn empty_flush_over_l1_writes_no_l0() {
+        // Nothing to flush above an L1 blob: no L0 blob is written and the
+        // cell keeps its `[INVALID, L1]` shape.
+        let ctx = make_ctx(false, 1024 * 1024);
+        let loader = RecordingLoader::new();
+        let l1_pos = WalPosition::new(500, 64);
+        loader.seed(l1_pos, build_dirty(&[(1, Some(1)), (2, Some(2))]));
+        let cmd = flush_command(
+            ctx.id(),
+            IndexTable::default(),
+            IndexLevels::promoted(l1_pos),
+        );
+
+        let (_orig, new_levels) =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+
+        assert_eq!(new_levels.l0(), None);
+        assert_eq!(new_levels.l1(), Some(l1_pos));
+        assert_eq!(loader.flush_count(), 0);
+    }
+
+    #[test]
+    fn sharded_promote_applies_relocation_updates() {
+        // 65 dirty overwrites in A's range force a re-sharding promote. The
+        // update for key 1 hits its dirty copy; those for 70 (A, not dirty)
+        // and 250 (B) go to their shards before the promote folds the dirty
+        // keys into A.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let dirty: Vec<(u64, Option<u64>)> = (1..=65u64).map(|k| (k, Some(k + 1_000))).collect();
+        let (loader, positions, new_levels) = sharded_relocation_flush(
+            &ctx,
+            &dirty,
+            relocation_updates(6_000, &[(1, 20_001), (70, 20_070), (250, 20_250)]),
+        );
+
+        assert!(new_levels.is_sharded());
+        assert_eq!(new_levels.l0(), None, "promote leaves no L0");
+        let a = new_levels.shards().get(&shard_key(1)).unwrap();
+        let a_entries = index_entries(&loader, a.position);
+        assert_eq!(a_entries.len(), 100);
+        assert!(a_entries.contains(&(1, 20_001)), "dirty copy re-pointed");
+        assert!(a_entries.contains(&(2, 1_002)), "dirty copy kept");
+        assert!(a_entries.contains(&(70, 20_070)), "shard copy re-pointed");
+        assert!(a_entries.contains(&(80, 80)), "untouched shard copy kept");
+        let b = new_levels.shards().get(&shard_key(200)).unwrap();
+        assert_ne!(b.position, positions[1], "shard B rewritten");
+        let b_entries = index_entries(&loader, b.position);
+        assert_eq!(b_entries.len(), 101);
+        assert!(b_entries.contains(&(250, 20_250)));
     }
 }

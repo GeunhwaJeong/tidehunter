@@ -323,11 +323,17 @@ impl IndexLevels {
     /// shard's max, or in a gap between shards). Point-lookup callers use
     /// this to skip on-disk reads for keys that can't be in any shard.
     pub fn shard_for(&self, key: &[u8]) -> Option<&IndexShard> {
-        let (_, shard) = self
+        self.shard_entry_for(key).map(|(_, shard)| shard)
+    }
+
+    /// [`shard_for`] plus the shard's btree key, for callers that group
+    /// work per shard.
+    pub fn shard_entry_for(&self, key: &[u8]) -> Option<(&Vec<u8>, &IndexShard)> {
+        let (min_key, shard) = self
             .shards
             .range::<[u8], _>((Bound::Unbounded, Bound::Included(key)))
             .next_back()?;
-        (shard.max_key.as_slice() >= key).then_some(shard)
+        (shard.max_key.as_slice() >= key).then_some((min_key, shard))
     }
 
     /// Forward-iteration shard picker: the shard holding the smallest

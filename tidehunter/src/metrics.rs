@@ -287,16 +287,19 @@ pub struct Metrics {
     pub l0_bytes_written: MetricIntCounterVec,
     pub l1_bytes_written: MetricIntCounterVec,
     pub promote_total: MetricIntCounterVec,
-    /// Number of L1 shard blobs written by the flusher. Each shard blob
-    /// counts as one increment regardless of whether it came from initial
-    /// sharding or re-sharding.
+    /// Number of L1 shard blobs written by the flusher, one increment per
+    /// blob: initial sharding, re-sharding promotes, relocation
+    /// compare-and-set rewrites, and snapshot forced-relocation reflushes.
     pub l1_shards_total: MetricIntCounterVec,
-    /// Number of times a promote produced more than one L1 shard (i.e.
-    /// auto-sharding kicked in for this cell on this promote). Counts both
-    /// initial-sharding invocations and re-sharding re-split events.
+    /// Number of times a shard write produced more than one L1 shard blob:
+    /// the initial sharding of a promoted L1, and a shard splitting while a
+    /// re-sharding promote or a relocation compare-and-set rewrites it.
     pub l1_shard_split_total: MetricIntCounterVec,
-    /// Number of existing shards rewritten during a re-sharding promote.
-    /// Stays at zero until re-sharding fires.
+    /// Number of existing shards rewritten by the flusher: by a re-sharding
+    /// promote folding L0 keys into them, by a relocation compare-and-set
+    /// re-pointing keys inside them, or by a snapshot forced relocation
+    /// reflushing them out of a low-occupancy index file. Stays at zero
+    /// while no cell is sharded.
     pub l1_shard_rewritten_total: MetricIntCounterVec,
 
     pub relocation_target_position: MetricIntGauge,

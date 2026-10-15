@@ -976,13 +976,23 @@ impl LargeTable {
         let mut overlay = IndexTable::clone(&entry.data);
         overlay.retain_processed(last_processed);
 
-        // Base = the on-disk levels the overlay sits on. Load L1; for an unloaded
-        // cell L0 is still on disk (not folded into `entry.data`), so merge it over
-        // L1. For a loaded cell L0 already lives in `entry.data` (and thus `overlay`).
-        let mut merged = match entry.levels().l1() {
-            Some(l1_pos) => loader.load(&entry.context.ks_config, l1_pos)?,
-            None => IndexTable::default(),
-        };
+        // Base = the on-disk levels the overlay sits on: the L1 blob, or every
+        // shard when auto-sharding split L1. Shards are disjoint and
+        // `iter_below_l0` yields them in key order, so they concatenate into
+        // one flat in linear time. For an unloaded cell L0 is still on disk
+        // (not folded into `entry.data`), so merge it over the base. For a
+        // loaded cell L0 already lives in `entry.data` (and thus `overlay`).
+        //
+        // TODO: this materialises the whole L1 — every shard — in memory, and
+        // under the row lock. A sharded cell is one whose L1 outgrew a
+        // fragment, so a cell with many shards can exhaust memory here;
+        // relocation should walk the shards one at a time instead.
+        let below_l0: Vec<IndexTable> = entry
+            .levels()
+            .iter_below_l0()
+            .map(|pos| loader.load(&entry.context.ks_config, pos))
+            .collect::<Result<_, _>>()?;
+        let mut merged = IndexTable::concat_disjoint_flats(below_l0);
         if entry.as_unloaded_state().is_some()
             && let Some(l0_pos) = entry.levels().l0()
         {
@@ -2268,8 +2278,9 @@ impl LargeTableEntry {
     }
 
     /// Pass 2 helper: queues a force-relocation flush if any populated level lives
-    /// in a low-occupancy file. For dirty entries we issue a normal flush instead —
-    /// the new flush will naturally land past the relocation cutoff.
+    /// in a low-occupancy file. For dirty entries we issue a normal flush carrying
+    /// the flagged positions instead — any L0 it writes lands past the relocation
+    /// cutoff, and its post-pass reflushes the flagged blobs the merge left in place.
     /// No IO is performed — flushes are dispatched asynchronously.
     pub fn request_force_relocate(
         &mut self,
@@ -3887,6 +3898,103 @@ mod tests {
             metrics.entry_state.label_count(),
             2,
             "empty + dirty_loaded after second report"
+        );
+    }
+
+    #[test]
+    fn test_get_index_for_cell_folds_every_shard() {
+        // The relocation as-of view of an unloaded sharded cell must carry
+        // the keys of every shard, with the L0 blob winning on overlap.
+        let key = |k: u64| Bytes::from(k.to_be_bytes().to_vec());
+        let blob = |entries: &[(u64, u64)]| {
+            let mut table = IndexTable::default();
+            for (k, pos) in entries {
+                table.insert(key(*k), WalPosition::test_value(*pos));
+            }
+            // A disk blob deserializes flat-only; mirror that so the as-of
+            // view concatenates the shards instead of folding them.
+            table.promote_to_flat_unconditionally(LastProcessed::new(u64::MAX));
+            table
+        };
+        let shard_a_pos = WalPosition::new(100, 64);
+        let shard_b_pos = WalPosition::new(200, 64);
+        let l0_pos = WalPosition::new(300, 64);
+        // The as-of view only loads tables, so no serialized form is needed.
+        let mut blobs = HashMap::new();
+        blobs.insert(
+            shard_a_pos.offset(),
+            (blob(&[(1, 1), (2, 2), (3, 3)]), Bytes::default()),
+        );
+        blobs.insert(
+            shard_b_pos.offset(),
+            (blob(&[(10, 10), (11, 11), (12, 12)]), Bytes::default()),
+        );
+        blobs.insert(
+            l0_pos.offset(),
+            (blob(&[(2, 500), (20, 501)]), Bytes::default()),
+        );
+        let loader = CountingByPosLoader::new(blobs);
+        let mut shards = BTreeMap::new();
+        shards.insert(
+            1u64.to_be_bytes().to_vec(),
+            IndexShard::new(shard_a_pos, 3u64.to_be_bytes().to_vec()),
+        );
+        shards.insert(
+            10u64.to_be_bytes().to_vec(),
+            IndexShard::new(shard_b_pos, 12u64.to_be_bytes().to_vec()),
+        );
+
+        let config = Config::small();
+        let mut ks = KeyShapeBuilder::new();
+        ks.add_key_space("a", 8, 1, KeyType::uniform(1));
+        let ks = ks.build();
+        let a = crate::key_shape::KeySpaces::from_key_shape(&ks).ks("a");
+        let tmp_dir = tempdir::TempDir::new("test_get_index_for_cell_sharded").unwrap();
+        let wal = Wal::open(
+            tmp_dir.path(),
+            config.wal_layout(WalKind::Replay),
+            Metrics::new(),
+        )
+        .unwrap();
+        let table = LargeTable::from_unloaded(
+            &ks,
+            &LargeTableContainer::new_from_key_shape(&ks, SnapshotEntryData::empty()),
+            Arc::new(config),
+            IndexFlusher::new_unstarted_for_test(),
+            Metrics::new(),
+            wal.as_ref(),
+        );
+        let context = table.ks_context(a);
+        let cell = {
+            let (mut row, cell) = table.row(context, &key(1));
+            let (entry, _) = row.entry_mut(&cell);
+            entry.levels = IndexLevels::sharded_with_l0(l0_pos, shards);
+            entry.state = LargeTableEntryState::Unloaded;
+            cell
+        };
+
+        let index = table
+            .get_index_for_cell(context, &cell, &loader, LastProcessed::new(u64::MAX / 2))
+            .unwrap()
+            .expect("cell exists");
+        let entries: Vec<(u64, u64)> = index
+            .iter()
+            .map(|(k, pos)| {
+                let bytes: [u8; 8] = k.as_ref().try_into().unwrap();
+                (u64::from_be_bytes(bytes), pos.offset())
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                (1, 1),
+                (2, 500),
+                (3, 3),
+                (10, 10),
+                (11, 11),
+                (12, 12),
+                (20, 501)
+            ]
         );
     }
 }

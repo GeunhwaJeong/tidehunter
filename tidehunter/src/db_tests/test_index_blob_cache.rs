@@ -351,9 +351,8 @@ fn test_index_blob_cache_differential() {
 }
 
 /// The same workload on auto-sharded cells, so shard blobs flow through
-/// the cached readers and the explicit drops diff sharded levels. WAL
-/// relocation is left out: relocation updates on sharded cells are not
-/// supported yet.
+/// the cached readers, the explicit drops diff sharded levels, and
+/// relocation re-points shard entries through the sync flush path.
 #[test]
 fn test_index_blob_cache_differential_sharded() {
     run_differential(true);
@@ -492,7 +491,7 @@ fn run_differential(sharded: bool) {
         for db in &dbs {
             db.force_rebuild_control_region().unwrap();
         }
-        if round % 3 == 2 && !sharded {
+        if round % 3 == 2 {
             for db in &dbs {
                 let target = compute_target_position_from_ratio(db, 0.6);
                 db.start_blocking_relocation_with_strategy(RelocationStrategy::IndexBased(target));
@@ -515,7 +514,7 @@ fn run_differential(sharded: bool) {
     for (i, metrics) in metrics.iter().enumerate() {
         for ks_name in ["walk", "lru"] {
             assert!(
-                sharded || metrics.relocation_kept.with_label_values(&[ks_name]).get() > 0,
+                metrics.relocation_kept.with_label_values(&[ks_name]).get() > 0,
                 "db {i}: relocation must have rewritten positions of {ks_name}"
             );
         }
