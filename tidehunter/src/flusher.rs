@@ -177,6 +177,23 @@ fn shard_bounds(entries: &[(Bytes, WalPosition)]) -> (Vec<u8>, Vec<u8>) {
     )
 }
 
+/// What a relocation asks of a flush on top of flushing the cell. Updates
+/// and a cutoff never combine: a cutoff flush that changes nothing returns
+/// without a level set, which would discard shards the updates had
+/// rewritten.
+pub enum RelocationFlush {
+    /// A regular flush, which a clean cell skips; the other variants flush
+    /// a clean cell too.
+    None,
+    /// Re-point the positions relocation copied: each update is a
+    /// compare-and-set on the key's latest position below the frontier.
+    Updates(RelocationUpdates),
+    /// Drop the L0 and overlay entries below this position: relocation-filter
+    /// key spaces reclaim their values instead of copying them, and deeper
+    /// levels shed theirs on their next rewrite.
+    Cutoff(u64),
+}
+
 impl IndexFlusherThread {
     pub fn new(
         db: Weak<Db>,
@@ -210,7 +227,7 @@ impl IndexFlusherThread {
                     let is_relocation =
                         matches!(command.flush_kind, FlushKind::ForceRelocate { .. });
                     if let Some((original_index, new_levels)) =
-                        Self::handle_command(&*db, &command, ks_context, None, None)
+                        Self::handle_command(&*db, &command, ks_context, RelocationFlush::None)
                     {
                         // Failpoint between the flush work and its visible
                         // completion: lets tests pause here to interleave
@@ -241,15 +258,8 @@ impl IndexFlusherThread {
         loader: &L,
         command: &IndexFlushCommand,
         ctx: &KsContext,
-        relocation_updates: Option<RelocationUpdates>,
-        relocation_cutoff: Option<u64>,
+        relocation: RelocationFlush,
     ) -> Option<(Arc<IndexTable>, IndexLevels)> {
-        // A cutoff flush that changes nothing returns early without a level
-        // set, which would discard shards the updates had rewritten.
-        assert!(
-            relocation_updates.is_none() || relocation_cutoff.is_none(),
-            "relocation updates and a relocation cutoff are mutually exclusive"
-        );
         // Sharded ForceRelocate short-circuits before the merge-build
         // path below, which would collapse the shard btree into one blob.
         if let FlushKind::ForceRelocate {
@@ -357,16 +367,19 @@ impl IndexFlusherThread {
         //   the shards that changed (see `apply_relocation_updates_sharded`).
         //   A promote in the same flush rewrites those shards once more; the
         //   duplicate write is acceptable on the relocation path.
-        let current_levels = match relocation_updates {
-            Some(updates) if current_levels.is_sharded() => Self::apply_relocation_updates_sharded(
-                loader,
-                ctx,
-                command.ks,
-                &mut merged_l0,
-                current_levels,
-                updates,
+        let (current_levels, cutoff) = match relocation {
+            RelocationFlush::Updates(updates) if current_levels.is_sharded() => (
+                Self::apply_relocation_updates_sharded(
+                    loader,
+                    ctx,
+                    command.ks,
+                    &mut merged_l0,
+                    current_levels,
+                    updates,
+                ),
+                None,
             ),
-            Some(updates) => {
+            RelocationFlush::Updates(updates) => {
                 if let Some(l1) = current_levels.l1() {
                     let mut combined = loader
                         .load(&ctx.ks_config, l1)
@@ -377,13 +390,14 @@ impl IndexFlusherThread {
                     merged_l0 = combined;
                 }
                 updates.apply(&mut merged_l0);
-                current_levels
+                (current_levels, None)
             }
-            None => current_levels,
+            RelocationFlush::Cutoff(cutoff) => (current_levels, Some(cutoff)),
+            RelocationFlush::None => (current_levels, None),
         };
         let existing_l1 = current_levels.l1();
 
-        match relocation_cutoff {
+        match cutoff {
             Some(cutoff) => {
                 let length = merged_l0.len();
                 merged_l0.retain_above_position(cutoff);
@@ -1149,7 +1163,7 @@ mod tests {
         let dirty = build_table(1000);
         let cmd = flush_command(ctx.id(), dirty, IndexLevels::new());
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
         assert!(!new_levels.is_sharded());
         assert_eq!(new_levels.l0(), None);
         assert!(new_levels.l1().is_some(), "expected promoted [INVALID, L1]");
@@ -1165,7 +1179,7 @@ mod tests {
         let dirty = build_table(200);
         let cmd = flush_command(ctx.id(), dirty, IndexLevels::new());
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
         assert!(!new_levels.is_sharded());
         assert!(new_levels.l1().is_some());
         assert_eq!(loader.flush_count(), 1);
@@ -1186,7 +1200,7 @@ mod tests {
 
         let cmd = flush_command(ctx.id(), dirty, IndexLevels::new());
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
         assert!(new_levels.is_sharded(), "expected sharded IndexLevels");
         assert_eq!(
             new_levels.l1(),
@@ -1333,7 +1347,7 @@ mod tests {
 
         let cmd = flush_command(ctx.id(), dirty, current_levels);
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
 
         assert!(new_levels.is_sharded(), "still sharded after re-sharding");
         assert_eq!(new_levels.shards().len(), 2, "two shards expected");
@@ -1370,7 +1384,7 @@ mod tests {
 
         let cmd = flush_command(ctx.id(), dirty, current_levels);
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
         assert!(new_levels.is_sharded());
         assert_eq!(new_levels.shards().len(), 2);
 
@@ -1401,7 +1415,7 @@ mod tests {
 
         let cmd = flush_command(ctx.id(), dirty, current_levels);
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
         let new_a = new_levels.shards().get(&shard_key(1)).unwrap();
         assert_eq!(
             new_a.max_key,
@@ -1433,7 +1447,7 @@ mod tests {
 
         let cmd = flush_command(ctx.id(), dirty, current_levels);
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
         assert!(new_levels.is_sharded());
         // Started with 2 shards; A got split into multiple, B is untouched.
         assert!(
@@ -1468,7 +1482,7 @@ mod tests {
 
         let cmd = flush_command(ctx.id(), dirty, current_levels);
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
         assert!(
             !new_levels.is_sharded(),
             "empty-shard cell collapses to unsharded",
@@ -1494,7 +1508,7 @@ mod tests {
 
         let cmd = flush_command(ctx.id(), dirty, current_levels);
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
 
         assert!(new_levels.is_sharded(), "shards preserved on L0-only flush");
         assert!(new_levels.l0().is_some(), "new L0 written");
@@ -1536,7 +1550,7 @@ mod tests {
 
         let cmd = force_relocate_command(ctx.id(), current_levels, [pos_a]);
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
 
         assert!(new_levels.is_sharded(), "sharded shape preserved");
         assert_eq!(new_levels.shards().len(), 2);
@@ -1565,7 +1579,7 @@ mod tests {
 
         let cmd = force_relocate_command(ctx.id(), current_levels, [positions[0], positions[1]]);
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
 
         assert!(new_levels.is_sharded());
         assert_eq!(new_levels.shards().len(), 2);
@@ -1595,7 +1609,7 @@ mod tests {
 
         let cmd = force_relocate_command(ctx.id(), levels, [l0_pos]);
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
 
         assert!(new_levels.is_sharded());
         // L0 moved.
@@ -1626,7 +1640,7 @@ mod tests {
         let cmd =
             flush_command_with_relocation(ctx.id(), build_dirty(&dirty), current_levels, [pos_a]);
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
 
         // Shape: sharded with fresh L0.
         assert!(new_levels.is_sharded());
@@ -1657,7 +1671,7 @@ mod tests {
         let cmd =
             flush_command_with_relocation(ctx.id(), build_dirty(&dirty), current_levels, [pos_b]);
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
 
         assert!(new_levels.is_sharded());
         assert_eq!(new_levels.l0(), None, "promote vacated L0");
@@ -1689,7 +1703,7 @@ mod tests {
         let cmd =
             flush_command_with_relocation(ctx.id(), build_dirty(&dirty), current_levels, [l1_pos]);
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
 
         assert!(!new_levels.is_sharded());
         assert!(new_levels.l0().is_some(), "fresh L0 written");
@@ -1725,7 +1739,7 @@ mod tests {
         let cmd = flush_command(ctx.id(), build_dirty(&dirty), IndexLevels::promoted(l1_pos));
 
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
 
         let new_l1 = new_levels.l1().expect("promote writes a new L1");
         let keys: Vec<u64> = index_entries(&loader, new_l1)
@@ -1764,7 +1778,7 @@ mod tests {
         let cmd = flush_command(ctx.id(), build_dirty(&dirty), current_levels);
 
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
 
         let shard_a = new_levels.shards().get(&shard_key(1)).unwrap();
         let keys: Vec<u64> = index_entries(&loader, shard_a.position)
@@ -1807,7 +1821,8 @@ mod tests {
             IndexLevels::promoted(l1_pos),
         );
 
-        let result = IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, Some(200));
+        let result =
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::Cutoff(200));
 
         assert!(result.is_none(), "no overlay entries to rewrite");
         assert_eq!(
@@ -1832,7 +1847,8 @@ mod tests {
         let dirty1: Vec<(u64, Option<u64>)> = (1..=65u64).map(|k| (k, Some(k + 10_000))).collect();
         let cmd1 = flush_command(ctx.id(), build_dirty(&dirty1), current_levels);
         let (_orig, levels_after_1) =
-            IndexFlusherThread::handle_command(&loader, &cmd1, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd1, &ctx, RelocationFlush::None)
+                .unwrap();
         assert!(levels_after_1.is_sharded());
         let pos_b_after_1 = levels_after_1
             .shards()
@@ -1847,7 +1863,8 @@ mod tests {
             (200..=264u64).map(|k| (k, Some(k + 20_000))).collect();
         let cmd2 = flush_command(ctx.id(), build_dirty(&dirty2), levels_after_1.clone());
         let (_orig, levels_after_2) =
-            IndexFlusherThread::handle_command(&loader, &cmd2, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd2, &ctx, RelocationFlush::None)
+                .unwrap();
         assert!(levels_after_2.is_sharded());
         assert_eq!(levels_after_2.shards().len(), 2);
 
@@ -1892,8 +1909,13 @@ mod tests {
         let loader = RecordingLoader::new();
         let (current_levels, positions) = seed_sharded_cell(&loader, &[(1, 100), (200, 300)]);
         let cmd = flush_command(ctx.id(), build_dirty(dirty), current_levels);
-        let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, ctx, Some(updates), None).unwrap();
+        let (_orig, new_levels) = IndexFlusherThread::handle_command(
+            &loader,
+            &cmd,
+            ctx,
+            RelocationFlush::Updates(updates),
+        )
+        .unwrap();
         (loader, positions, new_levels)
     }
 
@@ -2065,7 +2087,7 @@ mod tests {
         );
 
         let (_orig, new_levels) =
-            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, None, None).unwrap();
+            IndexFlusherThread::handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
 
         assert_eq!(new_levels.l0(), None);
         assert_eq!(new_levels.l1(), Some(l1_pos));

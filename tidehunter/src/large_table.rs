@@ -3,7 +3,9 @@ use crate::config::Config;
 use crate::container::LargeTableContainer;
 use crate::context::{KsContext, LookupResult, LookupSource, ReadType};
 use crate::control::RelocateFiles;
-use crate::flusher::{FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread};
+use crate::flusher::{
+    FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread, RelocationFlush,
+};
 use crate::index::index_format::{Direction, IndexFormat, IndexIterCaches};
 use crate::index::index_table::IndexTable;
 use crate::index::levels::{INLINE_LEVELS, IndexLevels};
@@ -15,7 +17,6 @@ use crate::metrics::Metrics;
 use crate::primitives::arc_cow::ArcCow;
 use crate::primitives::range_from_excluding::next_key_in_tree;
 use crate::primitives::sharded_mutex::ShardedMutex;
-use crate::relocation::updates::RelocationUpdates;
 use crate::replay_buffer::{CellReplayBuffer, ReplayBuffer};
 use crate::runtime;
 use crate::wal::WalRandomRead;
@@ -1010,8 +1011,7 @@ impl LargeTable {
         context: &KsContext,
         cell_id: &CellId,
         loader: &L,
-        relocation_updates: Option<RelocationUpdates>,
-        relocation_cutoff: Option<u64>,
+        relocation: RelocationFlush,
     ) -> Result<LevelPositions, L::Error> {
         let mut row = self.lock_cell_waiting_for_flush(context, cell_id);
 
@@ -1023,7 +1023,7 @@ impl LargeTable {
         entry.promote_pending();
 
         let before = entry.level_positions();
-        entry.sync_flush(loader, true, relocation_updates, relocation_cutoff)?;
+        entry.sync_flush(loader, relocation)?;
         Ok(entry.dropped_positions(before))
     }
 
@@ -2415,16 +2415,15 @@ impl LargeTableEntry {
     }
 
     /// Performs a synchronous flush regardless of the config setting.
-    /// If forced_relocation is set, the flush happens even for clean state.
+    /// A flush requested by relocation (`relocation` other than
+    /// `RelocationFlush::None`) happens even for a clean cell.
     /// If unload is false, the in-memory index is kept after the flush (no eviction from cache).
     /// Caller is responsible for checking two things:
     /// * pending_last_processed is None
     fn sync_flush<L: Loader>(
         &mut self,
         loader: &L,
-        forced_relocation: bool,
-        relocation_updates: Option<RelocationUpdates>,
-        relocation_cutoff: Option<u64>,
+        relocation: RelocationFlush,
     ) -> Result<(), L::Error> {
         assert!(
             self.pending_last_processed.is_none(),
@@ -2437,7 +2436,7 @@ impl LargeTableEntry {
         let flush_kind = match self.flush_kind(HashSet::new()) {
             Some(kind) => kind,
             None => {
-                if !forced_relocation {
+                if matches!(relocation, RelocationFlush::None) {
                     return Ok(()); // Not in a flushable state and relocation was not requested
                 }
                 self.maybe_load(loader)?;
@@ -2455,8 +2454,7 @@ impl LargeTableEntry {
             loader,
             &IndexFlushCommand::new(self.context.id(), self.cell.clone(), flush_kind),
             &self.context,
-            relocation_updates,
-            relocation_cutoff,
+            relocation,
         ) else {
             return Ok(());
         };
@@ -2491,7 +2489,7 @@ impl LargeTableEntry {
         }
         if self.pending_last_processed.is_none() {
             if self.context.config.sync_flush {
-                self.sync_flush(loader, false, None, None)?;
+                self.sync_flush(loader, RelocationFlush::None)?;
             } else {
                 // Perform async flush - store the captured value for later
                 self.pending_last_processed = Some(loader.last_processed_wal_position());

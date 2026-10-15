@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::context::{DbOpKind, KsContext, KsContextVec, ReadType, WalEntryKind};
 use crate::control::{ControlRegion, ControlRegionStore, RelocateFiles};
 use crate::crc::IntoBytesFixed;
-use crate::flusher::IndexFlusher;
+use crate::flusher::{IndexFlusher, RelocationFlush};
 use crate::index::index_format::{IndexFormat, IndexIterCaches};
 use crate::index::index_table::IndexTable;
 use crate::index::levels::IndexLevels;
@@ -888,8 +888,7 @@ impl Db {
             context,
             &cell_id,
             self,
-            Some(updates),
-            None,
+            RelocationFlush::Updates(updates),
         )?;
         self.retire_index_blobs(&dropped);
         Ok(())

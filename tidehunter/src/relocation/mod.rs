@@ -1,6 +1,7 @@
 use crate::WalPosition;
 use crate::batch::RelocatedWriteBatch;
 use crate::db::{Db, DbResult, WalEntry};
+use crate::flusher::RelocationFlush;
 use crate::index::index_table::IndexTable;
 use crate::key_shape::KeySpace;
 use crate::metrics::Metrics;
@@ -387,8 +388,7 @@ impl RelocationDriver {
                     db.ks_context(cell.keyspace),
                     &cell.cell_id,
                     db.as_ref(),
-                    None,
-                    Some(terminal_position),
+                    RelocationFlush::Cutoff(terminal_position),
                 )?;
                 db.retire_index_blobs(&dropped);
                 continue;
