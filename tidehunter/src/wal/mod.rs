@@ -346,7 +346,28 @@ impl Wal {
         pos: WalPosition,
         inner_offset: usize,
     ) -> Result<WalRandomRead, WalError> {
-        match self.frame_source(pos, false) {
+        self.reader_at(pos, inner_offset, false)
+    }
+
+    /// Like [`Self::random_reader_at`], for a caller that will read the whole
+    /// frame: a fragment whose pages were not pre-faulted is served through
+    /// the file, so the frame comes in one `pread` instead of a fault per
+    /// page (see `frame_source`).
+    pub fn whole_frame_reader_at(
+        &self,
+        pos: WalPosition,
+        inner_offset: usize,
+    ) -> Result<WalRandomRead, WalError> {
+        self.reader_at(pos, inner_offset, true)
+    }
+
+    fn reader_at(
+        &self,
+        pos: WalPosition,
+        inner_offset: usize,
+        whole_frame: bool,
+    ) -> Result<WalRandomRead, WalError> {
+        match self.frame_source(pos, whole_frame) {
             Some(FrameSource::Mapped(map, offset)) => {
                 let offset = offset as usize;
                 let header_end = offset + CrcFrame::CRC_HEADER_LENGTH;

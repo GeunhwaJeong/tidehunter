@@ -1,7 +1,7 @@
 use crate::cell::{CellId, CellIdBytesContainer};
 use crate::config::Config;
 use crate::container::LargeTableContainer;
-use crate::context::{KsContext, LookupResult, LookupSource, ReadType};
+use crate::context::{KsContext, LookupResult, LookupSource, ReadType, WalEntryKind};
 use crate::control::RelocateFiles;
 use crate::flusher::{
     FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread, RelocationFlush,
@@ -13,6 +13,7 @@ use crate::index::pending_table::{CommittedChange, PendingTable, Transaction};
 use crate::index::utils::{NextEntryResult, merge_levels_next_entry};
 use crate::iterators::IteratorResult;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc, KeyType};
+use crate::lookup::RandomRead;
 use crate::metrics::Metrics;
 use crate::primitives::arc_cow::ArcCow;
 use crate::primitives::range_from_excluding::next_key_in_tree;
@@ -201,6 +202,45 @@ pub(crate) enum PendingBatchOp {
     Remove {
         reduced_key: Bytes,
     },
+}
+
+/// The as-of view of one cell for relocation: every key with the position a
+/// checkpoint pinned at the view's frontier would read. Built under the row
+/// lock, iterated without it. The overlay, filtered to processed positions,
+/// and the L0 blob of an unloaded cell are held in memory; the levels below
+/// L0 — the L1 blob, or every shard — are held as readers, each read, decoded
+/// and released in turn during iteration, so one level at a time is resident.
+pub(crate) struct CellAsOfView {
+    /// The overlay merged over L0; shadows every level below.
+    top: IndexTable,
+    /// Readers over the levels below L0, in key order; the iteration drains
+    /// them.
+    below_l0: Vec<WalRandomRead>,
+}
+
+impl CellAsOfView {
+    /// Every key the view holds with its as-of position, tombstones left
+    /// out: `top` first, then each level below L0 in turn minus the keys
+    /// `top` shadows. Keys are not sorted across levels. The level reads are
+    /// counted against `context`'s key space.
+    pub(crate) fn iter<'a>(
+        &'a mut self,
+        context: &'a KsContext,
+    ) -> impl Iterator<Item = (Bytes, WalPosition)> + 'a {
+        let top = &self.top;
+        let below_l0 = self.below_l0.drain(..).flat_map(move |reader| {
+            let ks = &context.ks_config;
+            let bytes = reader.read(0..reader.len());
+            let read_type = reader.read_type();
+            context.inc_read(WalEntryKind::Index, read_type);
+            context.inc_read_bytes(WalEntryKind::Index, read_type, bytes.len() as u64);
+            ks.index_format()
+                .deserialize_index(ks, bytes)
+                .into_entries()
+                .filter(move |(key, _)| !top.contains_key(key))
+        });
+        top.iter().chain(below_l0)
+    }
 }
 
 impl LargeTable {
@@ -955,13 +995,13 @@ impl LargeTable {
     /// stays unloaded and its overlay untouched. `retain_processed`
     /// touches only `data`; disk-derived levels are merged unfiltered (they are
     /// as-of-safe by the unprocessed-write retention invariant — see `crate::checkpoint`).
-    pub fn get_index_for_cell<L: Loader>(
+    pub(crate) fn get_index_for_cell<L: Loader>(
         &self,
         context: &KsContext,
         cell_id: &CellId,
         loader: &L,
         last_processed: LastProcessed,
-    ) -> Result<Option<Arc<IndexTable>>, L::Error> {
+    ) -> Result<Option<CellAsOfView>, L::Error> {
         let mutex_index = context.ks_config.mutex_for_cell(cell_id);
         let mut row = self.row_by_mutex(context, mutex_index);
 
@@ -977,31 +1017,37 @@ impl LargeTable {
         let mut overlay = IndexTable::clone(&entry.data);
         overlay.retain_processed(last_processed);
 
-        // Base = the on-disk levels the overlay sits on: the L1 blob, or every
-        // shard when auto-sharding split L1. Shards are disjoint and
-        // `iter_below_l0` yields them in key order, so they concatenate into
-        // one flat in linear time. For an unloaded cell L0 is still on disk
-        // (not folded into `entry.data`), so merge it over the base. For a
-        // loaded cell L0 already lives in `entry.data` (and thus `overlay`).
-        //
-        // TODO: this materialises the whole L1 — every shard — in memory, and
-        // under the row lock. A sharded cell is one whose L1 outgrew a
-        // fragment, so a cell with many shards can exhaust memory here;
-        // relocation should walk the shards one at a time instead.
-        let below_l0: Vec<IndexTable> = entry
+        // Top = the overlay over L0. For an unloaded cell L0 is still on disk
+        // (not folded into `entry.data`), so load it and merge the overlay
+        // over it. For a loaded cell L0 already lives in `entry.data` (and
+        // thus `overlay`).
+        let mut top = match entry.levels().l0() {
+            Some(l0_pos) if entry.as_unloaded_state().is_some() => {
+                loader.load(&entry.context.ks_config, l0_pos)?
+            }
+            _ => IndexTable::default(),
+        };
+        top.merge_dirty_and_clean(&overlay);
+
+        // The levels below L0 — the L1 blob, or every shard — are decoded one
+        // at a time while the view is iterated. Their readers are opened
+        // here, under the row lock, for the same reason `get` and the
+        // iterator open theirs: a concurrent flush may replace these blobs
+        // and a later snapshot unlink their file, but an open reader keeps
+        // its blob readable. Like every reader-based path, the reads skip
+        // the frame CRC.
+        let below_l0: Vec<WalRandomRead> = entry
             .levels()
             .iter_below_l0()
-            .map(|pos| loader.load(&entry.context.ks_config, pos))
+            .map(|pos| loader.index_scan_reader(pos))
             .collect::<Result<_, _>>()?;
-        let mut merged = IndexTable::concat_disjoint_flats(below_l0);
-        if entry.as_unloaded_state().is_some()
-            && let Some(l0_pos) = entry.levels().l0()
-        {
-            let l0 = loader.load(&entry.context.ks_config, l0_pos)?;
-            merged.merge_dirty_and_clean(&l0);
-        }
-        merged.merge_dirty_and_clean(&overlay);
-        Ok(Some(Arc::new(merged)))
+        // The view shadows each level only with `top`, which is right because
+        // the levels below L0 are key-disjoint: one L1 blob, or the shards.
+        assert!(
+            below_l0.len() <= 1 || entry.levels().is_sharded(),
+            "levels below L0 must be one L1 blob or the shards"
+        );
+        Ok(Some(CellAsOfView { top, below_l0 }))
     }
 
     /// Returns the blob positions the flush removed from the cell's levels
@@ -1730,6 +1776,15 @@ pub trait Loader {
     fn load(&self, ks: &KeySpaceDesc, position: WalPosition) -> Result<IndexTable, Self::Error>;
 
     fn index_reader(&self, position: WalPosition) -> Result<WalRandomRead, Self::Error>;
+
+    /// Opens the index blob at `position` for a scan that reads it whole,
+    /// once. Unlike [`Self::index_reader`], which serves point lookups and
+    /// may admit the blob into the index blob cache, a scan reader serves a
+    /// resident blob from the cache but never admits one, and reads a cold
+    /// blob as one whole frame.
+    fn index_scan_reader(&self, position: WalPosition) -> Result<WalRandomRead, Self::Error> {
+        self.index_reader(position)
+    }
 
     fn flush_supported(&self) -> bool;
 
@@ -3900,38 +3955,13 @@ mod tests {
     }
 
     #[test]
-    fn test_get_index_for_cell_folds_every_shard() {
+    fn test_get_index_for_cell_view_covers_every_shard() {
         // The relocation as-of view of an unloaded sharded cell must carry
         // the keys of every shard, with the L0 blob winning on overlap.
         let key = |k: u64| Bytes::from(k.to_be_bytes().to_vec());
-        let blob = |entries: &[(u64, u64)]| {
-            let mut table = IndexTable::default();
-            for (k, pos) in entries {
-                table.insert(key(*k), WalPosition::test_value(*pos));
-            }
-            // A disk blob deserializes flat-only; mirror that so the as-of
-            // view concatenates the shards instead of folding them.
-            table.promote_to_flat_unconditionally(LastProcessed::new(u64::MAX));
-            table
-        };
         let shard_a_pos = WalPosition::new(100, 64);
         let shard_b_pos = WalPosition::new(200, 64);
         let l0_pos = WalPosition::new(300, 64);
-        // The as-of view only loads tables, so no serialized form is needed.
-        let mut blobs = HashMap::new();
-        blobs.insert(
-            shard_a_pos.offset(),
-            (blob(&[(1, 1), (2, 2), (3, 3)]), Bytes::default()),
-        );
-        blobs.insert(
-            shard_b_pos.offset(),
-            (blob(&[(10, 10), (11, 11), (12, 12)]), Bytes::default()),
-        );
-        blobs.insert(
-            l0_pos.offset(),
-            (blob(&[(2, 500), (20, 501)]), Bytes::default()),
-        );
-        let loader = CountingByPosLoader::new(blobs);
         let mut shards = BTreeMap::new();
         shards.insert(
             1u64.to_be_bytes().to_vec(),
@@ -3971,17 +4001,42 @@ mod tests {
             cell
         };
 
-        let index = table
+        // The view decodes shards from their serialized form, as from disk,
+        // and loads L0 as a table; the loader serves both.
+        let blob = |entries: &[(u64, u64)]| {
+            let mut table = IndexTable::default();
+            for (k, pos) in entries {
+                table.insert(key(*k), WalPosition::test_value(*pos));
+            }
+            let serialized = context
+                .ks_config
+                .index_format()
+                .clean_serialize_index(&mut table, &context.ks_config);
+            (table, serialized)
+        };
+        let mut blobs = HashMap::new();
+        blobs.insert(shard_a_pos.offset(), blob(&[(1, 1), (2, 2), (3, 3)]));
+        blobs.insert(shard_b_pos.offset(), blob(&[(10, 10), (11, 11), (12, 12)]));
+        blobs.insert(l0_pos.offset(), blob(&[(2, 500), (20, 501)]));
+        let loader = CountingByPosLoader::new(blobs);
+
+        let mut index = table
             .get_index_for_cell(context, &cell, &loader, LastProcessed::new(u64::MAX / 2))
             .unwrap()
             .expect("cell exists");
-        let entries: Vec<(u64, u64)> = index
-            .iter()
+        // Shards are opened as readers, L0 is loaded as a table.
+        assert_eq!(loader.opens_for(shard_a_pos), 1);
+        assert_eq!(loader.opens_for(shard_b_pos), 1);
+        assert_eq!(loader.opens_for(l0_pos), 0);
+        let mut entries: Vec<(u64, u64)> = index
+            .iter(context)
             .map(|(k, pos)| {
                 let bytes: [u8; 8] = k.as_ref().try_into().unwrap();
                 (u64::from_be_bytes(bytes), pos.offset())
             })
             .collect();
+        // Levels are yielded in turn, not merged in key order.
+        entries.sort();
         assert_eq!(
             entries,
             vec![

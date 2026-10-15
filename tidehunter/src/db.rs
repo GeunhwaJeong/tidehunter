@@ -1833,6 +1833,20 @@ impl Loader for Db {
         })
     }
 
+    /// Opens the index blob at `position` for a scan, sourcing it as `load`
+    /// does: from the index blob cache when the blob is resident, with a
+    /// whole-frame read otherwise, and without admitting it into the cache.
+    fn index_scan_reader(&self, position: WalPosition) -> Result<WalRandomRead, Self::Error> {
+        if let Some(cache) = &self.index_blob_cache
+            && let Some(blob) = cache.peek(position)
+        {
+            return Ok(WalRandomRead::Cached(blob));
+        }
+        Ok(self
+            .indexes
+            .whole_frame_reader_at(position, WalEntry::INDEX_PREFIX_SIZE)?)
+    }
+
     fn flush_supported(&self) -> bool {
         true
     }

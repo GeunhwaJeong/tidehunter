@@ -2,7 +2,6 @@ use crate::WalPosition;
 use crate::batch::RelocatedWriteBatch;
 use crate::db::{Db, DbResult, WalEntry};
 use crate::flusher::RelocationFlush;
-use crate::index::index_table::IndexTable;
 use crate::key_shape::KeySpace;
 use crate::metrics::Metrics;
 use crate::relocation::watermark::RelocationWatermarks;
@@ -393,27 +392,27 @@ impl RelocationDriver {
                 db.retire_index_blobs(&dropped);
                 continue;
             }
-            // For keyspaces without relocation filter, relocate entries
-            let batch_limit = db.config.relocation_batch_max_bytes();
-            let mut batch =
-                RelocatedWriteBatch::new(cell.keyspace, cell.cell_id.clone(), target_position);
+            // For keyspaces without relocation filter, relocate entries.
             // Relocate the value as of the checkpoint frontier, not the live
             // latest: a post-frontier overwrite would otherwise strand the
             // as-of value (which GC reclaims) that a held checkpoint reads.
             // `get_index_for_cell` returns that as-of view directly — the overlay
             // is filtered to < `last_processed` before any latest-per-key collapse,
             // and the on-disk levels it merges under are already as-of-safe.
-            let index = db
-                .large_table
-                .get_index_for_cell(
-                    db.ks_context(cell.keyspace),
-                    &cell.cell_id,
-                    db.as_ref(),
-                    last_processed,
-                )?
-                .unwrap_or(IndexTable::default().into());
             let context = db.ks_context(cell.keyspace);
-            for (reduced_key, position) in index.iter() {
+            let Some(mut index) = db.large_table.get_index_for_cell(
+                context,
+                &cell.cell_id,
+                db.as_ref(),
+                last_processed,
+            )?
+            else {
+                continue;
+            };
+            let batch_limit = db.config.relocation_batch_max_bytes();
+            let mut batch =
+                RelocatedWriteBatch::new(cell.keyspace, cell.cell_id.clone(), target_position);
+            for (reduced_key, position) in index.iter(context) {
                 if position.offset() < target_position
                     && let Some((key, value)) =
                         db.read_record_for_indexed_key(context, position, reduced_key.as_ref())?
@@ -482,7 +481,7 @@ impl RelocationDriver {
 
         // Phase A: Get shared reference to cell index, as of the relocation
         // frontier (filters the overlay before any latest-per-key collapse).
-        let index = match db.large_table.get_index_for_cell(
+        let mut index = match db.large_table.get_index_for_cell(
             db.ks_context(cell_ref.keyspace),
             &cell_ref.cell_id,
             db.as_ref(),
@@ -515,7 +514,7 @@ impl RelocationDriver {
         // (see the WAL-based path for why). `get_index_for_cell` already returns
         // the as-of view; the loop below skips any on-disk entry still at >= the
         // cutoff.
-        for (key, position) in index.iter() {
+        for (key, position) in index.iter(ks_context) {
             if position.offset() >= effective_limit {
                 continue;
             }
