@@ -81,15 +81,18 @@ pub struct Config {
     /// instance at the same path to fully close before giving up.
     #[serde(default = "default_open_lock_retry_timeout")]
     pub open_lock_retry_timeout: Duration,
-    /// Opt-in to per-cell L1 auto-sharding. `Some(threshold)` means the
-    /// flusher splits a cell's L1 across multiple WAL blobs (one per key
-    /// range) whenever the promoted index's serialized size exceeds
-    /// `threshold` bytes. `None` (default) disables auto-sharding entirely;
-    /// behavior is identical to a database written without the feature.
-    /// Set via [`Config::with_index_auto_sharding`] (uses `frag_size / 2`)
-    /// or [`Config::with_index_auto_shard_threshold`] for an explicit
-    /// value. `Db::open` re-validates the value against the WAL fragment
-    /// ceiling, so a struct-literal bypass of the builders is still caught.
+    /// Per-cell L1 auto-sharding: the flusher splits a cell's L1 across
+    /// multiple WAL blobs (one per key range) whenever the promoted index's
+    /// serialized size exceeds the threshold. `None` (default) uses
+    /// `frag_size / 2`; `Some(usize::MAX)` disables auto-sharding, so a
+    /// cell's L1 is always one blob; any other `Some(threshold)` is an
+    /// explicit byte threshold. Set via
+    /// [`Config::with_index_auto_shard_threshold`],
+    /// [`Config::with_index_auto_sharding`] or
+    /// [`Config::disable_index_auto_sharding`]; read via
+    /// [`Config::auto_shard_threshold`]. `Db::open` re-validates the value
+    /// against the WAL fragment ceiling, so a struct-literal bypass of the
+    /// builders is still caught.
     #[serde(default)]
     pub index_auto_shard_threshold: Option<usize>,
     /// Opt-in: pack each committed `WriteBatch` into a single compressed WAL
@@ -233,21 +236,34 @@ impl Config {
         self.frag_size
     }
 
-    /// Enable auto-sharding with an explicit per-shard byte threshold. The
+    /// Sets an explicit per-shard byte threshold for auto-sharding: the
     /// flusher splits a promoted L1 when its serialized size exceeds
-    /// `threshold`. Panics if `threshold` cannot fit in a single WAL
-    /// fragment (the resulting frame would overflow `frag_size`).
+    /// `threshold`. `usize::MAX` disables auto-sharding. Panics if any other
+    /// `threshold` is zero or cannot fit in a single WAL fragment (the
+    /// resulting frame would overflow `frag_size`).
     pub fn with_index_auto_shard_threshold(&mut self, threshold: usize) {
         self.index_auto_shard_threshold = Some(threshold);
         self.validate();
     }
 
-    /// Enable auto-sharding with the default `frag_size / 2` threshold —
+    /// Restores the default auto-sharding threshold, `frag_size / 2` —
     /// half the fragment leaves comfortable room for WAL framing and
     /// alignment so each shard's frame stays well under the ceiling.
     pub fn with_index_auto_sharding(&mut self) {
-        let half = (self.frag_size / 2) as usize;
-        self.with_index_auto_shard_threshold(half);
+        self.index_auto_shard_threshold = None;
+    }
+
+    /// Disables auto-sharding: a cell's L1 is always written as one blob,
+    /// however large it grows.
+    pub fn disable_index_auto_sharding(&mut self) {
+        self.index_auto_shard_threshold = Some(usize::MAX);
+    }
+
+    /// The per-shard byte threshold auto-sharding splits at; `usize::MAX`
+    /// when auto-sharding is disabled, so no blob ever exceeds it.
+    pub fn auto_shard_threshold(&self) -> usize {
+        self.index_auto_shard_threshold
+            .unwrap_or((self.frag_size / 2) as usize)
     }
 
     /// Panics if any field holds a value that violates a cross-field
@@ -278,9 +294,14 @@ impl Config {
                 self.index_blob_cache_min_bytes,
             );
         }
-        let Some(threshold) = self.index_auto_shard_threshold else {
-            return;
-        };
+        let threshold = self.auto_shard_threshold();
+        if threshold == usize::MAX {
+            return; // auto-sharding disabled
+        }
+        assert!(
+            threshold > 0,
+            "index_auto_shard_threshold must be positive; usize::MAX disables auto-sharding"
+        );
         // Largest serialized index blob that still fits in one WAL fragment,
         // after CRC frame header, WAL entry prefix, and worst-case alignment.
         let alignment = if self.direct_io { 512 } else { 8 };
@@ -385,5 +406,33 @@ mod tests {
         let mut config = Config::small();
         config.index_blob_cache_bytes = Some(default_index_blob_cache_min_bytes());
         config.validate();
+    }
+
+    #[test]
+    fn auto_shard_threshold_defaults_to_half_a_fragment() {
+        let mut config = Config::small();
+        let half = (config.frag_size / 2) as usize;
+        assert_eq!(config.auto_shard_threshold(), half);
+        config.with_index_auto_shard_threshold(4096);
+        assert_eq!(config.auto_shard_threshold(), 4096);
+        config.with_index_auto_sharding();
+        assert_eq!(config.auto_shard_threshold(), half);
+        config.disable_index_auto_sharding();
+        assert_eq!(config.auto_shard_threshold(), usize::MAX);
+        config.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the WAL fragment ceiling")]
+    fn validate_rejects_auto_shard_threshold_above_fragment() {
+        let mut config = Config::small();
+        config.with_index_auto_shard_threshold(config.frag_size as usize);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be positive")]
+    fn validate_rejects_zero_auto_shard_threshold() {
+        let mut config = Config::small();
+        config.with_index_auto_shard_threshold(0);
     }
 }

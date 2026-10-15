@@ -543,25 +543,24 @@ impl IndexFlusherThread {
         }
     }
 
-    /// Writes the freshly-promoted L1 image. When auto-sharding is enabled
-    /// and the serialized blob exceeds the shard-split threshold, splits
-    /// in-memory and flushes one blob per shard. The split is a pure
-    /// in-memory partition of `new_l1` — no further shards are loaded
-    /// from disk.
+    /// Writes the freshly-promoted L1 image. When the serialized blob
+    /// exceeds the auto-shard threshold (which it never does with
+    /// auto-sharding disabled), splits in-memory and flushes one blob per
+    /// shard. The split is a pure in-memory partition of `new_l1` — no
+    /// further shards are loaded from disk.
     fn write_promoted_l1<L: Loader>(
         loader: &L,
         ctx: &KsContext,
         ks: KeySpace,
         new_l1: IndexTable,
     ) -> IndexLevels {
-        if let Some(threshold) = ctx.config.index_auto_shard_threshold {
-            let serialized = ctx
-                .ks_config
-                .index_format()
-                .serialize_index(&new_l1, &ctx.ks_config);
-            if serialized.len() > threshold {
-                return Self::flush_split_l1(loader, ctx, ks, new_l1, threshold);
-            }
+        let threshold = ctx.config.auto_shard_threshold();
+        let serialized = ctx
+            .ks_config
+            .index_format()
+            .serialize_index(&new_l1, &ctx.ks_config);
+        if serialized.len() > threshold {
+            return Self::flush_split_l1(loader, ctx, ks, new_l1, threshold);
         }
         let pos = loader.flush(ks, &new_l1).expect("Failed to flush index");
         ctx.metrics
@@ -710,9 +709,9 @@ impl IndexFlusherThread {
         mut work: BTreeMap<&'a [u8], T>,
         mut rewrite: impl FnMut(&mut IndexTable, T) -> bool,
     ) -> BTreeMap<Vec<u8>, IndexShard> {
-        // `usize::MAX` when auto-sharding is disabled: a rewrite still
-        // happens but never splits the shard any further.
-        let split_threshold = ctx.config.index_auto_shard_threshold.unwrap_or(usize::MAX);
+        // `usize::MAX` when auto-sharding is disabled, so a rewrite never
+        // splits the shard.
+        let split_threshold = ctx.config.auto_shard_threshold();
         let mut new_shards: BTreeMap<Vec<u8>, IndexShard> = BTreeMap::new();
         let mut total_bytes: u64 = 0;
         let mut rewritten: u64 = 0;
@@ -1097,8 +1096,8 @@ mod tests {
         let mut config = Config::small();
         config.frag_size = frag_size;
         config.l0_max_entries = Some(64);
-        if auto_sharding {
-            config.with_index_auto_sharding();
+        if !auto_sharding {
+            config.disable_index_auto_sharding();
         }
         let shape =
             KeyShape::new_single_config(8, 1, KeyType::uniform(8), KeySpaceConfig::default());
@@ -1193,10 +1192,7 @@ mod tests {
         let loader = RecordingLoader::new();
         let dirty = build_table(1000);
         // Sanity: serialized size > the shard-split budget.
-        assert!(
-            serialized_size(&ctx.ks_config, &dirty)
-                > ctx.config.index_auto_shard_threshold.unwrap()
-        );
+        assert!(serialized_size(&ctx.ks_config, &dirty) > ctx.config.auto_shard_threshold());
 
         let cmd = flush_command(ctx.id(), dirty, IndexLevels::new());
         let (_orig, new_levels) =
@@ -1232,7 +1228,7 @@ mod tests {
 
         // Re-run split_recursive directly to confirm every shard fits
         // the budget — the on-disk shape the WAL layer accepts.
-        let threshold = ctx.config.index_auto_shard_threshold.unwrap();
+        let threshold = ctx.config.auto_shard_threshold();
         let entries: Vec<(Bytes, WalPosition)> = build_table(1000).iter().collect();
         let mut shard_tables: Vec<(Vec<u8>, Vec<u8>, IndexTable)> = Vec::new();
         IndexFlusherThread::split_recursive(&entries, &ctx.ks_config, threshold, &mut shard_tables);
