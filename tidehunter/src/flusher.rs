@@ -1103,7 +1103,12 @@ mod tests {
             KeyShape::new_single_config(8, 1, KeyType::uniform(8), KeySpaceConfig::default());
         let ks_id = KeySpace::first();
         let ks = shape.ks(ks_id).clone();
-        KsContext::new(Arc::new(config), ks, Metrics::new())
+        KsContext::new(
+            Arc::new(config),
+            ks,
+            Metrics::new(),
+            crate::wal::tracker::SharedLastProcessed::default(),
+        )
     }
 
     fn build_table(n: usize) -> IndexTable {

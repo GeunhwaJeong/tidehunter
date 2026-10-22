@@ -34,7 +34,7 @@ use layout::WalLayout;
 use mapper::{INITIAL_MAPS_BUFFER, WalMapper};
 use position::{LastProcessed, MapId, WalPosition};
 use syncer::WalSyncer;
-use tracker::{WalGuard, WalTracker, WalTrackerLatch};
+use tracker::{SharedLastProcessed, WalGuard, WalTracker, WalTrackerLatch};
 
 pub struct WalWriter {
     wal: Arc<Wal>,
@@ -749,6 +749,17 @@ impl WalIterator {
     }
 
     pub fn into_writer(self, position_override: Option<u64>) -> WalWriter {
+        self.into_writer_with_last_processed(position_override, SharedLastProcessed::default())
+    }
+
+    /// Like [`Self::into_writer`], but the tracker publishes its externally
+    /// observed `last_processed` into `last_processed`, so the caller can
+    /// hand that handle to readers built before the writer exists.
+    pub fn into_writer_with_last_processed(
+        self,
+        position_override: Option<u64>,
+        last_processed: SharedLastProcessed,
+    ) -> WalWriter {
         assert!(
             self.for_writer,
             "into_writer called on a scan-mode WalIterator — construct via wal_iterator_for_writer"
@@ -784,6 +795,7 @@ impl WalIterator {
             mapper,
             LastProcessed::new(position),
             self.wal.metrics.clone(),
+            last_processed,
         );
         let allocator = WalAllocator::new(self.wal.layout.clone(), position);
         WalWriter {

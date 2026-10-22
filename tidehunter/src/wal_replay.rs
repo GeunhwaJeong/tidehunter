@@ -35,6 +35,7 @@ use crate::key_shape::KeyShape;
 use crate::large_table::LargeTable;
 use crate::metrics::Metrics;
 use crate::replay_buffer::ReplayBuffer;
+use crate::wal::tracker::SharedLastProcessed;
 use crate::wal::{WalError, WalIterator, WalWriter};
 
 pub(crate) fn replay_wal(
@@ -43,6 +44,7 @@ pub(crate) fn replay_wal(
     key_shape: &KeyShape,
     mut wal_iterator: WalIterator,
     metrics: &Metrics,
+    last_processed: SharedLastProcessed,
 ) -> DbResult<WalWriter> {
     let mut buffer = ReplayBuffer::new(key_shape);
     // Number of records still expected inside the currently-open
@@ -56,7 +58,8 @@ pub(crate) fn replay_wal(
     let writer = loop {
         let entry = wal_iterator.next();
         if matches!(entry, Err(WalError::Crc(_) | WalError::EndOfWal)) {
-            break wal_iterator.into_writer(batch_start_position);
+            break wal_iterator
+                .into_writer_with_last_processed(batch_start_position, last_processed);
         }
         let (position, raw_entry) = entry?;
         let entry = WalEntry::from_bytes(raw_entry);

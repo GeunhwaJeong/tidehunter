@@ -27,10 +27,27 @@ use std::thread;
 /// This is an essential property to avoid race conditions with an asynchronous flush
 /// and the snapshot process,
 /// and this is what allows us not to hold large table mutex when writing to the wal.
+/// The externally observed `last_processed` position. The tracker is its
+/// only writer; it is read through [`WalTracker::last_processed`] or by
+/// whoever else holds a clone (`KsContext::last_processed_wal_position`).
+/// Reads as 0 until the tracker starts.
+#[derive(Clone, Default)]
+pub struct SharedLastProcessed(Arc<AtomicU64>);
+
+impl SharedLastProcessed {
+    pub fn get(&self) -> LastProcessed {
+        LastProcessed::new(self.0.load(Ordering::SeqCst))
+    }
+
+    fn set(&self, value: LastProcessed) {
+        self.0.store(value.as_u64(), Ordering::SeqCst);
+    }
+}
+
 pub struct WalTracker {
     jh: Option<thread::JoinHandle<()>>,
     sender: Option<mpsc::Sender<WalTrackerMessage>>,
-    last_processed: Arc<AtomicU64>,
+    last_processed: SharedLastProcessed,
     mapper: Arc<WalMapper>,
     /// Test hook: latch requests handed to the tracker thread, counted right
     /// after each request is sent. Lets a test order a latch request ahead
@@ -72,9 +89,10 @@ pub struct WalTrackerLatch {
 
 struct WalTrackerThread {
     receiver: mpsc::Receiver<WalTrackerMessage>,
-    /// Externally observed `last_processed`, read by [`WalTracker::last_processed`].
+    /// Externally observed `last_processed`, read by [`WalTracker::last_processed`]
+    /// and by whoever else holds the shared handle.
     /// Capped by active latches; equals the internal value when no latch is held.
-    last_processed: Arc<AtomicU64>,
+    last_processed: SharedLastProcessed,
     state: WalTrackerState,
     /// Active latches keyed by `(captured position, id)`. The first element
     /// gives the minimum latched position that caps the external value.
@@ -131,14 +149,17 @@ enum WalTrackerMessage {
 }
 
 impl WalTracker {
+    /// `shared` is where the tracker publishes its externally observed
+    /// `last_processed`; it starts at `last_processed`.
     pub fn start(
         layout: WalLayout,
         mapper: WalMapper,
         last_processed: LastProcessed,
         metrics: Arc<Metrics>,
+        shared: SharedLastProcessed,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
-        let atomic_last_processed = Arc::new(AtomicU64::new(last_processed.as_u64()));
+        shared.set(last_processed);
         let mapper = Arc::new(mapper);
         let kind = layout.kind.name();
         let metric_external = metrics
@@ -151,7 +172,7 @@ impl WalTracker {
         let thread = WalTrackerThread {
             receiver,
             state: WalTrackerState::new_empty(last_processed),
-            last_processed: atomic_last_processed.clone(),
+            last_processed: shared.clone(),
             latches: BTreeSet::new(),
             next_latch_id: 0,
             pending_requests: Vec::new(),
@@ -169,7 +190,7 @@ impl WalTracker {
         Self {
             jh: Some(jh),
             sender: Some(sender),
-            last_processed: atomic_last_processed,
+            last_processed: shared,
             mapper,
             #[cfg(any(test, feature = "test-utils"))]
             latch_requests_sent: AtomicU64::new(0),
@@ -194,7 +215,7 @@ impl WalTracker {
     }
 
     pub fn last_processed(&self) -> LastProcessed {
-        LastProcessed::new(self.last_processed.load(Ordering::SeqCst))
+        self.last_processed.get()
     }
 
     /// Acquires a latch that pins the externally observed `last_processed`.
@@ -400,8 +421,7 @@ impl WalTrackerThread {
             .latches
             .first()
             .map_or(internal, |(min_position, _)| internal.min(*min_position));
-        self.last_processed
-            .store(external.as_u64(), Ordering::SeqCst);
+        self.last_processed.set(external);
         self.metric_external.set(external.as_u64() as i64);
         self.metric_internal.set(internal.as_u64() as i64);
         self.metric_active_latches.set(self.latches.len() as i64);
@@ -546,6 +566,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            SharedLastProcessed::default(),
         );
         let guard1 = tracker.allocated(a.clone());
         let guard2 = tracker.allocated(b.clone());
@@ -558,6 +579,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            SharedLastProcessed::default(),
         );
         let guard1 = tracker.allocated(a.clone());
         let guard3 = tracker.allocated(c.clone());
@@ -569,6 +591,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            SharedLastProcessed::default(),
         );
         let guard3 = tracker.allocated(c.clone());
         let guard2 = tracker.allocated(b.clone());
@@ -602,6 +625,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            SharedLastProcessed::default(),
         );
         assert_eq!(tracker.last_processed().as_u64(), 0);
 
@@ -627,6 +651,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            SharedLastProcessed::default(),
         );
 
         // Process `a`: internal and external advance to a.next_position().
@@ -664,6 +689,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            SharedLastProcessed::default(),
         );
 
         // internal -> a.next_position(); take the older latch l0 here.
@@ -713,6 +739,7 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
+            SharedLastProcessed::default(),
         );
 
         // Process `a`, then deliver `c` out of order so it sits in `pending`

@@ -2,7 +2,8 @@ use crate::config::Config;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc};
 use crate::large_table::GetResult;
 use crate::metrics::{MetricHistogram, MetricIntCounter, MetricIntGauge, Metrics, TimerExt};
-use crate::wal::position::WalPosition;
+use crate::wal::position::{LastProcessed, WalPosition};
+use crate::wal::tracker::SharedLastProcessed;
 use std::array;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -21,6 +22,8 @@ pub struct KsContextInner {
     pub config: Arc<Config>,
     pub ks_config: KeySpaceDesc,
     pub metrics: Arc<Metrics>,
+    /// Externally observed WAL `last_processed`, published by the tracker.
+    pub last_processed: SharedLastProcessed,
     pub loaded_key_bytes: MetricIntGauge,
     pub flat_index_bytes: MetricIntGauge,
     pub dirty_keys: MetricIntGauge,
@@ -122,7 +125,12 @@ pub enum ReadType {
 }
 
 impl KsContext {
-    pub fn new(config: Arc<Config>, ks_config: KeySpaceDesc, metrics: Arc<Metrics>) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        ks_config: KeySpaceDesc,
+        metrics: Arc<Metrics>,
+        last_processed: SharedLastProcessed,
+    ) -> Self {
         let ks_name = ks_config.name();
         let loaded_key_bytes = metrics.loaded_key_bytes.with_label_values(&[ks_name]);
         let flat_index_bytes = metrics.flat_index_bytes.with_label_values(&[ks_name]);
@@ -193,6 +201,7 @@ impl KsContext {
             config,
             ks_config,
             metrics,
+            last_processed,
             loaded_key_bytes,
             flat_index_bytes,
             dirty_keys,
@@ -213,6 +222,14 @@ impl KsContext {
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// The externally observed WAL `last_processed` position: every write
+    /// below it has been applied to the in-memory index. Same value as
+    /// `Loader::last_processed_wal_position` on the `Db`, readable without
+    /// a loader.
+    pub fn last_processed_wal_position(&self) -> LastProcessed {
+        self.inner.last_processed.get()
     }
 
     pub fn db_op_timer(&self, op: DbOpKind) -> impl Drop {
@@ -305,10 +322,22 @@ impl Deref for KsContext {
 }
 
 impl KsContextVec {
-    pub fn new(key_shape: &KeyShape, config: Arc<Config>, metrics: Arc<Metrics>) -> Self {
+    pub fn new(
+        key_shape: &KeyShape,
+        config: Arc<Config>,
+        metrics: Arc<Metrics>,
+        last_processed: SharedLastProcessed,
+    ) -> Self {
         let contexts = key_shape
             .iter_ks()
-            .map(|ks_desc| KsContext::new(config.clone(), ks_desc.clone(), metrics.clone()))
+            .map(|ks_desc| {
+                KsContext::new(
+                    config.clone(),
+                    ks_desc.clone(),
+                    metrics.clone(),
+                    last_processed.clone(),
+                )
+            })
             .collect();
 
         Self { contexts }

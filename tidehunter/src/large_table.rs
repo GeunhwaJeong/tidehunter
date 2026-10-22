@@ -23,7 +23,7 @@ use crate::runtime;
 use crate::wal::WalRandomRead;
 use crate::wal::layout::WalLayout;
 use crate::wal::position::{LastProcessed, WalFileId, WalPosition};
-use crate::wal::tracker::WalGuard;
+use crate::wal::tracker::{SharedLastProcessed, WalGuard};
 use fastbloom::BloomFilter;
 use lru::LruCache;
 use minibytes::Bytes;
@@ -250,6 +250,7 @@ impl LargeTable {
         config: Arc<Config>,
         flusher: IndexFlusher,
         metrics: Arc<Metrics>,
+        last_processed: SharedLastProcessed,
         loader: &L,
     ) -> Self {
         assert_eq!(
@@ -277,7 +278,12 @@ impl LargeTable {
                     } else {
                         ks_cells
                     };
-                    let context = KsContext::new(config.clone(), ks.clone(), metrics.clone());
+                    let context = KsContext::new(
+                        config.clone(),
+                        ks.clone(),
+                        metrics.clone(),
+                        last_processed.clone(),
+                    );
                     let bloom_filter_start = Instant::now();
                     let num_mutexes = ks.num_mutexes();
 
@@ -3035,6 +3041,7 @@ mod tests {
             Arc::new(config),
             IndexFlusher::new_unstarted_for_test(),
             Metrics::new(),
+            SharedLastProcessed::default(),
             wal.as_ref(),
         );
         let (mut row, cell) = l.row(l.ks_context(a), &[]);
@@ -3060,7 +3067,12 @@ mod tests {
         let ks_id = KeySpace::first();
 
         let ks = shape.ks(ks_id);
-        let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
+        let context = KsContext::new(
+            Arc::new(Config::small()),
+            ks.clone(),
+            metrics.clone(),
+            SharedLastProcessed::default(),
+        );
 
         // A cell ID to use in our tests
         let cell_id = CellId::Integer(0);
@@ -3395,7 +3407,12 @@ mod tests {
         let shape = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
         let ks_id = KeySpace::first();
         let ks = shape.ks(ks_id);
-        let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
+        let context = KsContext::new(
+            Arc::new(Config::small()),
+            ks.clone(),
+            metrics.clone(),
+            SharedLastProcessed::default(),
+        );
         let cell_id = CellId::Integer(0);
 
         // Three-shard btree. Ranges are tight `[min, max]` content extents:
@@ -3621,7 +3638,12 @@ mod tests {
         let shape = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
         let ks_id = KeySpace::first();
         let ks = shape.ks(ks_id);
-        let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
+        let context = KsContext::new(
+            Arc::new(Config::small()),
+            ks.clone(),
+            metrics.clone(),
+            SharedLastProcessed::default(),
+        );
         let cell_id = CellId::Integer(0);
 
         let (loader, mut row, pos_a, pos_b) = make_two_shard_cell(context, ks, cell_id.clone());
@@ -3678,7 +3700,12 @@ mod tests {
         let shape = KeyShape::new_single_config(8, 1, KeyType::uniform(1), config);
         let ks_id = KeySpace::first();
         let ks = shape.ks(ks_id);
-        let context = KsContext::new(Arc::new(Config::small()), ks.clone(), metrics.clone());
+        let context = KsContext::new(
+            Arc::new(Config::small()),
+            ks.clone(),
+            metrics.clone(),
+            SharedLastProcessed::default(),
+        );
         let cell_id = CellId::Integer(0);
 
         let (loader, mut row, pos_a, pos_b) = make_two_shard_cell(context, ks, cell_id.clone());
@@ -3746,6 +3773,7 @@ mod tests {
             config.clone(),
             IndexFlusher::new_unstarted_for_test(),
             Metrics::new(),
+            SharedLastProcessed::default(),
             wal.as_ref(),
         );
 
@@ -3884,6 +3912,7 @@ mod tests {
             config.clone(),
             IndexFlusher::new_unstarted_for_test(),
             Arc::clone(&metrics),
+            SharedLastProcessed::default(),
             wal.as_ref(),
         );
 
@@ -3965,6 +3994,7 @@ mod tests {
             Arc::new(config),
             IndexFlusher::new_unstarted_for_test(),
             Metrics::new(),
+            SharedLastProcessed::default(),
             wal.as_ref(),
         );
         let context = table.ks_context(a);

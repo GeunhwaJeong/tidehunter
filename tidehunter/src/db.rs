@@ -26,7 +26,7 @@ use crate::relocation::{RelocationCommand, RelocationDriver, RelocationStrategy,
 use crate::state_snapshot;
 use crate::wal::layout::WalKind;
 use crate::wal::position::{LastProcessed, WalFileId, WalPosition};
-use crate::wal::tracker::WalGuard;
+use crate::wal::tracker::{SharedLastProcessed, WalGuard};
 use crate::wal::{PreparedWalWrite, Wal, WalError, WalRandomRead, WalWriter};
 use bytes::{Buf, BufMut, BytesMut};
 use minibytes::Bytes;
@@ -109,15 +109,25 @@ impl Db {
 
         let flusher = IndexFlusher::new(flusher_senders, metrics.clone());
         let relocator = Relocator(relocator_sender);
+        // The WAL tracker, started by `replay_wal`, publishes its externally
+        // observed `last_processed` into this handle; the key space contexts
+        // built before it read the handle.
+        let last_processed = SharedLastProcessed::default();
         let large_table = LargeTable::from_unloaded(
             &key_shape,
             control_region.snapshot(),
             config.clone(),
             flusher,
             metrics.clone(),
+            last_processed.clone(),
             indexes.as_ref(),
         );
-        let contexts = KsContextVec::new(&key_shape, config.clone(), metrics.clone());
+        let contexts = KsContextVec::new(
+            &key_shape,
+            config.clone(),
+            metrics.clone(),
+            last_processed.clone(),
+        );
         let wal_iterator = wal.wal_iterator_for_writer(control_region.last_position())?;
         let wal_writer = crate::wal_replay::replay_wal(
             &contexts,
@@ -125,6 +135,7 @@ impl Db {
             &key_shape,
             wal_iterator,
             &metrics,
+            last_processed,
         )?;
         let last_index_position = control_region.last_index_wal_position();
         // Restore the mapped window over the fragments holding live index
