@@ -536,4 +536,119 @@ mod tests {
             "checkpoint read of an absent key should be filtered by the bloom"
         );
     }
+
+    /// A write applied after a newer write to the same key (`WriteOrder::Stale`
+    /// in `IndexTable::checked_insert`) is the key's as-of value for
+    /// every frontier between its own position and the newer one, so it must
+    /// be recorded behind the newer position rather than dropped.
+    ///
+    /// W1 (`a = v1`, offset p1) and W2 (`b` removed, offset p2) are parked
+    /// before taking their row locks, so the tracker frontier cannot pass p1.
+    /// A checkpoint is requested behind them: its latch position L covers
+    /// p1 and p2 but not the batch write `a = v3` (offset p3) issued after the
+    /// request. The batch commits and is promoted first, so W1 is stale when
+    /// it applies. The checkpoint at L (p1 < L <= p3) must read `a = v1`
+    /// while the live read returns `v3`.
+    #[test]
+    fn test_checkpoint_sees_stale_write_behind_later_write() {
+        use crate::failpoints::FailPoint;
+        use crate::latch::Latch;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempdir::TempDir::new("test-checkpoint-stale-write").unwrap();
+        let config = Arc::new(Config::small());
+        let key_shape = KeyShape::new_single(8, 16, KeyType::uniform(16));
+        let metrics = Metrics::new();
+        let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+        let ks = db.single_ks();
+
+        let key_a = 42u64.to_be_bytes().to_vec();
+        let key_b = 43u64.to_be_bytes().to_vec();
+        let v1: Bytes = vec![1u8].into();
+        let v3: Bytes = vec![3u8].into();
+
+        // Park W1 (insert) and W2 (remove) after their WAL allocation, before
+        // the row lock: both hold their WAL guards, pinning the frontier at p1.
+        let (insert_latch, insert_guard) = Latch::new();
+        let (remove_latch, remove_guard) = Latch::new();
+        let arrivals = Arc::new(AtomicUsize::new(0));
+        db.large_table.fp.0.write().fp_insert_before_lock =
+            FailPoint::latch_counting(insert_latch, arrivals.clone());
+        db.large_table.fp.0.write().fp_remove_before_lock =
+            FailPoint::latch_counting(remove_latch, arrivals.clone());
+
+        let w1 = {
+            let db = db.clone();
+            let key_a = key_a.clone();
+            let v1 = v1.clone();
+            thread::spawn(move || db.insert(ks, key_a, v1).unwrap())
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while arrivals.load(Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < deadline, "W1 did not reach the failpoint");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let w2 = {
+            let db = db.clone();
+            let key_b = key_b.clone();
+            thread::spawn(move || db.remove(ks, key_b).unwrap())
+        };
+        while arrivals.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline, "W2 did not reach the failpoint");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // Request the checkpoint now: the tracker answers it only once p1 and
+        // p2 are processed, with the frontier captured when it dequeues the
+        // request. Wait until the request is queued, so it sits ahead of the
+        // batch allocation below (the tracker is FIFO).
+        let position_before_batch = db.wal_writer.position();
+        let latch_requests_before = db.wal_writer.latch_requests_sent();
+        let ckpt = {
+            let db = db.clone();
+            thread::spawn(move || db.checkpoint())
+        };
+        while db.wal_writer.latch_requests_sent() == latch_requests_before {
+            assert!(Instant::now() < deadline, "checkpoint request was not sent");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // A batch write to `a` lands above the latch position, commits, and is
+        // promoted into the overlay before W1 applies.
+        let mut batch = db.write_batch();
+        batch.write(ks, key_a.clone(), v3.clone());
+        batch.commit().unwrap();
+        assert_eq!(Some(v3.clone()), db.get(ks, &key_a).unwrap());
+
+        // Release W1: it is stale (p3 > p1) and is ordered behind p3. Then W2.
+        drop(insert_guard);
+        w1.join().unwrap();
+        assert_eq!(
+            1,
+            metrics
+                .skip_stale_update
+                .with_label_values(&["root", "insert"])
+                .get(),
+            "W1 must apply as a stale update behind the promoted batch write"
+        );
+        drop(remove_guard);
+        w2.join().unwrap();
+        let checkpoint = ckpt.join().unwrap();
+
+        // The interleaving under test: the latch must not cover the batch write.
+        assert!(
+            checkpoint.latch.position().as_u64() <= position_before_batch,
+            "latch position {} covers the batch write (allocated at or after {}); \
+             the checkpoint request was not queued ahead of the batch",
+            checkpoint.latch.position().as_u64(),
+            position_before_batch
+        );
+
+        assert_eq!(Some(v3), db.get(ks, &key_a).unwrap());
+        assert_eq!(
+            Some(v1),
+            checkpoint.get(ks, &key_a).unwrap(),
+            "checkpoint must see the write at p1, which precedes its frontier"
+        );
+    }
 }

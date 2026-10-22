@@ -7,7 +7,7 @@ use crate::flusher::{
     FlushKind, IndexFlushCommand, IndexFlusher, IndexFlusherThread, RelocationFlush,
 };
 use crate::index::index_format::{Direction, IndexFormat, IndexIterCaches};
-use crate::index::index_table::IndexTable;
+use crate::index::index_table::{IndexTable, WriteOrder};
 use crate::index::levels::{INLINE_LEVELS, IndexLevels};
 use crate::index::pending_table::{CommittedChange, PendingTable, Transaction};
 use crate::index::utils::{NextEntryResult, merge_levels_next_entry};
@@ -405,9 +405,7 @@ impl LargeTable {
 
         entry.promote_pending_for(&reduced_key);
 
-        if !entry.insert(reduced_key.clone(), v, full_key, Some(value)) {
-            return Ok(());
-        }
+        entry.insert(reduced_key, v, full_key, Some(value));
 
         let index_size = entry.data.len();
         if loader.flush_supported() && self.too_many_dirty(entry) {
@@ -447,10 +445,7 @@ impl LargeTable {
         let entry = self.entry_mut(&mut row, &cell);
 
         entry.promote_pending_for(&k);
-
-        if !entry.remove(k.clone(), v) {
-            return Ok(());
-        }
+        entry.remove(k, v);
         Ok(())
     }
 
@@ -476,7 +471,8 @@ impl LargeTable {
     /// Live-write checks intentionally skipped (replay is sequential, no
     /// in-flight transactions, no concurrent writers):
     ///   - `promote_pending_for` / `pending_data` (always empty)
-    ///   - `skip_stale_update` (WAL is monotonic; the key-ASC/offset-DESC
+    ///   - stale-write ordering in `IndexTable::checked_insert` (WAL is
+    ///     monotonic; the key-ASC/offset-DESC
     ///     sort plus dedup below keeps the later position per key)
     ///   - Value LRU (churns + evicts during replay, ends up holding a
     ///     random tail; not worth the cost)
@@ -902,9 +898,10 @@ impl LargeTable {
     /// lock, then `entry.pending_last_processed.unwrap_or(loader_lp)`. The
     /// `promote_pending` matters: a committed batch op still in
     /// `pending_data` must land in `data` before anything newer is promoted
-    /// out of it, which is what lets `skip_stale_update` consult `data`
-    /// alone. Passing `u64::MAX` instead would promote unprocessed entries
-    /// too and falsify the test against the real production invariant.
+    /// out of it, which is what lets `IndexTable::checked_insert` order a
+    /// write against `data` alone. Passing `u64::MAX` instead would promote
+    /// unprocessed entries too and falsify the test against the real
+    /// production invariant.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn test_promote_flat_force<L: Loader>(&self, loader: &L) {
         for ks_table in &self.table {
@@ -1901,30 +1898,14 @@ impl LargeTableEntry {
         entry
     }
 
-    /// Checks if the update is potentially stale and the operation needs to be canceled.
-    /// This can happen if there are multiple concurrent updates for the same key.
-    /// Returns true if the update is outdated and should be skipped
-    ///
-    /// Only the `data` overlay is consulted (see
-    /// `IndexTable::overlay_update_position`): a loaded cell's `flat` holds
-    /// disk-derived entries whose offsets do not order against live writes.
-    /// Comparing against a disk tombstone's `INVALID` sentinel there would
-    /// skip every later write to a key deleted and re-inserted across a
-    /// flush, silently losing the re-insert.
-    fn skip_stale_update(&self, key: &Bytes, wal_position: &WalPosition, op: &'static str) -> bool {
-        let skip = if let Some(last_position) = self.data.overlay_update_position(key) {
-            &last_position > wal_position
-        } else {
-            false
-        };
-        if skip {
-            self.context
-                .metrics
-                .skip_stale_update
-                .with_label_values(&[self.context.name(), op])
-                .inc();
-        }
-        skip
+    /// Counts a write that `IndexTable` ordered behind a newer write to the
+    /// same key (`WriteOrder::Stale`).
+    fn count_stale_update(&self, op: &'static str) {
+        self.context
+            .metrics
+            .skip_stale_update
+            .with_label_values(&[self.context.name(), op])
+            .inc();
     }
 
     /// Transitions the entry into a dirty state for a write at WAL position `v`.
@@ -1940,21 +1921,17 @@ impl LargeTableEntry {
         self.state.mark_dirty();
     }
 
-    /// Returns true if successful, false if update was skipped.
+    /// Records the write of `k` at WAL position `v`.
     /// The lru_value must be provided if LRU is configured.
-    pub fn insert(
-        &mut self,
-        k: Bytes,
-        v: WalPosition,
-        full_key: Bytes,
-        lru_value: Option<&Bytes>,
-    ) -> bool {
-        if self.skip_stale_update(&k, &v, "insert") {
-            return false;
-        }
+    pub fn insert(&mut self, k: Bytes, v: WalPosition, full_key: Bytes, lru_value: Option<&Bytes>) {
         self.mark_dirty(v);
         self.insert_bloom_filter(&k);
-        self.data.make_mut().insert(k.clone(), v);
+        if self.data.make_mut().insert(k.clone(), v) == WriteOrder::Stale {
+            // Nothing else changes: the key and dirty counts are per key, and
+            // the value LRU holds the live value, which is the newer write's.
+            self.count_stale_update("insert");
+            return;
+        }
         self.report_loaded_keys_count();
 
         if let Some(value_lru) = &mut self.value_lru {
@@ -1963,29 +1940,27 @@ impl LargeTableEntry {
             let previous = value_lru.push(k, (full_key, lru_value.clone()));
             Self::update_lru_metric(&self.context, previous, delta);
         }
-        true
     }
 
-    /// Returns true if successful, false if update was skipped
-    pub fn remove(&mut self, k: Bytes, v: WalPosition) -> bool {
-        if self.skip_stale_update(&k, &v, "remove") {
-            return false;
-        }
+    /// Records the removal of `k` at WAL position `v`.
+    pub fn remove(&mut self, k: Bytes, v: WalPosition) {
         self.mark_dirty(v);
+        if self.data.make_mut().remove(k.clone(), v) == WriteOrder::Stale {
+            // See `insert`.
+            self.count_stale_update("remove");
+            return;
+        }
+        self.report_loaded_keys_count();
 
         // Remove from LRU cache if enabled
         if let Some(value_lru) = &mut self.value_lru {
             let previous = value_lru.pop(&k);
             Self::update_lru_metric(
                 &self.context,
-                previous.map(|(full_key, v)| (k.clone(), (full_key, v))),
+                previous.map(|(full_key, v)| (k, (full_key, v))),
                 0,
             );
         }
-
-        self.data.make_mut().remove(k, v);
-        self.report_loaded_keys_count();
-        true
     }
 
     /// Drain a [`CellReplayBuffer`] into this entry. See
@@ -2070,7 +2045,7 @@ impl LargeTableEntry {
     fn apply_committed_changes(&mut self, committed: Vec<CommittedChange>) {
         for committed_change in committed {
             // todo perf - report_loaded_keys_count and make_mut calls can be done once
-            // Changes from a committed batch go over the same skip_stale_update logic as regular updates.
+            // Committed batch ops get the same stale-update ordering as direct writes.
             if committed_change.is_modified {
                 let (full_key, lru_value) =
                     split_lru_update(&committed_change.key, committed_change.lru_update);

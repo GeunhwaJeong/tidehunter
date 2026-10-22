@@ -199,6 +199,12 @@ impl WalWriter {
         self.wal_tracker.latch()
     }
 
+    /// Test hook: see [`WalTracker::latch_requests_sent`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn latch_requests_sent(&self) -> u64 {
+        self.wal_tracker.latch_requests_sent()
+    }
+
     /// Releases a latch acquired via [`Self::latch`] (see
     /// [`WalTracker::release_latch`]).
     pub fn release_latch(&self, latch: WalTrackerLatch) {

@@ -32,6 +32,11 @@ pub struct WalTracker {
     sender: Option<mpsc::Sender<WalTrackerMessage>>,
     last_processed: Arc<AtomicU64>,
     mapper: Arc<WalMapper>,
+    /// Test hook: latch requests handed to the tracker thread, counted right
+    /// after each request is sent. Lets a test order a latch request ahead
+    /// of a later allocation (the tracker is FIFO) without sleeping.
+    #[cfg(any(test, feature = "test-utils"))]
+    latch_requests_sent: AtomicU64,
 }
 
 pub struct WalGuard {
@@ -166,6 +171,8 @@ impl WalTracker {
             sender: Some(sender),
             last_processed: atomic_last_processed,
             mapper,
+            #[cfg(any(test, feature = "test-utils"))]
+            latch_requests_sent: AtomicU64::new(0),
         }
     }
 
@@ -208,9 +215,17 @@ impl WalTracker {
         let message = WalTrackerMessage::LatchRequest(response);
         let sender = self.sender.as_ref().expect("WalTracker already dropped");
         sender.send(message).ok();
+        #[cfg(any(test, feature = "test-utils"))]
+        self.latch_requests_sent.fetch_add(1, Ordering::SeqCst);
         response_rx
             .recv()
             .expect("WalTracker thread terminated before replying to latch request")
+    }
+
+    /// Test hook: number of latch requests sent so far (see the field).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn latch_requests_sent(&self) -> u64 {
+        self.latch_requests_sent.load(Ordering::SeqCst)
     }
 
     /// Releases a latch acquired via [`Self::latch`], handing it back to the

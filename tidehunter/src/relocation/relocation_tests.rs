@@ -199,9 +199,8 @@ fn test_checkpoint_survives_relocation_without_unload() {
 /// A write allocated before a relocation copies its key's as-of value, but
 /// applied only after the copy has landed in the loaded cell's `flat`, must
 /// still be applied. The copy sits at a higher WAL-tail offset yet holds the
-/// older value, so neither the stale-write check (`skip_stale_update`) nor the
-/// flat ordering assert in `IndexTable::checked_insert` may order the write
-/// against it. Unloading is disabled so the relocation flush re-points the
+/// older value, so `IndexTable::checked_insert` must not order the write
+/// against it, neither as a stale write nor through its flat ordering assert. Unloading is disabled so the relocation flush re-points the
 /// loaded overlay at the relocated blob (`rebase_on_as_of`) instead of
 /// unloading the cell; the writer is parked on `fp_insert_before_lock`
 /// between its WAL write and the row lock.

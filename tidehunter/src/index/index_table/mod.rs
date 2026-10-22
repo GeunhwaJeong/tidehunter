@@ -132,6 +132,22 @@ impl IndexEntryKind {
     }
 }
 
+/// Where a live write landed in the `data` overlay (`IndexTable::insert` /
+/// `remove`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum WriteOrder {
+    /// The write is the key's latest position: it is the live value.
+    Latest,
+    /// A newer write to the key was already recorded (concurrent writers to
+    /// one key took the row lock out of WAL order), so this one was ordered
+    /// behind it. It is not the live value, but it is the key's as-of value
+    /// for every frontier between it and the newer write, which checkpoint
+    /// `get_at`, the relocation as-of view and the flush blob filter
+    /// (`retain_processed`) all read per position.
+    Stale,
+}
+
 // Compile time check to ensure IndexWalPosition consumes the same amount of memory as WalPosition
 const _: [u8; size_of::<WalPosition>()] = [0u8; size_of::<IndexWalPosition>()];
 
@@ -160,19 +176,50 @@ pub(super) fn data_latest_per_key(
 // ---------------------------------------------------------------------------
 
 impl IndexTable {
-    pub fn insert(&mut self, k: Bytes, v: WalPosition) -> Option<WalPosition> {
+    /// Records the write of `k` at `v` and reports whether it is the key's
+    /// latest position; see `checked_insert`.
+    pub fn insert(&mut self, k: Bytes, v: WalPosition) -> WriteOrder {
         self.checked_insert(k, IndexWalPosition::new_modified(v))
     }
 
-    pub fn remove(&mut self, k: Bytes, v: WalPosition) -> Option<WalPosition> {
+    /// Records the removal of `k` at `v`; see `insert`.
+    pub fn remove(&mut self, k: Bytes, v: WalPosition) -> WriteOrder {
         self.checked_insert(k, IndexWalPosition::new_removed(v))
     }
 
-    fn checked_insert(&mut self, k: Bytes, v: IndexWalPosition) -> Option<WalPosition> {
+    /// Records a live write in the `data` overlay.
+    ///
+    /// A write above the key's latest `data` position (the common case)
+    /// appends and becomes the live value. A write below it is stale: a
+    /// concurrent writer to the same key took the row lock out of WAL order.
+    /// The stale write is inserted in order behind the newer position rather
+    /// than dropped, because it is the key's as-of value for every frontier
+    /// between the two (`WriteOrder::Stale`). Neither `key_bytes` (per unique
+    /// key) nor `dirty_count` (per key, from its latest position) changes for
+    /// a stale write.
+    ///
+    /// Ordering consults `data` alone, never `flat`. The other in-flight
+    /// writes to the key are always still in `data` when a write lands:
+    ///   - a direct write holds its WAL guard until it is applied, so the
+    ///     tracker frontier, and with it every promote threshold, stays at or
+    ///     below it and nothing newer is promoted into `flat` meanwhile;
+    ///   - a batch write releases its guards at commit while its ops wait in
+    ///     `pending_data`, but every frontier capture reads `last_processed`
+    ///     before `promote_pending` under the row lock, and the live
+    ///     `insert`/`remove` run `promote_pending_for` first, so a pending op
+    ///     is applied (and ordered against `data` here) before anything newer
+    ///     leaves `data`.
+    ///
+    /// Every `flat` entry is therefore either an older processed write or
+    /// disk-derived, and disk-derived entries carry offsets that are
+    /// meaningless for ordering: a tombstone's `INVALID` sentinel (u64::MAX)
+    /// and a relocated copy's WAL-tail offset would both wrongly outrank a
+    /// genuine newer write, hiding a re-insert from the live view.
+    ///
+    /// See test_concurrent_single_value_update for the end-to-end test of
+    /// out-of-order writes.
+    fn checked_insert(&mut self, k: Bytes, v: IndexWalPosition) -> WriteOrder {
         let k = k.into_owned();
-        // Only update index entry if new entry has higher wal position then the previous entry
-        // See test_concurrent_single_value_update for details how this is tested
-        // todo might want a separate test with snapshot enabled
 
         // Enforce the ordering assertion for keys promoted to flat but not yet
         // in `data`. Done before `entry` so the immutable flat read doesn't
@@ -201,22 +248,36 @@ impl IndexTable {
         match self.data.entry(k) {
             Entry::Occupied(mut oc) => {
                 // `positions` is non-empty and ascending by IWP, so the latest
-                // is its last element and the new (strictly greater) position
-                // appends in order.
+                // is its last element.
                 let prev = *oc.get().last().unwrap();
+                if prev.offset > v.offset {
+                    // Stale: order it behind the newer position. Same canary
+                    // as below: a repeated offset is never a legitimate write.
+                    // Offsets are unique per key, so the slot found by offset
+                    // is the slot in IWP order.
+                    let positions = oc.get_mut();
+                    let slot = match positions.binary_search_by_key(&v.offset, |p| p.offset) {
+                        Err(slot) => slot,
+                        Ok(_) => panic!("Index WAL position must be unique per key"),
+                    };
+                    positions.insert(slot, v);
+                    return WriteOrder::Stale;
+                }
+                // The canary for a duplicate-key compressed batch or an
+                // ordering bug: a repeated offset is never a legitimate write.
                 assert!(
                     prev.offset < v.offset,
-                    "Index WAL position must be increasing"
+                    "Index WAL position must be unique per key"
                 );
                 adjust_dirty_count(&mut self.dirty_count, !prev.is_clean(), !v.is_clean());
                 oc.get_mut().push(v);
-                Some(prev.into_wal_position())
+                WriteOrder::Latest
             }
             Entry::Vacant(va) => {
                 self.key_bytes += va.key().len();
                 adjust_dirty_count(&mut self.dirty_count, false, !v.is_clean());
                 va.insert(smallvec![v]);
-                None
+                WriteOrder::Latest
             }
         }
     }
@@ -650,32 +711,6 @@ impl IndexTable {
         }
         self.flat_binary_search(k)
             .map(|iwp| iwp.into_wal_position())
-    }
-
-    /// WAL position of the latest update (insert or delete) recorded for `k`
-    /// in the `data` overlay, or `None` when the overlay holds no position
-    /// for the key.
-    ///
-    /// Deliberately ignores `flat`. The stale-write check this backs
-    /// (`LargeTableEntry::skip_stale_update`) only has to order a write
-    /// against the other *in-flight* writes to the same key, and those are
-    /// always still in `data` when the check runs:
-    ///   - a direct write holds its WAL guard until it is applied, so the
-    ///     tracker frontier, and with it every promote threshold, stays at or
-    ///     below it and nothing newer is promoted into `flat` meanwhile;
-    ///   - a batch write releases its guards at commit while its ops wait in
-    ///     `pending_data`, but every frontier capture reads `last_processed`
-    ///     before `promote_pending` under the row lock, and `insert`/`remove`
-    ///     run `promote_pending_for` first, so a pending op is applied (and
-    ///     ordered against `data` here) before anything newer leaves `data`.
-    ///
-    /// Every `flat` entry is therefore either an older processed write or
-    /// disk-derived, and disk-derived entries carry offsets that are
-    /// meaningless for ordering — a tombstone's `INVALID` sentinel (u64::MAX)
-    /// and a relocated copy's WAL-tail offset would both wrongly outrank a
-    /// genuine newer write.
-    pub fn overlay_update_position(&self, k: &Bytes) -> Option<WalPosition> {
-        self.data_get_latest(k).map(|p| p.into_update_position())
     }
 
     /// If prev is None returns first entry.
@@ -1673,7 +1708,8 @@ impl IndexTable {
     /// and set semantics (an identical position is not duplicated). Creates the
     /// key's entry if absent. Used by merge/rebase paths where the incoming
     /// position is not guaranteed to be the largest for the key (the hot insert
-    /// path appends directly in `checked_insert`).
+    /// path appends directly in `checked_insert`, which also orders a stale
+    /// live write into the key's existing list).
     fn data_insert_sorted(&mut self, key: Bytes, iwp: IndexWalPosition) {
         let positions = self.data.entry(key).or_default();
         if let Err(pos) = positions.binary_search(&iwp) {
@@ -3093,7 +3129,7 @@ mod tests {
     }
 
     #[test]
-    fn test_overlay_update_position_ignores_disk_tombstone() {
+    fn test_insert_ignores_disk_tombstone_for_ordering() {
         // A tombstone loaded from disk sits in `flat` with the INVALID
         // sentinel offset (u64::MAX). It must neither order a later write as
         // stale nor trip the flat ordering assert when that write lands.
@@ -3113,18 +3149,11 @@ mod tests {
         let mut loaded = IndexTable::deserialize_index_entries(ks, Bytes::from(buf.freeze()));
         assert_eq!(loaded.get(&[2]), Some(WalPosition::INVALID));
 
-        // Nothing in the overlay for either key: no ordering information.
-        assert_eq!(loaded.overlay_update_position(&vec![1].into()), None);
-        assert_eq!(loaded.overlay_update_position(&vec![2].into()), None);
-
-        // Re-inserting the tombstoned key must succeed and shadow the tombstone.
+        // Re-inserting the tombstoned key is the key's latest write and
+        // shadows the tombstone.
         let reinsert = WalPosition::test_value(30);
-        loaded.insert(vec![2].into(), reinsert);
+        assert_eq!(loaded.insert(vec![2].into(), reinsert), WriteOrder::Latest);
         assert_eq!(loaded.get(&[2]), Some(reinsert));
-        assert_eq!(
-            loaded.overlay_update_position(&vec![2].into()),
-            Some(reinsert)
-        );
         assert_eq!(
             loaded.iter().collect::<Vec<_>>(),
             vec![
@@ -3132,6 +3161,70 @@ mod tests {
                 (Bytes::from(vec![2]), reinsert),
             ]
         );
+    }
+
+    #[test]
+    fn test_stale_write_is_ordered_behind_newer_write() {
+        // Two writers to one key applied out of WAL order: the later-applied
+        // write at the lower offset is stale. It must not become the live
+        // value, but every as-of view between the two offsets must see it.
+        let key: Bytes = vec![1].into();
+        let newer = WalPosition::test_value(30);
+        let stale = WalPosition::test_value(10);
+        let mut table = IndexTable::default();
+        assert_eq!(table.insert(key.clone(), newer), WriteOrder::Latest);
+        assert_eq!(table.insert(key.clone(), stale), WriteOrder::Stale);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.dirty_count(), 1);
+        assert_eq!(table.get(&key), Some(newer));
+        assert_eq!(table.get_at(&key, LastProcessed::new_test(20)), Some(stale));
+        assert_eq!(table.get_at(&key, LastProcessed::new_test(31)), Some(newer));
+        assert_eq!(table.get_at(&key, LastProcessed::new_test(10)), None);
+
+        // A stale write between two recorded positions lands in the middle.
+        let older = WalPosition::test_value(5);
+        let mut table = IndexTable::default();
+        assert_eq!(table.insert(key.clone(), older), WriteOrder::Latest);
+        assert_eq!(table.insert(key.clone(), newer), WriteOrder::Latest);
+        assert_eq!(table.insert(key.clone(), stale), WriteOrder::Stale);
+        assert_eq!(table.get(&key), Some(newer));
+        assert_eq!(table.get_at(&key, LastProcessed::new_test(6)), Some(older));
+        assert_eq!(table.get_at(&key, LastProcessed::new_test(11)), Some(stale));
+        assert_eq!(table.get_at(&key, LastProcessed::new_test(31)), Some(newer));
+
+        // A stale remove is an as-of tombstone behind the newer write.
+        let mut table = IndexTable::default();
+        assert_eq!(table.insert(key.clone(), newer), WriteOrder::Latest);
+        assert_eq!(table.remove(key.clone(), stale), WriteOrder::Stale);
+        assert_eq!(table.get(&key), Some(newer));
+        assert_eq!(
+            table.get_at(&key, LastProcessed::new_test(20)),
+            Some(WalPosition::INVALID)
+        );
+    }
+
+    #[test]
+    fn test_unmerge_flushed_keeps_stale_position() {
+        // A stale write recorded after the flush snapshot was taken is not in
+        // the blob, so the unmerge must leave it in the overlay while removing
+        // the flushed position below it.
+        let key: Bytes = vec![1].into();
+        let mut original = IndexTable::default();
+        original.insert(key.clone(), WalPosition::test_value(5));
+        original.insert(key.clone(), WalPosition::test_value(30));
+        let mut live = original.clone();
+        assert_eq!(
+            live.insert(key.clone(), WalPosition::test_value(10)),
+            WriteOrder::Stale
+        );
+        // Frontier 8: the flush covered position 5 only.
+        live.unmerge_flushed(&original, LastProcessed::new_test(8));
+        assert_eq!(live.get_at(&key, LastProcessed::new_test(8)), None);
+        assert_eq!(
+            live.get_at(&key, LastProcessed::new_test(11)),
+            Some(WalPosition::test_value(10))
+        );
+        assert_eq!(live.get(&key), Some(WalPosition::test_value(30)));
     }
 
     #[test]
