@@ -330,15 +330,14 @@ fn test_relocation_waits_for_racing_write_on_loaded_cell() {
 
 // A key overwritten after a checkpoint, whose as-of value is a distinct overlay
 // position (never promoted to flat or a deeper level), must survive relocation:
-// the as-of view relocates it, and the held checkpoint reads the relocated copy
-// once GC reclaims its WAL file. The WAL is moved several files past the as-of
-// write before the checkpoint, so the relocation target passes its file.
-// Known bug: on an unloading-enabled cell the relocation flush ends in
-// `clear_after_flush`, whose per-key `retain_unprocessed` keeps the stale
-// pre-frontier overlay position, so the checkpoint reads None. The live-read
-// variants run in CI; the checkpoint-read variants stay ignored until that is
-// fixed.
-fn checkpoint_survives_relocation_overlay_asof_value(sharded: bool, check_checkpoint: bool) {
+// the as-of view relocates it, the flush re-points it to the copy, and the held
+// checkpoint reads the copy once GC reclaims its WAL file. The WAL is moved
+// several files past the as-of write before the checkpoint, so the relocation
+// target passes its file. On an unloading-enabled cell the flush completion
+// must drop the re-pointed position from the overlay although the key's latest
+// position is past the frontier, and a later flush of the cell must not write
+// the reclaimed position back into the blob.
+fn checkpoint_survives_relocation_overlay_asof_value(sharded: bool) {
     let dir = tempdir::TempDir::new("ckpt_reloc_overlay_asof").unwrap();
     let config = relocation_test_config(sharded);
     let key_shape = k_and_pad_key_shape(KeySpaceConfig::new());
@@ -404,39 +403,37 @@ fn checkpoint_survives_relocation_overlay_asof_value(sharded: bool, check_checkp
         Some(big(2).into()),
         "live get must be the overwrite"
     );
-    if !check_checkpoint {
-        return;
-    }
     assert_eq!(
         checkpoint.get(ks, &target).unwrap(),
         Some(big(1).into()),
         "checkpoint must read the as-of value big(1) after relocation; \
          None => the overlay still points at the reclaimed position"
     );
+
+    // 7. Flush the cell again while the checkpoint is held. The overlay
+    //    holds only the overwrite now, so the new blob keeps the copy.
+    db.force_rebuild_control_region().unwrap();
+    assert_eq!(
+        db.get(ks, &target).unwrap(),
+        Some(big(2).into()),
+        "live get must still be the overwrite after the second flush"
+    );
+    assert_eq!(
+        checkpoint.get(ks, &target).unwrap(),
+        Some(big(1).into()),
+        "checkpoint must still read the as-of value after the second flush; \
+         None => the blob was rewritten with the reclaimed position"
+    );
 }
 
 #[test]
-fn test_relocation_overlay_asof_value_live_reads() {
-    checkpoint_survives_relocation_overlay_asof_value(false, false);
-}
-
-#[test]
-fn test_relocation_overlay_asof_value_live_reads_sharded() {
-    checkpoint_survives_relocation_overlay_asof_value(true, false);
-}
-
-#[test]
-#[ignore = "known bug: the relocation flush keeps the pre-frontier overlay position on \
-            unloading-enabled cells"]
 fn test_checkpoint_survives_relocation_overlay_asof_value() {
-    checkpoint_survives_relocation_overlay_asof_value(false, true);
+    checkpoint_survives_relocation_overlay_asof_value(false);
 }
 
 #[test]
-#[ignore = "known bug: the relocation flush keeps the pre-frontier overlay position on \
-            unloading-enabled cells"]
 fn test_checkpoint_survives_relocation_overlay_asof_value_sharded() {
-    checkpoint_survives_relocation_overlay_asof_value(true, true);
+    checkpoint_survives_relocation_overlay_asof_value(true);
 }
 
 #[test]

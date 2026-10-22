@@ -2462,11 +2462,10 @@ impl LargeTableEntry {
                 // The request frontier is the exact cutoff: the cell was
                 // clean at request time and in-flight writes hold their WAL
                 // guards until applied, so every overlay entry sits at or
-                // above it (no key straddles the frontier, making the
-                // per-key-latest `retain` equivalent to per-position here);
-                // everything below it is covered by the new blob, and the
+                // above it and the retain below keeps all of them, clearing
+                // only `flat`, whose content the new blob folded in (the
                 // promote job never moves entries at or above a pending
-                // frontier into flat.
+                // frontier into flat).
                 self.data.make_mut().retain_unprocessed(last_processed);
                 self.report_loaded_keys_count();
                 if self.data.is_empty() {
@@ -2624,7 +2623,13 @@ impl LargeTableEntry {
             }
             return;
         }
-        // Unloading enabled: retain only entries with offset >= last_processed
+        // Unloading enabled: keep only the positions at or above
+        // last_processed, per position. The blob just written holds each
+        // key's as-of-frontier position (or dropped it on purpose), and a
+        // relocation flush re-pointed that position to a copy whose original
+        // the run's GC reclaims, so a key overwritten past the frontier must
+        // not keep its older position behind the newer one: a checkpoint read
+        // would find it instead of the blob's copy.
         self.data.make_mut().retain_unprocessed(last_processed);
         self.report_loaded_keys_count();
 

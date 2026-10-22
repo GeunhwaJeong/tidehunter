@@ -1351,14 +1351,35 @@ impl IndexTable {
         debug_assert_eq!(self.dirty_count, 0);
     }
 
-    /// Retain only unprocessed entries (those with WAL offset >= last_processed).
+    /// Retain only unprocessed positions (WAL offset >= `last_processed`),
+    /// per position: a key keeps the suffix of its list from its first
+    /// unprocessed position on, and a key with none is dropped. The mirror of
+    /// [`Self::retain_processed`].
     ///
     /// By the `flat` field invariant (no in-flight entries, see its doc),
     /// `flat` is cleared unconditionally. The BTreeMap still holds entries on
     /// both sides of the boundary and is filtered.
+    ///
+    /// Runs at flush completion (`clear_after_flush`) and at the
+    /// ForceRelocate completion that demotes a DirtyLoaded cell
+    /// (`update_relocated_position`), once the blob just written holds each
+    /// key's as-of-frontier position or has dropped it on purpose (relocation
+    /// cutoff, WAL floor, compactor, deepest-level tombstone strip). A
+    /// processed position must not stay behind a newer, unprocessed one for
+    /// the same key: a relocation flush re-points the processed position to a
+    /// copy and the run's GC reclaims its frame, so a checkpoint read that
+    /// still finds it in the overlay reads a reclaimed frame instead of
+    /// falling through to the copy in the blob.
     pub fn retain_unprocessed(&mut self, last_processed: LastProcessed) {
         self.flat = Bytes::default();
-        self.retain(|_, v| !last_processed.is_processed(v));
+        self.data.retain(|_, positions| {
+            positions.retain(|v| !last_processed.is_processed(v));
+            !positions.is_empty()
+        });
+        // Flat is empty, so the data side is the whole count.
+        let (kb, dc) = self.recount_data_stats();
+        self.key_bytes = kb;
+        self.dirty_count = dc;
     }
 
     /// Returns true if this index table has any unprocessed entries.
@@ -2445,6 +2466,41 @@ mod tests {
         assert_eq!(index.get(&[1]), None);
         assert_eq!(index.get(&[2]), None);
         assert_eq!(index.get(&[3]), Some(WalPosition::test_value(500)));
+    }
+
+    #[test]
+    fn test_retain_unprocessed_is_per_position() {
+        // Flush completion keeps only the unprocessed suffix of every key: a
+        // key overwritten past the frontier drops its processed position,
+        // which the blob holds (re-pointed to a copy after a relocation).
+        let mut index = IndexTable::default();
+        index.insert(vec![1].into(), WalPosition::test_value(100));
+        index.insert(vec![1].into(), WalPosition::test_value(500));
+        index.insert(vec![2].into(), WalPosition::test_value(200));
+        index.insert(vec![3].into(), WalPosition::test_value(400));
+        index.insert(vec![3].into(), WalPosition::test_value(600));
+        // Key 2 is fully processed and promotes into flat; the other keys
+        // keep their whole lists in the BTreeMap.
+        index.promote_to_flat_force(LastProcessed::new(300));
+        assert_eq!(index.flat_len(), 1);
+        assert_eq!(index.data.len(), 2);
+
+        index.retain_unprocessed(LastProcessed::new(300));
+
+        assert!(index.flat.is_empty());
+        assert_eq!(index.get(&[2]), None);
+        let positions =
+            |key: &[u8]| -> Vec<u64> { index.data[key].iter().map(|v| v.offset).collect() };
+        assert_eq!(positions(&[1]), vec![500]);
+        assert_eq!(positions(&[3]), vec![400, 600]);
+        assert_eq!(index.get_at(&[1], LastProcessed::new(300)), None);
+        assert_eq!(index.get(&[1]), Some(WalPosition::test_value(500)));
+        assert_eq!(
+            index.get_at(&[3], LastProcessed::new(500)),
+            Some(WalPosition::test_value(400))
+        );
+        assert_eq!(index.dirty_count(), 2);
+        assert_eq!(index.key_bytes, 2);
     }
 
     #[test]
