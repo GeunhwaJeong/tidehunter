@@ -211,6 +211,19 @@ impl WalWriter {
         self.wal_tracker.release_latch(latch)
     }
 
+    /// Blocks until every WAL position allocated before this call is recorded
+    /// in the in-memory index (see [`WalTracker::wait_processed`]). Pins
+    /// nothing, unlike [`Self::latch`].
+    pub fn wait_processed(&self) {
+        self.wal_tracker.wait_processed()
+    }
+
+    /// Test hook: see [`WalTracker::wait_requests_sent`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn wait_requests_sent(&self) -> u64 {
+        self.wal_tracker.wait_requests_sent()
+    }
+
     /// Requests deletion of WAL files that have been fully processed by the relocation process up to the watermark position.
     ///
     /// Given watermark positions will be preserved.

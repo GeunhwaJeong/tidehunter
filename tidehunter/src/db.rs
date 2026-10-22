@@ -889,12 +889,21 @@ impl Db {
             .relocation_written_bytes
             .inc_by(size_bytes as u64);
         let positions = self.write_relocated_batch_into_wal(&prepared_writes)?;
+        // Index the copies only once every frame below them is applied. The
+        // next control region rebuild persists the blob written below, and a
+        // frame still being written when the process crashes is torn: replay
+        // stops at it, so a copy above it is unreachable and, since replay
+        // skips relocated frames, never re-derived, while GC has already
+        // reclaimed the original. With every frame below the copies applied,
+        // a crash can only cut the WAL above them. The wait covers at least
+        // every write allocated before the copies; their own guards are
+        // already dropped, so it cannot wait on itself.
+        self.wal_writer.wait_processed();
         let mut updates = RelocationUpdates::new(last_processed);
         for (pos, key) in positions.into_iter().zip(keys.into_iter()) {
             let reduced_key = context.ks_config.reduced_key_bytes(key);
             updates.add(reduced_key, pos);
         }
-        // todo this do not hold guards before flushing the index - need to confirm if this is ok
         let dropped = self.large_table.sync_flush_for_relocation(
             context,
             &cell_id,
@@ -944,11 +953,15 @@ impl Db {
         Ok((vec![guard], positions))
     }
 
+    /// Appends the relocated copies and returns their positions. The guards
+    /// are dropped at once: a copy is not an acknowledged write of its own,
+    /// its original stays readable until the GC at the end of the run, and
+    /// [`Self::write_relocated_batch`] waits for the tracker's frontier to
+    /// pass the copies before it indexes them.
     fn write_relocated_batch_into_wal(
         &self,
         prepared_writes: &[PreparedWalWrite],
     ) -> DbResult<Vec<WalPosition>> {
-        // todo make sure its ok to drop guard right away
         prepared_writes
             .iter()
             .map(|write| {

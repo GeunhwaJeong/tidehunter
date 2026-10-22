@@ -196,16 +196,18 @@ fn test_checkpoint_survives_relocation_without_unload() {
     checkpoint_survives_relocation(Arc::new(config), KeySpaceConfig::new().disable_unload());
 }
 
-/// A write allocated before a relocation copies its key's as-of value, but
-/// applied only after the copy has landed in the loaded cell's `flat`, must
-/// still be applied. The copy sits at a higher WAL-tail offset yet holds the
-/// older value, so `IndexTable::checked_insert` must not order the write
-/// against it, neither as a stale write nor through its flat ordering assert. Unloading is disabled so the relocation flush re-points the
-/// loaded overlay at the relocated blob (`rebase_on_as_of`) instead of
-/// unloading the cell; the writer is parked on `fp_insert_before_lock`
-/// between its WAL write and the row lock.
+/// A write allocated before a relocation copies its key's as-of value sits
+/// below the copy the relocation writes at the WAL tail: its guard pins the
+/// tracker frontier, so the relocation must not index the copy
+/// until the write is applied (a torn frame below an indexed copy would
+/// strand the key after a crash), and once it is, the compare-and-set must
+/// leave the key on the newer write, which sits at a lower offset than the
+/// copy of the older value. Unloading is disabled so the relocation flush
+/// re-points the loaded overlay at the relocated blob (`rebase_on_as_of`)
+/// instead of unloading the cell; the writer is parked on
+/// `fp_insert_before_lock` between its WAL write and the row lock.
 #[test]
-fn test_relocation_racing_write_on_loaded_cell() {
+fn test_relocation_waits_for_racing_write_on_loaded_cell() {
     use std::time::Instant;
 
     let dir = tempdir::TempDir::new("test_reloc_racing_write").unwrap();
@@ -268,37 +270,59 @@ fn test_relocation_racing_write_on_loaded_cell() {
     let in_flight_offset = metrics.wal_written_bytes.get() as u64;
 
     // Relocate just the key's original record: everything below its
-    // successor offset. The copy lands past the in-flight write.
-    db.start_blocking_relocation_with_strategy(RelocationStrategy::IndexBased(Some(
-        original.offset() + 1,
-    )));
+    // successor offset. The copy lands past the in-flight write, so the
+    // relocation must park until that write is applied.
+    let wait_requests_before = db.wal_writer.wait_requests_sent();
+    let relocation = {
+        let db = db.clone();
+        thread::spawn(move || {
+            db.start_blocking_relocation_with_strategy(RelocationStrategy::IndexBased(Some(
+                original.offset() + 1,
+            )))
+        })
+    };
+    while db.wal_writer.wait_requests_sent() == wait_requests_before {
+        assert!(
+            !relocation.is_finished(),
+            "relocation finished with a write in flight below its copy"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "relocation did not wait for the in-flight write"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        !relocation.is_finished(),
+        "relocation finished with a write in flight below its copy"
+    );
+    assert_eq!(
+        original,
+        indexed_position(),
+        "the copy must not be indexed while the write below it is in flight"
+    );
+
+    // Release the writer: it is applied first, and the relocation's
+    // compare-and-set then leaves the key on the newer write, which sits at
+    // a lower offset than the copy.
+    drop(latch_guard);
+    writer
+        .join()
+        .expect("racing write must be applied without panicking");
+    relocation.join().unwrap();
     assert_eq!(
         1,
         metrics.relocation_kept.with_label_values(&["k"]).get(),
         "relocation must have copied the key's record"
     );
-    let relocated = indexed_position();
-    assert!(
-        relocated.offset() > in_flight_offset,
-        "relocated copy at {} must sit past the in-flight write at {}",
-        relocated.offset(),
-        in_flight_offset
-    );
+    assert_eq!(0, skipped_inserts(), "racing write was skipped as stale");
+    assert_eq!(in_flight_offset, indexed_position().offset());
+    assert_eq!(Some(new_value.clone().into()), db.get(ks, &key).unwrap());
     db.large_table.each_entry(|entry| {
         assert!(entry.is_index_loaded(), "cell must stay loaded");
     });
 
-    // Release the writer: its write is newer than the copy and must win.
-    drop(latch_guard);
-    writer
-        .join()
-        .expect("racing write must be applied without panicking");
-    assert_eq!(0, skipped_inserts(), "racing write was skipped as stale");
-    assert_eq!(in_flight_offset, indexed_position().offset());
-    assert_eq!(Some(new_value.clone().into()), db.get(ks, &key).unwrap());
-
-    // A flush of that shape (copy in `flat`, newer write in the overlay)
-    // must persist the newer write.
+    // A flush must persist the newer write, not the copy of the older one.
     db.force_rebuild_control_region().unwrap();
     assert_eq!(Some(new_value.into()), db.get(ks, &key).unwrap());
     assert_eq!(0, skipped_inserts());
@@ -1785,4 +1809,188 @@ fn test_wal_relocation_on_sharded_cell_without_unload() {
     // in-memory overlay rather than from the shards alone and must still
     // re-point the shard copies.
     wal_relocation_on_sharded_cell(KeySpaceConfig::new().disable_unload());
+}
+
+fn torn_frame_config() -> Arc<Config> {
+    relocation_test_config(false)
+}
+
+/// Key spaces `k` and `pad`; relocation drops the padding instead of copying
+/// it, so the run's copies fit in the fragments the mapper prepares ahead of
+/// a tracker that is stuck behind a parked writer.
+fn torn_frame_key_shape() -> KeyShape {
+    let mut ksb = KeyShapeBuilder::new();
+    ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    ksb.add_key_space_config(
+        "pad",
+        8,
+        1,
+        KeyType::uniform(1),
+        KeySpaceConfig::new().with_relocation_filter(|_, _| Decision::Remove),
+    );
+    ksb.build()
+}
+
+fn torn_frame_key() -> Vec<u8> {
+    3u64.to_be_bytes().to_vec()
+}
+
+fn torn_frame_value() -> Vec<u8> {
+    vec![1u8; 64]
+}
+
+fn torn_frame_pad_value() -> Vec<u8> {
+    vec![7u8; 12 * 1000]
+}
+
+/// A relocated copy may be indexed, and so persisted by the control region
+/// rebuild that ends the run, only once every WAL frame below it is applied:
+/// a crash tears a frame still being written, replay stops at it, and a copy
+/// above the torn frame is unreachable (replay skips relocated frames) while
+/// its original is already reclaimed. The child process parks a writer
+/// between its WAL write and the row lock, so the tracker frontier stays at
+/// its frame while a WAL relocation copies a key written earlier; it then
+/// tears the parked frame and exits without closing the database. The parent
+/// reopens it and must still read the key.
+#[test]
+fn test_relocated_copies_survive_crash_with_torn_frame_below() {
+    use std::process::Command;
+
+    const CHILD_DB_PATH: &str = "TIDEHUNTER_TEST_TORN_FRAME_DB_PATH";
+    const CHILD_EXIT_CODE: i32 = 37;
+    if let Some(path) = std::env::var_os(CHILD_DB_PATH) {
+        torn_frame_crash_child(Path::new(&path), CHILD_EXIT_CODE);
+    }
+
+    let dir = tempdir::TempDir::new("test_reloc_torn_frame").unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "relocation::relocation_tests::test_relocated_copies_survive_crash_with_torn_frame_below",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(CHILD_DB_PATH, dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(CHILD_EXIT_CODE),
+        "child did not reach its crash point\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let db = Db::open(
+        dir.path(),
+        torn_frame_key_shape(),
+        torn_frame_config(),
+        Metrics::new(),
+    )
+    .unwrap();
+    let ks = db.ks("k");
+    let pad = db.ks("pad");
+    // The writer resumes at the torn frame; a few writes overwrite whatever
+    // sat above it, as the first writes after a restart would.
+    for i in 0..4u64 {
+        db.insert(pad, i.to_be_bytes().to_vec(), torn_frame_pad_value())
+            .unwrap();
+    }
+    assert_eq!(
+        db.get(ks, &torn_frame_key()).unwrap(),
+        Some(torn_frame_value().into()),
+        "key relocated above a torn frame was lost"
+    );
+}
+
+/// The child half of `test_relocated_copies_survive_crash_with_torn_frame_below`.
+/// Exits the process with `exit_code` instead of returning.
+fn torn_frame_crash_child(path: &Path, exit_code: i32) -> ! {
+    use crate::crc::CrcFrame;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::FileExt;
+    use std::time::Instant;
+
+    let metrics = Metrics::new();
+    let config = torn_frame_config();
+    let db = Db::open(
+        path,
+        torn_frame_key_shape(),
+        config.clone(),
+        metrics.clone(),
+    )
+    .unwrap();
+    let ks = db.ks("k");
+    let pad = db.ks("pad");
+    let deadline = Instant::now() + Duration::from_secs(60);
+
+    db.insert(ks, torn_frame_key(), torn_frame_value()).unwrap();
+    // Push the writer past two WAL files so the relocation target, a file
+    // boundary at or below the parked write, covers the key's file.
+    let mut i = 0u64;
+    while db.wal_writer.position() < 2 * config.wal_file_size {
+        db.insert(pad, i.to_be_bytes().to_vec(), torn_frame_pad_value())
+            .unwrap();
+        i += 1;
+    }
+    db.wal_writer.wal_tracker_barrier();
+
+    // Park a writer between its WAL write and the row lock: its guard keeps
+    // the tracker frontier at its frame for the rest of the child's life.
+    let (latch, _latch_guard) = Latch::new();
+    db.large_table.fp.0.write().fp_insert_before_lock = FailPoint::latch(latch);
+    let written_before = metrics.wal_written_bytes.get();
+    let _parked = {
+        let db = db.clone();
+        thread::spawn(move || {
+            db.insert(pad, u64::MAX.to_be_bytes().to_vec(), vec![0u8; 8])
+                .unwrap()
+        })
+    };
+    // `Db::insert` publishes the frame offset right after the WAL write and
+    // before the failpoint, so a changed gauge means the write is in flight.
+    while metrics.wal_written_bytes.get() == written_before {
+        assert!(
+            Instant::now() < deadline,
+            "parked writer did not reach the WAL before the deadline"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let torn_offset = metrics.wal_written_bytes.get() as u64;
+
+    // With the frontier pinned at the parked frame, the relocation must park
+    // in the tracker wait before indexing the copies. If it finishes instead,
+    // it indexed copies above the frontier, and the parent then fails to read
+    // the key.
+    let wait_requests_before = db.wal_writer.wait_requests_sent();
+    let relocation = {
+        let db = db.clone();
+        thread::spawn(move || db.start_blocking_relocation())
+    };
+    while !relocation.is_finished() && db.wal_writer.wait_requests_sent() == wait_requests_before {
+        assert!(
+            Instant::now() < deadline,
+            "relocation neither finished nor waited for the frontier"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    if relocation.is_finished() {
+        relocation.join().unwrap();
+        assert!(
+            metrics.relocation_kept.with_label_values(&["k"]).get() > 0,
+            "relocation must have copied the key"
+        );
+    }
+
+    // Tear the parked frame: its header never landed.
+    let layout = db.wal.layout();
+    let file = layout.wal_file_name(path, layout.locate_file(torn_offset));
+    let file = OpenOptions::new().write(true).open(file).unwrap();
+    file.write_all_at(
+        &[0u8; CrcFrame::CRC_HEADER_LENGTH],
+        torn_offset % config.wal_file_size,
+    )
+    .unwrap();
+    // Crash: `process::exit` runs no destructors, so nothing is flushed or
+    // closed on the way out.
+    std::process::exit(exit_code)
 }
