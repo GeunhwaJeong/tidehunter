@@ -135,7 +135,7 @@ impl IndexEntryKind {
 /// Where a live write landed in the `data` overlay (`IndexTable::insert` /
 /// `remove`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[doc(hidden)]
+#[doc(hidden)] // pub only because `IndexTable::insert`/`remove` are pub; no external user
 pub enum WriteOrder {
     /// The write is the key's latest position: it is the live value.
     Latest,

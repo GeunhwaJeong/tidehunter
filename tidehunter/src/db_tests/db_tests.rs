@@ -4904,3 +4904,187 @@ fn test_auto_sharding_concurrent() {
         "expected re-sharding (incremental sharded promote) to fire"
     );
 }
+
+/// A batch commit wakes only a pending-promotion thread that has already
+/// registered itself, and right after `Db::open` the first commit can beat
+/// that registration; the batch is then left to the flat-promotion job.
+fn wait_for_pending_promotion_threads(db: &Db) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while db
+        .pending_promotion_threads
+        .iter()
+        .any(|t| t.get().is_none())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pending-promotion threads did not start"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A fresh cell's `last_processed` anchor must not sit above the tracker
+/// frontier, or a later flush that captures the real frontier makes the next
+/// snapshot's `replay_from` look like a regression to
+/// `ControlRegionStore::store`.
+///
+/// W1 (direct insert into the cell) is parked after its WAL allocation, so
+/// the tracker frontier cannot pass p1. A batch write into the same cell at
+/// p2 > p1 commits and is promoted first, which anchors the cell: the anchor
+/// must be clamped to the pinned frontier, which the first snapshot records.
+/// Filler batch writes then push the cell over `max_dirty_keys`; the
+/// resulting flush captures that same frontier and completion sets
+/// `last_processed` to it, so the second snapshot records the same position.
+/// Without the clamp the first snapshot records p2 and the second regresses,
+/// which `ControlRegionStore::store` turns into a panic.
+#[test]
+fn test_snapshot_survives_empty_cell_anchor_above_frontier() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    let dir = tempdir::TempDir::new("test-snapshot-anchor-above-frontier").unwrap();
+    // `Config::small` flushes at 32 dirty keys, and its snapshot threshold
+    // saturates to 0, so a snapshot flushes only a cell anchored at 0.
+    let config = Arc::new(Config::small());
+    let key_shape = KeyShape::new_single(8, 16, KeyType::uniform(16));
+    let metrics = Metrics::new();
+    let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let ks = db.single_ks();
+    let key = |n: u64| n.to_be_bytes().to_vec();
+    let value: Bytes = vec![1u8].into();
+
+    // Put the first WAL frames into the cell and drop it again, so W1's
+    // offset p1, and the frontier its guard pins, sit above the WAL start:
+    // at 0 the clamped anchor would be indistinguishable from an unanchored
+    // cell and the first snapshot would flush the cell on its own.
+    db.insert(ks, key(7), value.clone()).unwrap();
+    let (cell_first, cell_last) = db
+        .key_shape
+        .ks(ks)
+        .cell_range(&crate::cell::CellId::Integer(0));
+    db.drop_cells_in_range(ks, &cell_first, &cell_last).unwrap();
+    db.wal_writer.wal_tracker_barrier();
+
+    // Park W1 after its WAL allocation: the frontier stays at p1.
+    let (insert_latch, insert_guard) = Latch::new();
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    db.large_table.fp.0.write().fp_insert_before_lock =
+        FailPoint::latch_counting(insert_latch, arrivals.clone());
+    let w1 = {
+        let db = db.clone();
+        let value = value.clone();
+        thread::spawn(move || db.insert(ks, key(42), value).unwrap())
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while arrivals.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < deadline, "W1 did not reach the failpoint");
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // A batch write into the same cell commits and is promoted: the Empty cell
+    // anchors last_processed while the frontier is pinned below p2.
+    let mut batch = db.write_batch();
+    batch.write(ks, key(43), value.clone());
+    batch.commit().unwrap();
+    assert_eq!(Some(value.clone()), db.get(ks, &key(43)).unwrap());
+
+    let pinned = db.wal_writer.last_processed().as_u64();
+    assert!(pinned > 0, "W1 must pin the frontier above the WAL start");
+    let first = db.rebuild_control_region().unwrap();
+    assert_eq!(
+        first, pinned,
+        "the first snapshot must clamp the anchor to the frontier W1 pins"
+    );
+
+    // Push the cell over max_dirty_keys with batch writes (they bypass the
+    // parked failpoint); the promotion thread requests the flush, which
+    // captures the pinned frontier.
+    let flushes_before = metrics.unload.with_label_values(&["flush"]).get();
+    wait_for_pending_promotion_threads(&db);
+    let mut batch = db.write_batch();
+    for n in 100..140u64 {
+        batch.write(ks, key(n), value.clone());
+    }
+    batch.commit().unwrap();
+    while metrics.unload.with_label_values(&["flush"]).get() == flushes_before {
+        assert!(Instant::now() < deadline, "the cell was not flushed");
+        thread::sleep(Duration::from_millis(1));
+    }
+    db.large_table.flusher.barrier();
+
+    let second = db.rebuild_control_region().unwrap();
+    assert_eq!(
+        second, first,
+        "the flush must have captured the frontier the first anchor was clamped to"
+    );
+
+    drop(insert_guard);
+    w1.join().unwrap();
+}
+
+/// A batch's ops are promoted in whatever order their keys come up, and a
+/// direct write promotes only its own key. Here a direct write to `b`
+/// promotes `b@p2` alone, which anchors the fresh cell; `a@p1` (p1 < p2, same
+/// batch) is promoted by the snapshot itself. The snapshot's `replay_from`
+/// must still cover `a`: the cell has no blob, so after a crash `a` survives
+/// only through replay.
+#[test]
+fn test_snapshot_covers_batch_op_promoted_after_its_sibling() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    let dir = tempdir::TempDir::new("test-snapshot-batch-op-after-sibling").unwrap();
+    let config = Arc::new(Config::small());
+    let key_shape = KeyShape::new_single(8, 16, KeyType::uniform(16));
+    let key = |n: u64| n.to_be_bytes().to_vec();
+    let value_a: Bytes = vec![1u8].into();
+    let value_b: Bytes = vec![2u8].into();
+    {
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            Metrics::new(),
+        )
+        .unwrap();
+        let ks = db.single_ks();
+
+        // Park the pending-promotion thread, which the commit wakes to
+        // promote the whole batch. It parks before taking any row lock and
+        // holds a strong reference to the Db while parked.
+        let (promote_latch, promote_guard) = Latch::new();
+        let arrivals = Arc::new(AtomicUsize::new(0));
+        db.large_table.fp.0.write().fp_promote_dirty_pending =
+            FailPoint::latch_counting(promote_latch, arrivals.clone());
+        wait_for_pending_promotion_threads(&db);
+
+        let mut batch = db.write_batch();
+        batch.write(ks, key(1), value_a.clone());
+        batch.write(ks, key(2), value_b.clone());
+        batch.commit().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while arrivals.load(Ordering::SeqCst) < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the promotion thread did not reach the failpoint"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Let the frontier pass both ops, so the anchor comes from the op
+        // itself rather than from a frontier still pinned below it.
+        db.wal_writer.wal_tracker_barrier();
+        // Promotes `b@p2` alone (`promote_pending_for`), then applies the
+        // direct write above it.
+        db.insert(ks, key(2), value_b.clone()).unwrap();
+        let replay_from = db.rebuild_control_region().unwrap();
+        assert!(replay_from > 0, "the cell must have anchored replay_from");
+
+        drop(promote_guard);
+        db.wait_for_background_threads_to_finish();
+    }
+    // Crash and reopen: `a` is in no blob and must be replayed.
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+    let ks = db.single_ks();
+    assert_eq!(Some(value_a), db.get(ks, &key(1)).unwrap());
+    assert_eq!(Some(value_b), db.get(ks, &key(2)).unwrap());
+}

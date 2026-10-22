@@ -798,6 +798,7 @@ impl LargeTable {
         shard_idx: usize,
         num_shards: usize,
     ) -> Result<(), L::Error> {
+        self.fp.fp_promote_dirty_pending();
         for ks_table in &self.table {
             for (mutex_idx, flag) in ks_table.pending_dirty.iter().enumerate() {
                 if mutex_idx % num_shards == shard_idx && flag.swap(false, Ordering::Acquire) {
@@ -1914,16 +1915,44 @@ impl LargeTableEntry {
             .inc();
     }
 
-    /// Transitions the entry into a dirty state for a write at WAL position `v`.
+    /// Transitions the entry into a dirty state for a write at WAL position `v`
+    /// and keeps `last_processed` at or below every write the entry has
+    /// applied. A snapshot records a dirty entry's `last_processed` as its
+    /// replay start, so an unflushed write below it is lost after a crash.
     ///
-    /// Also anchors `last_processed` at `v.offset()` when the entry was
-    /// previously `Empty`: without this, a freshly-dirty entry carries
-    /// `last_processed = 0` until its first flush and pins the snapshot's
-    /// `replay_from` to 0 — violating monotonicity of `cr.last_position`.
+    /// `Empty`: anchor at `min(v.offset(), frontier)`. Without an anchor a
+    /// fresh dirty entry carries `last_processed = 0` until its first flush
+    /// and pins the snapshot's `replay_from` to 0. `v.offset()` alone
+    /// over-claims: writes take the row lock in allocation order only by
+    /// chance, and a direct write allocated below `v` that has not reached
+    /// the lock yet holds its guard, which pins the frontier at or below its
+    /// offset. The write itself stays unprocessed under strict `<`.
+    ///
+    /// Otherwise: `min(last_processed, v.offset())`. A batch drops its guards
+    /// at commit, so the frontier can pass its ops before they are applied,
+    /// and they are applied in `take_committed`'s HashMap order or one key at
+    /// a time by `promote_pending_for`: a lower op can arrive after a higher
+    /// op, or a direct write, anchored the entry above it. Every reader of
+    /// `last_processed` (`ks_snapshot`, the flush captures) runs a full
+    /// `promote_pending` under the row lock first, so the anchor it reads has
+    /// been lowered by every committed op of the cell.
+    ///
+    /// Lowering never regresses the stored control region. A write allocated
+    /// before a store either pinned the frontier at or below its offset while
+    /// the store ran, or was a committed batch op the store promoted itself;
+    /// a store never records more than the frontier. A write allocated after
+    /// a store sits above the WAL tail of that time.
+    ///
+    /// The frontier is the tracker's externally observed `last_processed`
+    /// (`KsContext::last_processed_wal_position`), read only on the `Empty`
+    /// edge, once per cell lifetime.
     fn mark_dirty(&mut self, v: WalPosition) {
-        if matches!(self.state, LargeTableEntryState::Empty) {
-            self.last_processed = LastProcessed::new(v.offset());
-        }
+        let write = LastProcessed::new(v.offset());
+        self.last_processed = if self.state.is_empty() {
+            cmp::min(write, self.context.last_processed_wal_position())
+        } else {
+            cmp::min(self.last_processed, write)
+        };
         self.state.mark_dirty();
     }
 
@@ -1980,9 +2009,9 @@ impl LargeTableEntry {
     /// During replay the cell is in `Empty` or `Unloaded` state (no
     /// `maybe_load` call) and `entry.data` is the default IndexTable, so we
     /// can replace it wholesale with a flat buffer built from the sorted
-    /// entries. `mark_dirty` is fed the *first* WAL position observed for
-    /// the cell so that `last_processed` matches what the per-record path
-    /// would have anchored on the `Empty → Dirty` transition.
+    /// entries. A fresh cell anchors `last_processed` on the *first* WAL
+    /// position observed for it, which is exact: replay has no write in
+    /// flight, so `mark_dirty`'s frontier bound is not needed.
     fn apply_replay_buffer(&mut self, mut entries: CellReplayBuffer, cutoff: u64) {
         if entries.is_empty() {
             return;
@@ -2002,10 +2031,12 @@ impl LargeTableEntry {
             "apply_replay_buffer expects a fresh entry — replay never auto-loads L0",
         );
         // `entries` was pushed in WAL order, so `entries[0]` has the earliest
-        // position for this cell — anchor `mark_dirty` on it. Only the offset
-        // matters for `last_processed`; `len` is irrelevant.
-        let first_offset = entries[0].1.offset();
-        self.mark_dirty(WalPosition::new(first_offset, 0));
+        // position for this cell. An `Unloaded` cell keeps the
+        // `last_processed` its control region recorded.
+        if self.state.is_empty() {
+            self.last_processed = LastProcessed::new(entries[0].1.offset());
+        }
+        self.state.mark_dirty();
         // Sort by (key ASC, offset DESC) so that for runs of equal keys the
         // highest-position (latest) write comes first; `dedup_by` then keeps
         // exactly that entry per key.
@@ -2739,10 +2770,9 @@ impl LargeTableEntry {
 }
 
 impl LargeTableEntryState {
-    /// Pure state-label transition for the dirty edge. Callers must go
-    /// through `LargeTableEntry::mark_dirty`, which also initializes
-    /// `last_processed` on the `Empty → DirtyLoaded` edge and owns the
-    /// `levels` field.
+    /// Pure state-label transition for the dirty edge. Callers go through
+    /// `LargeTableEntry::mark_dirty` (or `apply_replay_buffer` for replay),
+    /// which also anchor `last_processed` on the `Empty → DirtyLoaded` edge.
     fn mark_dirty(&mut self) {
         match self {
             LargeTableEntryState::Empty => *self = LargeTableEntryState::DirtyLoaded,
@@ -2977,6 +3007,9 @@ pub(crate) struct LargeTableFailPointsInner {
     /// Hit by the flusher thread between the flush work and the visible
     /// completion (`update_flushed_index` / `update_relocated_index`).
     pub fp_flush_before_completion: crate::failpoints::FailPoint,
+    /// Hit by a pending-promotion thread on wakeup, before it takes any row
+    /// lock, so a test can keep a committed batch pending.
+    pub fp_promote_dirty_pending: crate::failpoints::FailPoint,
 }
 
 #[cfg(not(test))]
@@ -2987,6 +3020,8 @@ impl LargeTableFailPoints {
     pub fn fp_lookup_after_lock_drop(&self) {}
 
     pub fn fp_flush_before_completion(&self) {}
+
+    pub fn fp_promote_dirty_pending(&self) {}
 }
 
 #[cfg(test)]
@@ -3004,6 +3039,10 @@ impl LargeTableFailPoints {
 
     pub fn fp_flush_before_completion(&self) {
         self.0.read().fp_flush_before_completion.fp();
+    }
+
+    pub fn fp_promote_dirty_pending(&self) {
+        self.0.read().fp_promote_dirty_pending.fp();
     }
 }
 

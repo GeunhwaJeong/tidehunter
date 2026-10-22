@@ -571,9 +571,9 @@ impl Metrics {
                 registry,
                 enabled
             ),
-            // Stale updates: writes applied after a newer write to the same key.
-            // Such a write is recorded behind the newer position
-            // (`IndexTable::checked_insert`, `WriteOrder::Stale`), not dropped.
+            // Writes ordered behind a newer write to the same key
+            // (`IndexTable::checked_insert`, `WriteOrder::Stale`). The metric
+            // name is kept for dashboard continuity.
             skip_stale_update: counter_vec!("skip_stale_update", &["ks", "op"], registry, enabled),
 
             snapshot_lock_time_mcs: histogram!(
