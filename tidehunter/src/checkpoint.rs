@@ -28,7 +28,10 @@
 //!     feeds it (`IndexTable::merge_dirty`) must fold the overlay's full
 //!     position lists — a latest-per-key collapse ahead of the filter would
 //!     hand it only a post-frontier position and revert the key to its stale
-//!     base entry in the blob.
+//!     base entry in the blob. For the same reason the merge keeps the
+//!     overlay's `flat` entry for a key the overlay also holds in `data`: when
+//!     the filter drops every `data` position of that key, the promoted
+//!     `flat` entry is the as-of value the blob must hold.
 //!
 //! Relocation is the deliberate exception: a relocated copy sits at a WAL-tail
 //! offset (`>= L`) yet holds the as-of-frontier *value*, so an unfiltered read
@@ -649,6 +652,129 @@ mod tests {
             Some(v1),
             checkpoint.get(ks, &key_a).unwrap(),
             "checkpoint must see the write at p1, which precedes its frontier"
+        );
+    }
+
+    /// The flusher's merge path (`FlushKind::Flush { loaded: false }`) folds the
+    /// overlay's `flat` into the loaded L0 with `fold_dirty_flat`. A key held in
+    /// the overlay's `flat` (promoted, below the frontier) and `data` (above the
+    /// frontier pinned by a checkpoint) must keep its `flat` entry in the merged
+    /// table: `retain_processed` removes the `data` entry from the blob, so the
+    /// `flat` entry is the as-of value the blob must hold. Completion clears
+    /// the overlay's `flat`, so a value dropped by the merge survives nowhere.
+    #[test]
+    fn test_checkpoint_survives_unloaded_flush_of_promoted_key() {
+        let dir = tempdir::TempDir::new("test-checkpoint-promoted-flat-flush").unwrap();
+        let config = Arc::new(Config::small());
+        let key_shape = KeyShape::new_single(8, 16, KeyType::uniform(16));
+        let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+        let ks = db.single_ks();
+        let context = db.ks_context(ks);
+
+        let key = 42u64.to_be_bytes().to_vec();
+        let cell = db.key_shape.ks(ks).cell_id(&key);
+        let v1: Bytes = vec![1u8].into();
+        let v2: Bytes = vec![2u8].into();
+        let v3: Bytes = vec![3u8].into();
+
+        // v1 lands in an on-disk L0; the cell is clean and unloaded afterwards.
+        db.insert(ks, key.clone(), v1.clone()).unwrap();
+        db.force_rebuild_control_region().unwrap();
+
+        // v2 is the as-of value: written, processed, and promoted into `flat`.
+        db.insert(ks, key.clone(), v2.clone()).unwrap();
+        db.wal_writer.wal_tracker_barrier();
+        db.large_table.test_promote_flat_force(db.as_ref());
+
+        let checkpoint = db.checkpoint();
+        assert_eq!(Some(v2.clone()), checkpoint.get(ks, &key).unwrap());
+
+        // v3 is written after the checkpoint: it sits in `data` above the
+        // latched frontier while v2 stays in `flat`.
+        db.insert(ks, key.clone(), v3.clone()).unwrap();
+        assert_eq!(
+            db.large_table.entry_state_for_test(context, &cell),
+            "DirtyUnloaded"
+        );
+
+        // Flush the unloaded cell while the checkpoint pins the frontier.
+        db.force_rebuild_control_region().unwrap();
+
+        assert_eq!(Some(v3), db.get(ks, &key).unwrap());
+        assert_eq!(
+            Some(v2),
+            checkpoint.get(ks, &key).unwrap(),
+            "checkpoint must still see the promoted as-of value after the flush"
+        );
+    }
+
+    /// `maybe_load` folds the overlay into the loaded L0 with the same merge
+    /// as the flusher, so a key held in the overlay's `flat` and `data` must
+    /// keep its `flat` entry there too: the loaded table serves the
+    /// checkpoint's `get_at` directly, and the flush that follows takes the
+    /// `flat` entry as the blob's as-of value.
+    #[test]
+    fn test_checkpoint_survives_load_of_promoted_key() {
+        let dir = tempdir::TempDir::new("test-checkpoint-promoted-flat-load").unwrap();
+        let config = Arc::new(Config::small());
+        // An iterator loads an unloaded cell only with the unloaded iterator off.
+        let key_shape = KeyShape::new_single_config(
+            8,
+            16,
+            KeyType::uniform(16),
+            KeySpaceConfig::default().with_unloaded_iterator(false),
+        );
+        let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+        let ks = db.single_ks();
+        let context = db.ks_context(ks);
+
+        let key = 42u64.to_be_bytes().to_vec();
+        let cell = db.key_shape.ks(ks).cell_id(&key);
+        let v1: Bytes = vec![1u8].into();
+        let v2: Bytes = vec![2u8].into();
+        let v3: Bytes = vec![3u8].into();
+
+        // v1 lands in an on-disk L0; the cell is clean and unloaded afterwards.
+        db.insert(ks, key.clone(), v1.clone()).unwrap();
+        db.force_rebuild_control_region().unwrap();
+
+        // v2 is the as-of value: written, processed, and promoted into `flat`.
+        db.insert(ks, key.clone(), v2.clone()).unwrap();
+        db.wal_writer.wal_tracker_barrier();
+        db.large_table.test_promote_flat_force(db.as_ref());
+
+        let checkpoint = db.checkpoint();
+        assert_eq!(Some(v2.clone()), checkpoint.get(ks, &key).unwrap());
+
+        // v3 is written after the checkpoint: it sits in `data` above the
+        // latched frontier while v2 stays in `flat`.
+        db.insert(ks, key.clone(), v3.clone()).unwrap();
+        assert_eq!(
+            db.large_table.entry_state_for_test(context, &cell),
+            "DirtyUnloaded"
+        );
+
+        // A live iterator loads the cell: the overlay folds into L0 in memory.
+        let live: Vec<(Bytes, Bytes)> = db.iterator(ks).collect::<DbResult<Vec<_>>>().unwrap();
+        assert_eq!(live, vec![(key.clone().into(), v3.clone())]);
+        assert_eq!(
+            db.large_table.entry_state_for_test(context, &cell),
+            "DirtyLoaded"
+        );
+        assert_eq!(
+            Some(v2.clone()),
+            checkpoint.get(ks, &key).unwrap(),
+            "checkpoint must still see the promoted as-of value after the load"
+        );
+
+        // Flush the loaded cell while the checkpoint pins the frontier.
+        db.force_rebuild_control_region().unwrap();
+
+        assert_eq!(Some(v3), db.get(ks, &key).unwrap());
+        assert_eq!(
+            Some(v2),
+            checkpoint.get(ks, &key).unwrap(),
+            "checkpoint must still see the promoted as-of value after the flush"
         );
     }
 }

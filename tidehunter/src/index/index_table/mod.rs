@@ -376,19 +376,28 @@ impl IndexTable {
     /// `self.flat`, upholding the invariant that disk entries never enter the
     /// `data` overlay.
     ///
-    /// `dirty` is the fresher side, so on equal keys its flat entry wins over
-    /// `self.flat` — except where `dirty.data` already carries the key, in
-    /// which case the overlay (just merged into `self.data`) is freshest and
-    /// `self.flat`'s entry is kept untouched as the below-overlay value
-    /// (matching the prior behavior of skipping `dirty.flat` for overlay keys).
+    /// `dirty` is the fresher side on both halves, so its flat entry is always
+    /// taken: over `self.flat`'s entry on equal keys, and also when
+    /// `dirty.data` carries the same key. The merged table then holds that
+    /// key on both sides, exactly as `dirty` did: the overlay positions in
+    /// `data` and the older promoted value in `flat`, which `data` shadows.
+    /// That `flat` entry is the key's as-of value for every frontier below the
+    /// overlay positions. The flusher runs `retain_processed` after this
+    /// merge and drops the overlay positions above the flush frontier, so the
+    /// blob must find the `flat` entry beneath them, and `maybe_load` hands
+    /// the merged table to `get_at`, which falls through to `flat` the same
+    /// way. Keeping `self.flat`'s entry instead would leave the base's older
+    /// value for the key, and the flush completion clears the overlay's
+    /// `flat`, so the promoted value would survive nowhere. `dirty_count`
+    /// counts such a key on both sides, as the overlay already does.
     ///
-    /// For a key taken from `dirty.flat`, any now-stale `self.data` tuple is
-    /// dropped so the flat value is the one observed. In every production
-    /// caller `self` is a freshly-loaded merge base with empty `data`, so that
-    /// cleanup is a no-op there; it only matters for synthetic callers that
-    /// pre-seed `self.data` with values older than `dirty` (debug asserts
-    /// enforce the "older" contract on both the dropped tuples and equal-key
-    /// flat entries).
+    /// For a key taken from `dirty.flat` that `dirty.data` does not hold, any
+    /// now-stale `self.data` tuple is dropped so the flat value is the one
+    /// observed. In every production caller `self` is a freshly-loaded merge
+    /// base with empty `data`, so that cleanup is a no-op there; it only
+    /// matters for synthetic callers that pre-seed `self.data` with values
+    /// older than `dirty` (a debug assert enforces the "older" contract on
+    /// the dropped tuples).
     ///
     /// Returns the number of dirty (non-clean) entries in the rebuilt `flat`,
     /// so the caller can finish its stats without re-decoding the blob.
@@ -433,37 +442,35 @@ impl IndexTable {
                 }
                 Ordering::Greater => {
                     let (k, v) = dirty_it.next().unwrap();
-                    if dirty.data_contains_key(k) {
-                        continue; // overlay carries the fresher value
-                    }
                     let key = dirty.flat.slice_to_bytes(k);
-                    keys_from_dirty.push((key.clone(), v));
+                    if !dirty.data_contains_key(k) {
+                        keys_from_dirty.push((key.clone(), v));
+                    }
                     merged.push((key, demote(v)));
                 }
                 Ordering::Equal => {
-                    let (sk, sv) = self_it.next().unwrap();
+                    // Caller contract: `dirty` is the fresher side. The two
+                    // offsets are not comparable, so this is not asserted:
+                    // either side may be a disk tombstone (`INVALID`
+                    // sentinel) or a relocated copy, which sits at a
+                    // WAL-tail offset above genuine writes it predates (a
+                    // copy promoted into L1 under a held checkpoint versus
+                    // the newer overwrite that later reaches L0).
+                    self_it.next();
                     let (dk, dv) = dirty_it.next().unwrap();
-                    if dirty.data_contains_key(dk) {
-                        // Overlay is freshest; keep self.flat's entry beneath it.
-                        merged.push((self_flat.slice_to_bytes(sk), sv));
-                    } else {
-                        // Caller contract: `dirty` is the fresher side. The two
-                        // offsets are not comparable, so this is not asserted:
-                        // either side may be a disk tombstone (`INVALID`
-                        // sentinel) or a relocated copy, which sits at a
-                        // WAL-tail offset above genuine writes it predates (a
-                        // copy promoted into L1 under a held checkpoint versus
-                        // the newer overwrite that later reaches L0).
-                        let key = dirty.flat.slice_to_bytes(dk);
+                    let key = dirty.flat.slice_to_bytes(dk);
+                    if !dirty.data_contains_key(dk) {
                         keys_from_dirty.push((key.clone(), dv));
-                        merged.push((key, demote(dv)));
                     }
+                    merged.push((key, demote(dv)));
                 }
             }
         }
 
         // Drop overlay positions shadowed by a value just taken from dirty.flat:
         // every position for that key is below the winner, so the whole key goes.
+        // A key `dirty.data` holds is not in this list: its overlay positions,
+        // folded into `self.data` above, are newer than its `flat` entry.
         for (key, winner) in keys_from_dirty {
             if let Some(stale) = self.data.remove(&key) {
                 for e in &stale {
@@ -4146,6 +4153,70 @@ mod tests {
         // All three positions coexist for [1]: the base @5 plus both dirty
         // positions — the below-latest @10 must survive the merge.
         assert_eq!(self_table.data.get([1].as_ref()).map(|p| p.len()), Some(3));
+    }
+
+    #[test]
+    fn test_merge_dirty_keeps_flat_entry_under_overlay_key() {
+        // A key promoted into the overlay's `flat` and then overwritten in
+        // `data` above the frontier: the merge must keep the `flat` entry
+        // (the as-of value) beneath the overlay position, on both the flush
+        // path (`_and_clean`) and the load path (`_no_clean`). [1] has an
+        // older base entry that must not win; [2] has none.
+        let frontier = LastProcessed::new(25);
+        let mut base = IndexTable::default();
+        base.insert(vec![1].into(), WalPosition::test_value(10));
+        base.demote_data_modified_to_clean();
+        base.promote_to_flat(LastProcessed::new(u64::MAX));
+
+        let mut dirty = IndexTable::default();
+        dirty.insert(vec![1].into(), WalPosition::test_value(20));
+        dirty.insert(vec![2].into(), WalPosition::test_value(21));
+        dirty.promote_to_flat(frontier);
+        dirty.insert(vec![1].into(), WalPosition::test_value(30));
+        dirty.insert(vec![2].into(), WalPosition::test_value(31));
+        assert!(dirty.data_contains_key(&[1]) && dirty.data_contains_key(&[2]));
+        assert_eq!(
+            dirty.get_at(&[1], frontier),
+            Some(WalPosition::test_value(20))
+        );
+
+        let mut merged = base.clone();
+        merged.merge_dirty_and_clean(&dirty);
+        assert_eq!(merged.get(&[1]), Some(WalPosition::test_value(30)));
+        assert_eq!(merged.get(&[2]), Some(WalPosition::test_value(31)));
+        assert_eq!(
+            merged.get_at(&[1], frontier),
+            Some(WalPosition::test_value(20))
+        );
+        assert_eq!(
+            merged.get_at(&[2], frontier),
+            Some(WalPosition::test_value(21))
+        );
+        // The flusher's frontier filter then drops the overlay positions, and
+        // the blob serializes the `flat` entries.
+        merged.retain_processed(frontier);
+        assert_eq!(
+            merged.iter_with_tombstones().collect::<Vec<_>>(),
+            vec![
+                (Bytes::from(vec![1]), WalPosition::test_value(20)),
+                (Bytes::from(vec![2]), WalPosition::test_value(21)),
+            ]
+        );
+
+        let mut loaded = base;
+        loaded.merge_dirty_no_clean(&dirty);
+        assert_eq!(loaded.get(&[1]), Some(WalPosition::test_value(30)));
+        assert_eq!(
+            loaded.get_at(&[1], frontier),
+            Some(WalPosition::test_value(20))
+        );
+        assert_eq!(
+            loaded.get_at(&[2], frontier),
+            Some(WalPosition::test_value(21))
+        );
+        // Both sides stay dirty on the load path and are counted as the
+        // overlay counted them.
+        assert_eq!(loaded.dirty_count(), dirty.dirty_count());
     }
 
     #[test]
