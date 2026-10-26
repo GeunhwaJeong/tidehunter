@@ -5088,3 +5088,106 @@ fn test_snapshot_covers_batch_op_promoted_after_its_sibling() {
     assert_eq!(Some(value_a), db.get(ks, &key(1)).unwrap());
     assert_eq!(Some(value_b), db.get(ks, &key(2)).unwrap());
 }
+
+/// An iterator step on a key space with `with_unloaded_iterator(false)`
+/// reaches a cell whose async flush is parked before its completion. The step
+/// must walk the cell unloaded instead of loading it: a load would fold the L0
+/// blob the flush is replacing under the overlay and replace the `data` Arc,
+/// so the completion would take the `unmerge_flushed` path, which removes the
+/// flushed overlay positions and nothing else, and the old L0 copy of the key
+/// would shadow the new blob on reads and be written over it by the next
+/// flush. Finding F6 of the TLA+ model of the cell protocol.
+#[test]
+fn test_iterator_step_during_flush_keeps_flushed_value() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempdir::TempDir::new("test-iter-load-during-flush").unwrap();
+    let mut config = Config::small();
+    config.snapshot_unload_threshold = 0;
+    let config = Arc::new(config);
+    let ks_config = KeySpaceConfig::new().with_unloaded_iterator(false);
+    let mut ksb = KeyShapeBuilder::new();
+    ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ks_config);
+    let key_shape = ksb.build();
+    let metrics = Metrics::new();
+    let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let ks = db.ks("k");
+
+    let key = 42u64.to_be_bytes().to_vec();
+    let v1: Bytes = vec![1u8].into();
+    let v2: Bytes = vec![2u8].into();
+
+    // v1 lands in an on-disk L0 and the cell unloads.
+    db.insert(ks, key.clone(), v1.clone()).unwrap();
+    db.force_rebuild_control_region().unwrap();
+    // v2 makes the cell DirtyUnloaded; wait until it is processed so the
+    // flush below writes it.
+    db.insert(ks, key.clone(), v2.clone()).unwrap();
+    db.wal_writer.wal_tracker_barrier();
+    let clears_before = metrics.flush_update.with_label_values(&["clear"]).get();
+
+    // Park the flush after its work, before its completion, and wait until
+    // the flusher is parked there. The latch releases when its guard drops,
+    // including on a panicking assertion.
+    let (completion_latch, completion_latch_guard) = Latch::new();
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    db.large_table.fp.0.write().fp_flush_before_completion =
+        FailPoint::latch_counting(completion_latch, arrivals.clone());
+    let db2 = db.clone();
+    let rebuild = thread::spawn(move || db2.rebuild_control_region().unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while arrivals.load(Ordering::SeqCst) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the flusher did not reach the completion failpoint before the deadline"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // The iterator step walks the cell unloaded: the overlay (v2) over the
+    // on-disk L0 (v1).
+    let scanned: Vec<(Bytes, Bytes)> = db.iterator(ks).collect::<DbResult<Vec<_>>>().unwrap();
+    assert_eq!(scanned, vec![(key.clone().into(), v2.clone())]);
+    db.large_table.each_entry(|entry| {
+        assert!(
+            !entry.is_index_loaded(),
+            "an iterator step must not load a cell whose flush is in flight"
+        )
+    });
+
+    drop(completion_latch_guard);
+    let _: u64 = rebuild.join().unwrap();
+    assert_eq!(
+        0,
+        metrics.flush_update.with_label_values(&["unmerge"]).get(),
+        "the completion must find the snapshot it took and not unmerge"
+    );
+    assert_eq!(
+        clears_before + 1,
+        metrics.flush_update.with_label_values(&["clear"]).get(),
+        "the completion must find the snapshot it took and clear the overlay"
+    );
+
+    assert_eq!(
+        Some(v2.clone()),
+        db.get(ks, &key).unwrap(),
+        "live read right after the flush completion"
+    );
+    // With no flush in flight the step loads the cell as usual.
+    let scanned: Vec<(Bytes, Bytes)> = db.iterator(ks).collect::<DbResult<Vec<_>>>().unwrap();
+    assert_eq!(scanned, vec![(key.clone().into(), v2.clone())]);
+    let loaded = std::cell::Cell::new(false);
+    db.large_table.each_entry(|entry| {
+        if entry.is_index_loaded() {
+            loaded.set(true);
+        }
+    });
+    assert!(loaded.get(), "the step after the completion loads the cell");
+    // A rebuild must leave v2 in place: a cell left DirtyUnloaded with the
+    // old L0's entries in its overlay would flush them over the new blob.
+    db.force_rebuild_control_region().unwrap();
+    assert_eq!(
+        Some(v2),
+        db.get(ks, &key).unwrap(),
+        "live read after the next flush"
+    );
+}

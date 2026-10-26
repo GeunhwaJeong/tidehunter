@@ -2273,6 +2273,9 @@ impl LargeTableEntry {
     }
 
     /// Loads an unloaded cell's L0 blob and folds the dirty overlay on top.
+    /// A no-op for a loaded or empty cell, and for a cell whose async flush is in
+    /// flight (`pending_last_processed` set): the caller then serves the cell
+    /// in its unloaded shape, as every unloaded-iterator key space does.
     ///
     /// The fold (`merge_dirty_no_clean`) preserves the overlay's full per-key
     /// position lists, including processed below-frontier positions: they are
@@ -2281,10 +2284,21 @@ impl LargeTableEntry {
     /// as-of-frontier position for a key overwritten across the frontier and
     /// serve the stale flat/L0 entry to checkpoint reads. The backlog drains
     /// through the usual `promote_to_flat`/flush paths once processed.
+    ///
+    /// Loading during an async flush would fold the L0 blob the flush is
+    /// replacing into `self.data` and replace the `Arc` the flush snapshotted,
+    /// so the completion would take the `unmerge_flushed` path, which removes
+    /// the flushed overlay positions and nothing else, and then mark the cell
+    /// `DirtyUnloaded` with that blob's entries still in `flat`: they would
+    /// shadow the new blob on reads and the next flush would write them over
+    /// it. `sync_flush` asserts no flush is pending before it loads.
     pub fn maybe_load<L: Loader>(&mut self, loader: &L) -> Result<(), L::Error> {
         let Some(unloaded) = self.as_unloaded_state() else {
             return Ok(());
         };
+        if self.pending_last_processed.is_some() {
+            return Ok(());
+        }
         // Load only the L0 slot — never L1. Reading L1 into `self.data` here
         // would make the next flush treat L1 content as "L0 + overlay" and
         // rewrite L1 as the new L0. On the read path, lookups already walk
