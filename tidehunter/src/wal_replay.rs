@@ -29,7 +29,6 @@
 //! Lives in its own module so `db.rs` doesn't carry the loop body.
 
 use crate::compressed_batch::{InnerIter, decompress_wal_entry};
-use crate::context::KsContextVec;
 use crate::db::{DbResult, WalEntry};
 use crate::key_shape::KeyShape;
 use crate::large_table::LargeTable;
@@ -39,7 +38,6 @@ use crate::wal::tracker::SharedLastProcessed;
 use crate::wal::{WalError, WalIterator, WalWriter};
 
 pub(crate) fn replay_wal(
-    contexts: &KsContextVec,
     large_table: &LargeTable,
     key_shape: &KeyShape,
     mut wal_iterator: WalIterator,
@@ -71,7 +69,7 @@ pub(crate) fn replay_wal(
             match entry {
                 WalEntry::Record(ks, k, _v, relocated) => {
                     metrics.replayed_wal_records.inc();
-                    let context = contexts.ks_context(ks);
+                    let context = large_table.ks_context(ks);
                     if !relocated && !context.destroyed() {
                         let reduced_key = context.ks_config.reduced_key_bytes(k);
                         let cell = context.ks_config.cell_id(&reduced_key);
@@ -80,7 +78,7 @@ pub(crate) fn replay_wal(
                 }
                 WalEntry::Remove(ks, k) => {
                     metrics.replayed_wal_records.inc();
-                    let context = contexts.ks_context(ks);
+                    let context = large_table.ks_context(ks);
                     if !context.destroyed() {
                         let reduced_key = context.ks_config.reduced_key_bytes(k);
                         let cell = context.ks_config.cell_id(&reduced_key);
@@ -105,7 +103,7 @@ pub(crate) fn replay_wal(
                     // Nothing needs to be done for the relocated record
                     continue;
                 }
-                let context = contexts.ks_context(ks);
+                let context = large_table.ks_context(ks);
                 if context.destroyed() {
                     continue;
                 }
@@ -118,7 +116,7 @@ pub(crate) fn replay_wal(
             }
             WalEntry::Remove(ks, k) => {
                 metrics.replayed_wal_records.inc();
-                let context = contexts.ks_context(ks);
+                let context = large_table.ks_context(ks);
                 if context.destroyed() {
                     continue;
                 }
@@ -148,7 +146,7 @@ pub(crate) fn replay_wal(
             }
             WalEntry::DropCells(ks, from_cell, to_cell) => {
                 metrics.replayed_wal_records.inc();
-                let context = contexts.ks_context(ks);
+                let context = large_table.ks_context(ks);
                 if context.destroyed() {
                     continue;
                 }
@@ -169,7 +167,7 @@ pub(crate) fn replay_wal(
                     metrics.replayed_wal_records.inc();
                     match inner {
                         WalEntry::Record(ks, key, _value, _relocated) => {
-                            let context = contexts.ks_context(ks);
+                            let context = large_table.ks_context(ks);
                             if context.destroyed() {
                                 continue;
                             }
@@ -178,7 +176,7 @@ pub(crate) fn replay_wal(
                             buffer.insert(ks, cell, reduced_key, position);
                         }
                         WalEntry::Remove(ks, key) => {
-                            let context = contexts.ks_context(ks);
+                            let context = large_table.ks_context(ks);
                             if context.destroyed() {
                                 continue;
                             }

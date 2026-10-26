@@ -1945,7 +1945,8 @@ impl LargeTableEntry {
     ///
     /// The frontier is the tracker's externally observed `last_processed`
     /// (`KsContext::last_processed_wal_position`), read only on the `Empty`
-    /// edge, once per cell lifetime.
+    /// edge: a cell's first write, and its first write after `clear` empties
+    /// it again.
     fn mark_dirty(&mut self, v: WalPosition) {
         let write = LastProcessed::new(v.offset());
         self.last_processed = if self.state.is_empty() {

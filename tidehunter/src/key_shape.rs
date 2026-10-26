@@ -944,7 +944,7 @@ impl KeySpace {
     }
 
     /// Index for slice-based per-keyspace storage. Crate-internal — matches
-    /// the layout used by `KsContextVec` and friends.
+    /// the layout of `LargeTable`'s per-keyspace tables.
     pub(crate) fn index(&self) -> usize {
         self.0 as usize
     }

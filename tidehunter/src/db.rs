@@ -5,7 +5,7 @@ use crate::compressed_batch::{
     BatchCodec, CompressedBatch, decompress_wal_entry, find_record, find_record_by,
 };
 use crate::config::Config;
-use crate::context::{DbOpKind, KsContext, KsContextVec, ReadType, WalEntryKind};
+use crate::context::{DbOpKind, KsContext, ReadType, WalEntryKind};
 use crate::control::{ControlRegion, ControlRegionStore, RelocateFiles};
 use crate::crc::IntoBytesFixed;
 use crate::flusher::{IndexFlusher, RelocationFlush};
@@ -122,15 +122,8 @@ impl Db {
             last_processed.clone(),
             indexes.as_ref(),
         );
-        let contexts = KsContextVec::new(
-            &key_shape,
-            config.clone(),
-            metrics.clone(),
-            last_processed.clone(),
-        );
         let wal_iterator = wal.wal_iterator_for_writer(control_region.last_position())?;
         let wal_writer = crate::wal_replay::replay_wal(
-            &contexts,
             &large_table,
             &key_shape,
             wal_iterator,

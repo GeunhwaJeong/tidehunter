@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc};
+use crate::key_shape::{KeySpace, KeySpaceDesc};
 use crate::large_table::GetResult;
 use crate::metrics::{MetricHistogram, MetricIntCounter, MetricIntGauge, Metrics, TimerExt};
 use crate::wal::position::{LastProcessed, WalPosition};
@@ -12,10 +12,6 @@ use strum::{AsRefStr, EnumCount, EnumIter, FromRepr};
 #[derive(Clone)]
 pub struct KsContext {
     inner: Arc<KsContextInner>,
-}
-
-pub struct KsContextVec {
-    contexts: Vec<KsContext>,
 }
 
 pub struct KsContextInner {
@@ -318,32 +314,5 @@ impl Deref for KsContext {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-impl KsContextVec {
-    pub fn new(
-        key_shape: &KeyShape,
-        config: Arc<Config>,
-        metrics: Arc<Metrics>,
-        last_processed: SharedLastProcessed,
-    ) -> Self {
-        let contexts = key_shape
-            .iter_ks()
-            .map(|ks_desc| {
-                KsContext::new(
-                    config.clone(),
-                    ks_desc.clone(),
-                    metrics.clone(),
-                    last_processed.clone(),
-                )
-            })
-            .collect();
-
-        Self { contexts }
-    }
-
-    pub fn ks_context(&self, ks: KeySpace) -> &KsContext {
-        &self.contexts[ks.as_usize()]
     }
 }
