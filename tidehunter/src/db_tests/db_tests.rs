@@ -5191,3 +5191,121 @@ fn test_iterator_step_during_flush_keeps_flushed_value() {
         "live read after the next flush"
     );
 }
+
+/// The snapshot walk visits ks1's only cell while it is still empty, so the cell
+/// contributes nothing to replay_from. Its first write lands right after the
+/// visit and is processed by the tracker; ks2's first write then anchors its
+/// last_processed above that position, and the walk reaches ks2. Only the
+/// frontier read before the walk keeps replay_from at or below ks1's write;
+/// the stored control region holds ks1 as empty, so the restart must replay it.
+#[test]
+fn test_first_write_to_empty_cell_during_snapshot_survives_restart() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = tempdir::TempDir::new("test-empty-cell-snapshot").unwrap();
+    let config = Arc::new(Config::small());
+    // One row per key space, ks1 walked first: the walk parks exactly once
+    // between ks1's row and ks2's.
+    let mut builder = KeyShapeBuilder::new();
+    builder.add_key_space("ks1", 8, 1, KeyType::uniform(1));
+    builder.add_key_space("ks2", 8, 1, KeyType::uniform(1));
+    let key_shape = builder.build();
+    let k1 = 1u64.to_be_bytes().to_vec();
+    let k2 = 2u64.to_be_bytes().to_vec();
+    {
+        let db = Arc::new(
+            Db::open(
+                dir.path(),
+                key_shape.clone(),
+                config.clone(),
+                Metrics::new(),
+            )
+            .unwrap(),
+        );
+        let ks1 = db.ks("ks1");
+        let ks2 = db.ks("ks2");
+
+        // Both failpoints are installed before anyone can park on them: a parked
+        // thread holds the failpoint read lock.
+        let (insert_latch, insert_guard) = Latch::new();
+        let insert_arrivals = Arc::new(AtomicUsize::new(0));
+        let (walk_latch, walk_guard) = Latch::new();
+        let walk_arrivals = Arc::new(AtomicUsize::new(0));
+        {
+            let mut fp = db.large_table.fp.0.write();
+            fp.fp_insert_before_lock =
+                FailPoint::latch_counting(insert_latch, insert_arrivals.clone());
+            fp.fp_snapshot_after_row = FailPoint::latch_counting(walk_latch, walk_arrivals.clone());
+        }
+
+        // ks1's first write: in the WAL, parked before it takes the row lock.
+        let tail_before_write = db.wal_writer.position();
+        let writer = {
+            let db = db.clone();
+            let k1 = k1.clone();
+            thread::spawn(move || db.insert(ks1, k1, vec![1]).unwrap())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while insert_arrivals.load(Ordering::SeqCst) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ks1's write did not reach the failpoint"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // The periodic rebuild: its snapshot walk visits ks1 (empty) and parks
+        // after releasing ks1's row, before ks2.
+        let rebuild = {
+            let db = db.clone();
+            thread::spawn(move || db.rebuild_control_region().unwrap())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while walk_arrivals.load(Ordering::SeqCst) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the snapshot walk did not reach the failpoint"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // ks1's write lands and is processed by the tracker; ks2's first write
+        // anchors its last_processed above it.
+        drop(insert_guard);
+        writer.join().unwrap();
+        db.wal_writer.wal_tracker_barrier();
+        db.insert(ks2, k2.clone(), vec![2]).unwrap();
+
+        // The walk continues to ks2 and the control region is stored with a
+        // replay_from at or below ks1's write.
+        drop(walk_guard);
+        let replay_from = rebuild.join().unwrap();
+        assert_eq!(
+            2,
+            walk_arrivals.load(Ordering::SeqCst),
+            "the walk parks once per row"
+        );
+        assert!(
+            replay_from <= tail_before_write,
+            "replay_from {replay_from} is above the WAL tail {tail_before_write} from before ks1's write"
+        );
+        assert_eq!(Some(vec![1].into()), db.get(ks1, &k1).unwrap());
+        assert_eq!(Some(vec![2].into()), db.get(ks2, &k2).unwrap());
+        // The next store must not regress (the store asserts it too).
+        let next_replay_from = db.rebuild_control_region().unwrap();
+        assert!(
+            next_replay_from >= replay_from,
+            "replay_from regressed from {replay_from} to {next_replay_from}"
+        );
+    }
+    // Restart from the stored control region.
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+    let ks1 = db.ks("ks1");
+    let ks2 = db.ks("ks2");
+    assert_eq!(Some(vec![2].into()), db.get(ks2, &k2).unwrap());
+    assert_eq!(
+        Some(vec![1].into()),
+        db.get(ks1, &k1).unwrap(),
+        "ks1's first write was lost by the restart"
+    );
+}

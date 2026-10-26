@@ -1092,24 +1092,25 @@ impl LargeTable {
     }
 
     /// Provides a snapshot of this large table along with replay position in the wal for the snapshot.
+    ///
+    /// `replay_from` is the minimum of the non-empty cells' `last_processed`
+    /// (see [`Self::ks_snapshot`]) and the WAL frontier read before the walk.
+    /// The frontier bounds the writes the walk cannot see: a write landing in
+    /// a cell after the walk visited it empty, or in a cell the walk never
+    /// visits because that write creates it, was either in flight at the
+    /// read, pinning the frontier at or below its position, or allocated
+    /// later, at or above the WAL tail of that time. Replaying from the
+    /// frontier covers both.
     pub(crate) fn snapshot<L: Loader>(&self, loader: &L) -> LargeTableSnapshot {
-        // Capture the WAL's last_processed position before iterating entries.
-        // Used as replay_from for the empty-database case; must be captured early so
-        // any writes that arrive during iteration are not silently skipped on replay.
-        let wal_last_processed = loader.last_processed_wal_position();
-        let mut replay_from: Option<u64> = None;
+        let mut replay_from = loader.last_processed_wal_position().as_u64();
         let mut data = Vec::with_capacity(self.table.len());
         for ks_table in self.table.iter() {
             let (ks_data, ks_replay_from) = self.ks_snapshot(ks_table, loader);
             data.push(ks_data);
             if let Some(ks_replay_from) = ks_replay_from {
-                replay_from = Some(cmp::min(replay_from.unwrap_or(u64::MAX), ks_replay_from));
+                replay_from = cmp::min(replay_from, ks_replay_from);
             }
         }
-
-        // replay_from is None only when every keyspace has zero non-empty entries (empty DB).
-        let replay_from = replay_from.unwrap_or_else(|| wal_last_processed.as_u64());
-
         let data = LargeTableContainer { data };
         LargeTableSnapshot { data, replay_from }
     }
@@ -1147,7 +1148,8 @@ impl LargeTable {
                 let snapshot_data =
                     SnapshotEntryData::from_levels(entry.levels().clone(), entry.last_processed);
                 ks_data.insert(entry.cell.clone(), snapshot_data);
-                // Do not use last_processed from empty entries
+                // An empty entry's last_processed is meaningless; its first
+                // write is covered by the frontier bound in `snapshot`.
                 if !entry.state.is_empty() {
                     replay_from = Some(cmp::min(
                         replay_from.unwrap_or(u64::MAX),
@@ -1155,6 +1157,8 @@ impl LargeTable {
                     ));
                 }
             }
+            drop(row);
+            self.fp.fp_snapshot_after_row();
         }
         let metric = self
             .metrics
@@ -3030,6 +3034,9 @@ pub(crate) struct LargeTableFailPointsInner {
     /// Hit by a pending-promotion thread on wakeup, before it takes any row
     /// lock, so a test can keep a committed batch pending.
     pub fp_promote_dirty_pending: crate::failpoints::FailPoint,
+    /// Hit by the snapshot walk after it releases each row's lock, so a test
+    /// can park the walk between two rows.
+    pub fp_snapshot_after_row: crate::failpoints::FailPoint,
 }
 
 #[cfg(not(test))]
@@ -3042,6 +3049,8 @@ impl LargeTableFailPoints {
     pub fn fp_flush_before_completion(&self) {}
 
     pub fn fp_promote_dirty_pending(&self) {}
+
+    pub fn fp_snapshot_after_row(&self) {}
 }
 
 #[cfg(test)]
@@ -3063,6 +3072,10 @@ impl LargeTableFailPoints {
 
     pub fn fp_promote_dirty_pending(&self) {
         self.0.read().fp_promote_dirty_pending.fp();
+    }
+
+    pub fn fp_snapshot_after_row(&self) {
+        self.0.read().fp_snapshot_after_row.fp();
     }
 }
 

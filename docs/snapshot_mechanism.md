@@ -91,18 +91,19 @@ For each keyspace, `ks_snapshot` computes:
 - `replay_from`: the **minimum `last_processed`** across all non-empty entries. Any entry
   with a lower `last_processed` has writes that may not be in its on-disk index yet;
   those writes exist only in the WAL and must be replayed.
-- `max_wal_position`: the **maximum on-disk index position** across all entries. Used only
-  when all entries are clean (no dirty `last_processed` to use as floor).
 
-The final `replay_from` for the snapshot is determined as:
+The final `replay_from` for the snapshot is the minimum of:
 
-1. **Non-empty database** → `min(last_processed)` across all non-empty entries in all
-   keyspaces. Every non-empty entry contributes its `last_processed` regardless of whether
-   it is dirty or clean (clean entries have `last_processed` advanced to the WAL frontier
-   in pass 2, so they do not pull `replay_from` back unnecessarily).
-2. **Empty database** → `loader.last_processed_wal_position()` captured at the start of
-   `snapshot()`, before iterating any entries. Capturing it early ensures that writes
-   arriving during iteration are not silently skipped on replay.
+1. **The WAL frontier read at the start of `snapshot()`**, before any entry is visited
+   (`loader.last_processed_wal_position()`). This bounds the writes the walk cannot see: a
+   write landing in a cell after the walk visited it empty, or in a byte-addressed cell the
+   walk never visits because that write creates it, was either in flight at the read,
+   pinning the frontier at or below its position, or allocated later, at or above the WAL tail
+   of that time. For an empty database this is the whole answer.
+2. **`min(last_processed)` across all non-empty entries in all keyspaces.** Every non-empty
+   entry contributes its `last_processed` regardless of whether it is dirty or clean (clean
+   entries have `last_processed` advanced to the WAL frontier in pass 2, so they do not
+   pull `replay_from` back unnecessarily).
 
 ## Why Updates Are Not Lost
 
@@ -121,6 +122,9 @@ stored to the control region, the following chain holds:
    `request_async_snapshot_flush` (the `pending_last_processed.is_some()` guard). Their
    already-queued flush completes before the barrier returns, so by pass 2 they are clean
    and their `last_processed` is updated.
+5. **Cells the walk saw empty, or never visited** (a byte-addressed cell is created by its
+   first write) contribute nothing per entry. Their writes are covered by the frontier read
+   at the start of `snapshot()`, which caps `replay_from`.
 
 After a crash and restart, Tidehunter loads the control region and replays the WAL from
 `replay_from`. Every write that was not yet reflected in any on-disk index at snapshot time
