@@ -1492,12 +1492,15 @@ impl LargeTable {
     /// For Tree-based storage (PrefixedUniform key type), entries are actually removed from the BTreeMap.
     ///
     /// The implementation waits for any pending async flush operations to complete before dropping cells.
+    /// `Db::drop_cells_in_range` holds the DropCells frame's WAL guard across this call, so the
+    /// wait keeps the WAL frontier at or below the frame.
     pub(crate) fn drop_cells_in_range(
         &self,
         context: &KsContext,
         from_cell: &CellId,
         to_cell: &CellId,
     ) {
+        self.fp.fp_drop_cells_before_lock();
         let mut current_cell = Some(from_cell.clone());
 
         while let Some(cell) = current_cell.as_ref() {
@@ -3037,6 +3040,9 @@ pub(crate) struct LargeTableFailPointsInner {
     /// Hit by the snapshot walk after it releases each row's lock, so a test
     /// can park the walk between two rows.
     pub fp_snapshot_after_row: crate::failpoints::FailPoint,
+    /// Hit by `drop_cells_in_range` before it locks any cell, so a test can
+    /// park a drop between its DropCells frame and the clear.
+    pub fp_drop_cells_before_lock: crate::failpoints::FailPoint,
 }
 
 #[cfg(not(test))]
@@ -3051,6 +3057,8 @@ impl LargeTableFailPoints {
     pub fn fp_promote_dirty_pending(&self) {}
 
     pub fn fp_snapshot_after_row(&self) {}
+
+    pub fn fp_drop_cells_before_lock(&self) {}
 }
 
 #[cfg(test)]
@@ -3076,6 +3084,10 @@ impl LargeTableFailPoints {
 
     pub fn fp_snapshot_after_row(&self) {
         self.0.read().fp_snapshot_after_row.fp();
+    }
+
+    pub fn fp_drop_cells_before_lock(&self) {
+        self.0.read().fp_drop_cells_before_lock.fp();
     }
 }
 

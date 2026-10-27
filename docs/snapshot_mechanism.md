@@ -99,7 +99,9 @@ The final `replay_from` for the snapshot is the minimum of:
    write landing in a cell after the walk visited it empty, or in a byte-addressed cell the
    walk never visits because that write creates it, was either in flight at the read,
    pinning the frontier at or below its position, or allocated later, at or above the WAL tail
-   of that time. For an empty database this is the whole answer.
+   of that time. A drop in progress pins the frontier the same way: `drop_cells_in_range`
+   holds its DropCells frame's guard until every cell in the range is cleared. For an empty
+   database this is the whole answer.
 2. **`min(last_processed)` across all non-empty entries in all keyspaces.** Every non-empty
    entry contributes its `last_processed` regardless of whether it is dirty or clean (clean
    entries have `last_processed` advanced to the WAL frontier in pass 2, so they do not
@@ -125,6 +127,9 @@ stored to the control region, the following chain holds:
 5. **Cells the walk saw empty, or never visited** (a byte-addressed cell is created by its
    first write) contribute nothing per entry. Their writes are covered by the frontier read
    at the start of `snapshot()`, which caps `replay_from`.
+6. **Drops.** `drop_cells_in_range` holds the DropCells frame's WAL guard until every cell in
+   the range is cleared, so a snapshot stored meanwhile has `replay_from` at or below the
+   frame and replay re-applies the drop over whatever the snapshot stored for those cells.
 
 After a crash and restart, Tidehunter loads the control region and replays the WAL from
 `replay_from`. Every write that was not yet reflected in any on-disk index at snapshot time

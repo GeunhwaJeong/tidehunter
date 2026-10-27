@@ -575,6 +575,13 @@ impl Db {
     /// of a dropped cell returns `None`, and once GC reclaims the underlying
     /// WAL space the read may fail. Do not hold a checkpoint across a drop
     /// of a range it still needs.
+    ///
+    /// # Concurrent writes
+    ///
+    /// Writes to the range being dropped must not race the drop: the WAL
+    /// orders them against the DropCells frame while the in-memory clear
+    /// orders them against the row locks, and the two orders may differ, so
+    /// the live table and a replay can disagree about such a write.
     pub fn drop_cells_in_range(
         &self,
         ks: KeySpace,
@@ -592,11 +599,21 @@ impl Db {
 
         let entry = WalEntry::DropCells(ks, from_cell.clone(), to_cell.clone());
         let w = PreparedWalWrite::new(&entry);
-        self.wal_writer.write(&w)?;
+        // The frame's guard is held until every cell is cleared: the WAL
+        // frontier stays at or below the frame, so a control region stored
+        // meanwhile has replay_from at or below it and a restart replays the
+        // drop over whatever the control region stored for the cells. The
+        // clear waits out any async flush of a cell in flight, and the held
+        // guard then stalls the tracker: checkpoint creation, relocation and,
+        // once writers are past the WAL mapper's lookahead, every write wait
+        // for the drop. Dropped cells rarely have a flush pending, so the
+        // stall is accepted.
+        let guard = self.wal_writer.write(&w)?;
 
         let context = self.ks_context(ks);
         self.large_table
             .drop_cells_in_range(context, &from_cell, &to_cell);
+        drop(guard);
 
         Ok(())
     }

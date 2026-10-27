@@ -151,9 +151,10 @@ pub(crate) fn replay_wal(
                     continue;
                 }
                 // Drop on both sides: the buffer (so pre-drop writes don't
-                // resurrect at apply time) and `large_table` (in case the
-                // cells exist as Unloaded entries from a CR snapshot loaded
-                // at replay start).
+                // resurrect at apply time) and `large_table`: a control
+                // region stored while the live drop waited out a flush holds
+                // the cells with their levels and a replay_from at or below
+                // this frame.
                 buffer.drop_cells_in_range(ks, &from_cell, &to_cell);
                 large_table.drop_cells_in_range(context, &from_cell, &to_cell);
             }

@@ -5309,3 +5309,126 @@ fn test_first_write_to_empty_cell_during_snapshot_survives_restart() {
         "ks1's first write was lost by the restart"
     );
 }
+
+/// `drop_cells_in_range` keeps the DropCells frame's WAL guard until every
+/// cell in the range is cleared, so the WAL frontier stays at or below the
+/// frame while the cells still hold their data. Here the periodic rebuild
+/// flushes the cell and stores a control region while the drop is parked
+/// between its frame and the clear: the stored replay_from is at or below the
+/// frame, so a restart replays the drop over the cell's stored blob.
+#[test]
+fn test_drop_during_snapshot_survives_restart() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = tempdir::TempDir::new("test-drop-during-snapshot").unwrap();
+    let mut config = Config::small();
+    // Pass 1 of the rebuild flushes every dirty cell.
+    config.snapshot_unload_threshold = 0;
+    let config = Arc::new(config);
+    let key_shape = KeyShape::new_single(8, 1, KeyType::uniform(1));
+    let k = 1u64.to_be_bytes().to_vec();
+    {
+        let db = Arc::new(
+            Db::open(
+                dir.path(),
+                key_shape.clone(),
+                config.clone(),
+                Metrics::new(),
+            )
+            .unwrap(),
+        );
+        let ks = db.single_ks();
+        let (first_key, last_key) = db
+            .key_shape
+            .ks(ks)
+            .cell_range(&crate::cell::CellId::Integer(0));
+        db.insert(ks, k.clone(), vec![1]).unwrap();
+        db.wal_writer.wal_tracker_barrier();
+
+        // Both failpoints are installed before anyone can park on one: a parked
+        // thread holds the failpoint read lock.
+        let (drop_latch, drop_guard) = Latch::new();
+        let drop_arrivals = Arc::new(AtomicUsize::new(0));
+        let (flush_latch, flush_guard) = Latch::new();
+        let flush_arrivals = Arc::new(AtomicUsize::new(0));
+        {
+            let mut fp = db.large_table.fp.0.write();
+            fp.fp_drop_cells_before_lock =
+                FailPoint::latch_counting(drop_latch, drop_arrivals.clone());
+            fp.fp_flush_before_completion =
+                FailPoint::latch_counting(flush_latch, flush_arrivals.clone());
+        }
+
+        // The drop: its DropCells frame is in the WAL at `drop_frame` with its
+        // guard held; it parks before locking the cell.
+        let drop_frame = db.wal_writer.position();
+        let dropper = {
+            let db = db.clone();
+            thread::spawn(move || db.drop_cells_in_range(ks, &first_key, &last_key).unwrap())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while drop_arrivals.load(Ordering::SeqCst) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the drop did not reach the failpoint"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // The periodic rebuild: pass 1 flushes the dirty cell; the flusher parks
+        // before completion, so the rebuild waits at its barrier.
+        let rebuild = {
+            let db = db.clone();
+            thread::spawn(move || db.rebuild_control_region().unwrap())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while flush_arrivals.load(Ordering::SeqCst) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the flush did not reach the failpoint"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let frontier = db.wal_writer.last_processed().as_u64();
+        assert!(
+            frontier <= drop_frame,
+            "the frontier {frontier} passed the DropCells frame at {drop_frame} while the drop holds its guard"
+        );
+
+        // The flush completes and the rebuild stores a control region holding
+        // the cell's blob.
+        drop(flush_guard);
+        let replay_from = rebuild.join().unwrap();
+        assert_eq!(
+            1,
+            flush_arrivals.load(Ordering::SeqCst),
+            "pass 2 of the rebuild queues no flush"
+        );
+        assert!(
+            replay_from <= drop_frame,
+            "replay_from {replay_from} is above the DropCells frame at {drop_frame}"
+        );
+
+        // The drop clears the cell and releases its guard, so the frontier
+        // passes the frame.
+        drop(drop_guard);
+        dropper.join().unwrap();
+        assert_eq!(None, db.get(ks, &k).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while db.wal_writer.last_processed().as_u64() <= drop_frame {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the frontier is still at or below the DropCells frame at {drop_frame} after the drop: its guard leaked"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    // Restart from the stored control region.
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+    let ks = db.single_ks();
+    assert_eq!(
+        None,
+        db.get(ks, &k).unwrap(),
+        "the dropped cell came back after the restart"
+    );
+}
