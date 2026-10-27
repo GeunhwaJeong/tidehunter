@@ -24,6 +24,11 @@ pub struct PendingTable {
     len: usize,
 }
 
+/// Smallest capacity [`PendingTable::shrink_if_sparse`] acts on. Everyday
+/// batches leave a cell's map far below it, so only a bulk load ever pays
+/// for a shrink.
+const SHRINK_MIN_CAPACITY: usize = 1024;
+
 #[derive(Default)]
 pub struct Transaction {
     status: TransactionStatus,
@@ -104,6 +109,7 @@ impl PendingTable {
         self.len = self.len.checked_sub(removed).expect("len overflow");
         if updates.is_empty() {
             self.data.remove(key);
+            self.shrink_if_sparse();
         }
         (committed, removed)
     }
@@ -117,7 +123,25 @@ impl PendingTable {
             total_removed += removed;
             !updates.is_empty()
         });
+        self.shrink_if_sparse();
         (committed, total_removed)
+    }
+
+    /// Shrinks the map once it uses less than a quarter of a capacity of at
+    /// least [`SHRINK_MIN_CAPACITY`]; an empty map is freed outright.
+    ///
+    /// Removing entries never shrinks a map, and a bulk load that walks the
+    /// key space in order (formal snapshot restore) parks a whole batch in
+    /// one cell for a single promotion, so without this every cell it passes
+    /// through keeps the buckets of its largest batch for as long as the cell
+    /// exists (7-15 MB per cell for 100k-key batches). Maps below the
+    /// threshold are left alone, so a steadily written cell never reallocates
+    /// its pending table on promotion.
+    fn shrink_if_sparse(&mut self) {
+        let capacity = self.data.capacity();
+        if capacity >= SHRINK_MIN_CAPACITY && self.data.len() * 4 < capacity {
+            self.data.shrink_to(self.data.len() * 2);
+        }
     }
 
     /// Take committed updates for a given key, add them to given vector
@@ -394,6 +418,69 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
+    }
+
+    #[test]
+    fn pending_table_shrinks_when_drained() {
+        // Fully drained: the map is freed.
+        let mut table = PendingTable::default();
+        let transaction = Transaction::default();
+        for i in 0..100_000u64 {
+            table.insert(b(i), WalPosition::test_value(i), None, &transaction);
+        }
+        assert!(table.data.capacity() >= 100_000);
+        transaction.commit();
+        let (committed, removed) = table.take_committed();
+        assert_eq!(committed.len(), 100_000);
+        assert_eq!(removed, 100_000);
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.data.capacity(), 0);
+
+        // One update still pending: the map shrinks around it instead of
+        // keeping the batch's buckets.
+        let committed_tx = Transaction::default();
+        let pending_tx = Transaction::default();
+        for i in 0..100_000u64 {
+            table.insert(b(i), WalPosition::test_value(i), None, &committed_tx);
+        }
+        table.insert(b(u64::MAX), WalPosition::test_value(1), None, &pending_tx);
+        committed_tx.commit();
+        let (committed, removed) = table.take_committed();
+        assert_eq!(committed.len(), 100_000);
+        assert_eq!(removed, 100_000);
+        assert_eq!(table.len(), 1);
+        assert!(table.data.capacity() < SHRINK_MIN_CAPACITY);
+        pending_tx.commit();
+        let (committed, _) = table.take_committed_for(&b(u64::MAX));
+        assert_eq!(committed.len(), 1);
+        assert_eq!(table.len(), 0);
+
+        // Drained one key at a time through the single-key path.
+        let transaction = Transaction::default();
+        for i in 0..4_096u64 {
+            table.insert(b(i), WalPosition::test_value(i), None, &transaction);
+        }
+        assert!(table.data.capacity() >= 4_096);
+        transaction.commit();
+        for i in 0..4_096u64 {
+            let (committed, removed) = table.take_committed_for(&b(i));
+            assert_eq!(committed.len(), 1);
+            assert_eq!(removed, 1);
+        }
+        assert_eq!(table.len(), 0);
+        assert!(table.data.capacity() < SHRINK_MIN_CAPACITY);
+
+        // A map below the threshold keeps its buckets across a drain (a
+        // shrink of an empty map would free them).
+        let transaction = Transaction::default();
+        for i in 0..100u64 {
+            table.insert(b(i), WalPosition::test_value(i), None, &transaction);
+        }
+        transaction.commit();
+        let (committed, _) = table.take_committed();
+        assert_eq!(committed.len(), 100);
+        assert_eq!(table.len(), 0);
+        assert!(table.data.capacity() >= SHRINK_MIN_CAPACITY / 2);
     }
 
     fn b(v: u64) -> Bytes {
